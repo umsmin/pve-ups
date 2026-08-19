@@ -33,13 +33,14 @@ from .config import (
     HostConfig,
     SnmpConfig,
     UpsBase,
+    WebhookConfig,
     _to_serialisable,
     assign_ups_ids,
     load_config,
     save_config,
 )
 from .engine import Engine
-from . import proxmox, sources
+from . import notify, proxmox, sources
 
 log = logging.getLogger("pve-usv")
 
@@ -519,6 +520,33 @@ async def api_test_host(incoming: dict):
     host = HostConfig.model_validate(incoming)
     result = await proxmox.test_connection(host)
     return {"ok": result.ok, "message": result.message, "has_power_mgmt": result.has_power_mgmt}
+
+
+@app.post("/api/test/webhook", dependencies=[Depends(require_auth)])
+async def api_test_webhook(incoming: dict):
+    """Send one sample notification with the submitted (still unsaved) webhook settings.
+
+    Neither ``enabled`` nor the severity filter apply here: the user asked for this send
+    explicitly, and the point is to verify URL and format *before* saving.
+    """
+    assert engine is not None
+    try:
+        hook = WebhookConfig.model_validate(incoming)
+    except Exception as exc:  # noqa: BLE001 - validation error -> 400
+        raise HTTPException(status_code=400, detail=f"Invalid webhook settings: {exc}")
+    if not hook.url:
+        raise HTTPException(status_code=400, detail="No webhook URL configured.")
+    try:
+        result = await notify.send_webhook(
+            hook,
+            "[PVE-UPS] Test notification",
+            "Test message from the PVE-UPS web interface — the webhook is working.",
+            db.INFO,
+            engine.snapshot(),
+        )
+    except Exception as exc:  # noqa: BLE001 - report the failure, do not raise
+        return {"ok": False, "message": str(exc) or exc.__class__.__name__}
+    return {"ok": True, "message": result}
 
 
 @app.post("/api/test/shutdown", dependencies=[Depends(require_auth)])

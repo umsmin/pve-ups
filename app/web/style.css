@@ -163,9 +163,10 @@ main { max-width: var(--maxw); margin: 22px auto 8px; padding: 0 18px; }
 }
 .card-h h3 { margin: 0; font-size: 14px; font-weight: 650; display: flex; align-items: center; gap: 9px; }
 .card-h .actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
-/* subtle "?" deep-link into the manual, pinned to the right of a card header */
-.card-h .doclink { margin-left: auto; display: inline-flex; color: var(--text-faint); }
-.card-h .doclink:hover { color: var(--text); }
+/* subtle "?" deep-link into the manual, pinned to the right of a card header (or, for a
+   collapsible card, of its summary — which is a flex row too). */
+.card-h .doclink, details > summary .doclink { margin-left: auto; display: inline-flex; color: var(--text-faint); }
+.card-h .doclink:hover, details > summary .doclink:hover { color: var(--text); }
 .card h3 { margin: 0 0 12px; font-size: 14px; font-weight: 650; }
 .section-num {
   display: inline-grid; place-items: center; width: 22px; height: 22px;

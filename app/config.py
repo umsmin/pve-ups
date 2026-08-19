@@ -258,10 +258,58 @@ class Thresholds(BaseModel):
     host_shutdown_timeout_s: int = 60
 
 
+class WebhookFormat(str, Enum):
+    """Shape of the payload the webhook POSTs (see app/notify.py: FORMATTERS).
+
+    Every member needs matching ``whfmt.<value>`` and ``whfmt.<value>Help`` i18n keys in
+    en.js *and* de.js (enforced by tests/test_i18n.py).
+    """
+
+    json = "json"  # {"subject", "body", "severity", "status"} — the full status snapshot
+    teams = "teams"  # Microsoft Teams adaptive card (Workflows / incoming webhook)
+    text = "text"  # human-readable plain text, sent as text/plain
+
+
+class WebhookLevel(str, Enum):
+    """Lowest event severity that still fires the webhook. Values match app/db.py.
+
+    Every member needs a matching ``whlvl.<value>`` i18n key in en.js *and* de.js
+    (enforced by tests/test_i18n.py).
+    """
+
+    info = "info"  # everything, including routine notices ("mains power restored")
+    warning = "warning"  # default: warnings and critical events
+    critical = "critical"  # only what needs an immediate reaction
+
+
 class WebhookConfig(BaseModel):
     enabled: bool = False
     url: str = ""
-    # POSTs the /api/status payload as JSON on each notable event.
+    # POSTs a rendered notification on each notable event that passes ``min_severity``.
+    format: WebhookFormat = WebhookFormat.json
+    min_severity: WebhookLevel = WebhookLevel.warning
+
+    @field_validator("format", mode="before")
+    @classmethod
+    def _normalise_format(cls, value):
+        """Fall back to the plain JSON payload instead of rejecting an unknown format.
+
+        Same rule as the self-test validators below: a backup from another version must
+        still import — a webhook in the wrong shape is fixable, a refused import is not.
+        """
+        try:
+            return WebhookFormat(value)
+        except (ValueError, TypeError):
+            return WebhookFormat.json
+
+    @field_validator("min_severity", mode="before")
+    @classmethod
+    def _normalise_min_severity(cls, value):
+        """Unknown level -> the default; never reject the import."""
+        try:
+            return WebhookLevel(value)
+        except (ValueError, TypeError):
+            return WebhookLevel.warning
 
 
 class Notifications(BaseModel):

@@ -7,8 +7,8 @@ and no config files.**
 
 PVE-UPS monitors one or more UPS devices — **with an SNMP network card (standard RFC 1628
 or a vendor MIB such as APC PowerNet)** or **through a NUT server**, which is how USB and
-serial UPS devices are read — and, on a power outage, shuts down one or more **standalone Proxmox VE hosts** in
-an orderly fashion. The modern replacement for vendor-locked appliances such as APC
+serial UPS devices are read — and, on a power outage, shuts down one or more **Proxmox VE
+hosts** in an orderly fashion. The modern replacement for vendor-locked appliances such as APC
 PowerChute Network Shutdown. Everything is configured through a **web wizard**; monitoring
 is available as **REST/JSON**.
 
@@ -71,6 +71,10 @@ curl -fsSL https://github.com/ffind-dev/pve-ups/releases/latest/download/install
   --ctid 950 --ip 10.0.0.50/24 --gateway 10.0.0.1 --hostname pve-usv
 ```
 
+PVE-UPS is also listed on [community-scripts.org](https://community-scripts.org/) (search
+for "PVE-UPS") — a community-maintained collection of Proxmox helper scripts. The one-liner
+above stays the reference path.
+
 Then open the web UI at **`http://<container-ip>:8080`**:
 1. Set the UI password.
 2. Walk through the wizard (UPS devices → hosts → thresholds → optional webhook).
@@ -117,11 +121,11 @@ Everything else (SNMP polling, Proxmox shutdown, thresholds, webhook, self-test)
 identically to the LXC deployment. The LXC install (above) remains the primary, fully
 self-updating path.
 
-## Connecting a Proxmox host (API token)
+## Connecting the Proxmox hosts (API token)
 
 The appliance shuts hosts down through the Proxmox API — no root SSH, no agent on the
-host. Each host needs a dedicated user with a **single privilege** (`Sys.PowerMgmt`) and
-an API token. Run once per host in the node shell (as root):
+host. It needs a dedicated user with a **single privilege** (`Sys.PowerMgmt`) and an API
+token. Run **once** in a node shell (as root):
 
 ```bash
 # 1) dedicated user (PVE realm)
@@ -141,6 +145,13 @@ The last command prints the **token ID** (`ups@pve!shutdown`) and the **secret**
 shown only this once — copy it now). Enter both in the wizard under **Proxmox hosts**
 (API URL is `https://<host-ip>:8006`) and check the connection with **Test**.
 
+- **In a cluster, run the commands only once, on any node.** Users, API tokens and ACLs
+  live at datacenter level (`/etc/pve`) and are therefore valid on every node — enter the
+  *same* token ID and secret for each node you add. On standalone hosts that share no
+  cluster, repeat the commands per host.
+- Give every host entry **its own API URL** (`https://<this-node-ip>:8006`). The API would
+  proxy a request to another node, but a node that has already been shut down cannot proxy
+  for the ones still to come.
 - Leave **Verify TLS** off as long as the host uses Proxmox's self-signed certificate.
 - The token is revocable at any time: `pveum user token remove ups@pve shutdown`.
 
@@ -155,7 +166,10 @@ shown only this once — copy it now). Enter both in the wizard under **Proxmox 
     AP9617/AP9618/AP9619). Picked automatically per UPS; selectable by hand.
   - **NUT server** (TCP 3493) as a read-only client — for UPS devices without a network
     card. Works with the UPS server built into a Synology/QNAP/TrueNAS NAS, a Raspberry
-    Pi, OPNsense, or a NUT install on a Proxmox host.
+    Pi, OPNsense, or a NUT install on a Proxmox host. QNAP and Synology prescribe their own
+    values (QNAP: UPS name `qnapups`, user `admin`, password `123456`; Synology: UPS name
+    and user `ups`, no password) and only answer hosts on their permitted-devices list —
+    see the manual, section 5.
 - **Web wizard** for UPS devices, hosts, thresholds and notifications — with test buttons;
   the UPS test breaks its result down per object, so a missing OID or NUT variable, wrong
   credentials and a blocked port are told apart at a glance. It also names the trigger
@@ -163,7 +177,8 @@ shown only this once — copy it now). Enter both in the wizard under **Proxmox 
 - **Bilingual UI**: English (default) and German, picked automatically from the browser
   language; user manual built in (both languages).
 - Per-UPS **threshold overrides** on top of the global defaults.
-- **Webhook notifications** (HTTP POST with subject/body/status JSON) on notable events.
+- **Webhook notifications** on notable events, as full status JSON, a **Microsoft Teams**
+  adaptive card or plain text — with a severity filter and a test-send button.
 - **REST status** (`/api/status`, `/api/health`) — read-only, no auth, no secrets;
   event log of the last 48 h included. Event/webhook texts are uniformly English.
 - **Config export/import**, NTP/timezone setup, scheduled Proxmox connectivity self-test
@@ -237,7 +252,10 @@ PVE_USV_CONFIG=./dev-config.yaml PVE_USV_DB=./dev-events.db python -m app.main
 
 ## Limits / assumptions
 
-- Standalone hosts only (no cluster/HA-manager interaction) — a possible future extension.
+- Hosts are shut down **individually**, each through its own API. Nodes of a cluster work
+  as targets (one datacenter-wide token covers them all), but PVE-UPS does not touch the
+  **HA manager or quorum** and resolves no dependencies between nodes — a possible future
+  extension.
 - Reads the standard RFC 1628 UPS MIB, the APC PowerNet MIB, or a NUT server's variables.
   Other vendor MIBs are not implemented yet — a device outside those needs either RFC 1628
   or a NUT driver. There is no direct USB/serial support in the appliance itself; a locally

@@ -7,8 +7,8 @@ Konfigurationsdateien.**
 
 PVE-UPS überwacht eine oder mehrere USVs — **mit SNMP-Netzwerkkarte (Standard RFC 1628
 oder Hersteller-MIB wie APC PowerNet)** oder **über einen NUT-Server**, worüber USB- und
-seriell angeschlossene USVs gelesen werden — und fährt bei Stromausfall einen oder mehrere **Standalone-Proxmox-VE-Hosts**
-geordnet herunter. Der moderne Ersatz für herstellergebundene Appliances wie APC
+seriell angeschlossene USVs gelesen werden — und fährt bei Stromausfall einen oder mehrere
+**Proxmox-VE-Hosts** geordnet herunter. Der moderne Ersatz für herstellergebundene Appliances wie APC
 PowerChute Network Shutdown. Die komplette Einrichtung läuft über einen **Web-Wizard**;
 Monitoring gibt es als **REST/JSON**.
 
@@ -74,6 +74,10 @@ curl -fsSL https://github.com/ffind-dev/pve-ups/releases/latest/download/install
   --ctid 950 --ip 10.0.0.50/24 --gateway 10.0.0.1 --hostname pve-usv
 ```
 
+PVE-UPS ist außerdem auf [community-scripts.org](https://community-scripts.org/) gelistet
+(dort nach „PVE-UPS" suchen) — einer community-gepflegten Sammlung von
+Proxmox-Helper-Skripten. Der Einzeiler oben bleibt der Referenzweg.
+
 Danach das Webinterface auf **`http://<container-ip>:8080`** öffnen:
 1. UI-Passwort setzen.
 2. Wizard durchlaufen (USVs → Hosts → Schwellwerte → optional Webhook).
@@ -123,11 +127,11 @@ Alles Weitere (SNMP-Polling, Proxmox-Shutdown, Schwellwerte, Webhook, Selbsttest
 funktioniert identisch zur LXC-Bereitstellung. Die LXC-Installation (oben) bleibt der
 primäre, vollständig selbst-aktualisierende Weg.
 
-## Proxmox-Host anbinden (API-Token)
+## Proxmox-Hosts anbinden (API-Token)
 
 Die Appliance fährt Hosts über die Proxmox-API herunter — kein Root-SSH, kein Agent auf
-dem Host. Jeder Host braucht einen dedizierten Benutzer mit **einem einzigen Recht**
-(`Sys.PowerMgmt`) und einen API-Token. Einmalig je Host in der Node-Shell (als root):
+dem Host. Sie braucht einen dedizierten Benutzer mit **einem einzigen Recht**
+(`Sys.PowerMgmt`) und einen API-Token. **Einmalig** in einer Node-Shell (als root):
 
 ```bash
 # 1) Dedizierten Benutzer anlegen (PVE-Realm)
@@ -148,6 +152,13 @@ UUID, wird nur dieses eine Mal angezeigt — jetzt kopieren). Beides im Wizard u
 **Proxmox-Hosts** eintragen (API-URL ist `https://<host-ip>:8006`) und die Verbindung mit
 **Test** prüfen.
 
+- **Im Cluster die Befehle nur einmal ausführen, auf einem beliebigen Knoten.** Benutzer,
+  API-Token und ACLs liegen auf Datacenter-Ebene (`/etc/pve`) und gelten damit auf jedem
+  Knoten — bei jedem Host-Eintrag *dieselbe* Token-ID und dasselbe Secret eintragen. Bei
+  Standalone-Hosts ohne gemeinsamen Cluster die Befehle je Host wiederholen.
+- Jedem Host-Eintrag **seine eigene API-URL** geben (`https://<ip-dieses-knotens>:8006`).
+  Die API würde eine Anfrage zwar an einen anderen Knoten weiterreichen, aber ein bereits
+  heruntergefahrener Knoten kann das für die nachfolgenden nicht mehr tun.
 - **TLS prüfen** aus lassen, solange der Host das selbstsignierte Proxmox-Zertifikat nutzt.
 - Der Token ist jederzeit widerrufbar: `pveum user token remove ups@pve shutdown`.
 
@@ -163,7 +174,10 @@ UUID, wird nur dieses eine Mal angezeigt — jetzt kopieren). Beides im Wizard u
     lässt sich von Hand festlegen.
   - **NUT-Server** (TCP 3493) als nur-lesender Client — für USVs ohne Netzwerkkarte.
     Funktioniert mit dem eingebauten USV-Server einer Synology/QNAP/TrueNAS, einem
-    Raspberry Pi, OPNsense oder einem NUT auf einem Proxmox-Host.
+    Raspberry Pi, OPNsense oder einem NUT auf einem Proxmox-Host. QNAP und Synology geben
+    ihre Werte fest vor (QNAP: USV-Name `qnapups`, Benutzer `admin`, Kennwort `123456`;
+    Synology: USV-Name und Benutzer `ups`, kein Kennwort) und antworten nur Hosts, die in
+    ihrer Freigabeliste stehen — siehe Handbuch, Abschnitt 5.
 - **Web-Wizard** für USVs, Hosts, Schwellwerte und Benachrichtigungen — mit Test-Buttons;
   der USV-Test schlüsselt sein Ergebnis je Objekt auf, sodass fehlende OID bzw.
   NUT-Variable, falsche Zugangsdaten und blockierter Port auf einen Blick unterscheidbar
@@ -172,8 +186,8 @@ UUID, wird nur dieses eine Mal angezeigt — jetzt kopieren). Beides im Wizard u
 - **Zweisprachige Oberfläche**: Englisch (Standard) und Deutsch, automatisch passend
   zur Browsersprache; eingebautes Benutzerhandbuch (beide Sprachen).
 - **Schwellen-Overrides je USV** zusätzlich zu den globalen Standardwerten.
-- **Webhook-Benachrichtigungen** (HTTP-POST mit subject/body/status-JSON) bei wichtigen
-  Ereignissen.
+- **Webhook-Benachrichtigungen** bei wichtigen Ereignissen — als vollständiges Status-JSON,
+  als **Microsoft-Teams**-Karte oder als Klartext, mit Stufenfilter und Testversand.
 - **REST-Status** (`/api/status`, `/api/health`) — lesend, ohne Auth, ohne Secrets;
   Ereignisprotokoll der letzten 48 h inklusive. Ereignis-/Webhook-Texte sind einheitlich
   englisch.
@@ -251,7 +265,10 @@ PVE_USV_CONFIG=./dev-config.yaml PVE_USV_DB=./dev-events.db python -m app.main
 
 ## Grenzen / Annahmen
 
-- Nur Standalone-Hosts (kein Cluster-/HA-Manager-Eingriff) — mögliche spätere Erweiterung.
+- Hosts werden **einzeln** über ihre jeweils eigene API heruntergefahren. Knoten eines
+  Clusters funktionieren als Ziel (ein datacenter-weites Token deckt alle ab), aber PVE-UPS
+  fasst **HA-Manager und Quorum nicht an** und löst keine Abhängigkeiten zwischen Knoten
+  auf — mögliche spätere Erweiterung.
 - Liest die Standard-RFC-1628-UPS-MIB, die APC-PowerNet-MIB oder die Variablen eines
   NUT-Servers. Weitere Hersteller-MIBs sind noch nicht umgesetzt — ein Gerät außerhalb
   davon braucht entweder RFC 1628 oder einen NUT-Treiber. Die Appliance selbst spricht kein

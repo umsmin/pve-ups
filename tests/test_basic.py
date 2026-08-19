@@ -187,6 +187,10 @@ def test_config_ignores_legacy_smtp_key(tmp_path):
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert "smtp" not in raw["notifications"]
     assert raw["notifications"]["webhook"]["url"] == "https://hook.example/x"
+    # A pre-3.4 webhook block has neither key; both must appear with their defaults, and
+    # as plain strings (an Enum would not survive yaml.safe_dump).
+    assert raw["notifications"]["webhook"]["format"] == "json"
+    assert raw["notifications"]["webhook"]["min_severity"] == "warning"
 
 
 def test_default_config_missing_file_returns_defaults(tmp_path):
@@ -1893,7 +1897,7 @@ def test_selftest_fields_are_import_forgiving():
 # --- config export / import round-trip -------------------------------------
 def _full_config() -> AppConfig:
     """A config with every notable field populated, for round-trip coverage."""
-    from app.config import Notifications, WebhookConfig
+    from app.config import Notifications, WebhookConfig, WebhookFormat, WebhookLevel
 
     return AppConfig(
         configured=True,
@@ -1915,7 +1919,10 @@ def _full_config() -> AppConfig:
                        ups_ids=["a", "b"], ups_policy="any", this_host=True),
         ],
         thresholds=Thresholds(runtime_below_minutes=7, comm_loss_shutdown_after_min=15),
-        notifications=Notifications(webhook=WebhookConfig(enabled=True, url="https://hook/x")),
+        notifications=Notifications(webhook=WebhookConfig(
+            enabled=True, url="https://hook/x",
+            format=WebhookFormat.teams, min_severity=WebhookLevel.critical,
+        )),
         selftest_enabled=True,
         selftest_hour=3,
         selftest_interval_min=360,
@@ -1988,6 +1995,8 @@ async def test_export_import_round_trip_preserves_every_field(_import_target):
     assert restored.thresholds.runtime_below_minutes == 7
     assert restored.thresholds.comm_loss_shutdown_after_min == 15
     assert restored.notifications.webhook.url == "https://hook/x"
+    assert restored.notifications.webhook.format.value == "teams"
+    assert restored.notifications.webhook.min_severity.value == "critical"
     assert restored.dry_run is False
     assert restored.ntp_server == "pool.ntp.org"
     assert restored.timezone == "Europe/Berlin"
@@ -2186,3 +2195,267 @@ async def test_probe_reports_missing_ciphers_without_firewall_advice(monkeypatch
     assert result.summary == ups.PRIVACY_MISSING
     assert "firewall" not in result.summary.lower()
     assert [e.status for e in result.entries] == ["skipped"] * result.total
+
+
+# --- webhook notifications: formats, severity filter, sending ---------------
+def _hook(**kw):
+    from app.config import WebhookConfig
+
+    return WebhookConfig(**{"enabled": True, "url": "https://hook/x", **kw})
+
+
+_SNAPSHOT = {
+    "appliance": {"version": "9.9.9", "dry_run": False},
+    "ups": [{"id": "a", "name": "UPS A", "reachable": True, "power_source": "battery",
+             "battery_charge_pct": 84, "runtime_remaining_min": 12},
+            {"id": "b", "name": "UPS B", "reachable": False}],
+    "hosts": [{"name": "pve01", "eligible": True}, {"name": "pve02", "shutdown_state": "sent"}],
+}
+
+
+def test_json_payload_stays_backwards_compatible():
+    from app import notify
+
+    kwargs = notify._render_json("[PVE-UPS] Subject", "Body.", "warning", _SNAPSHOT)
+
+    # subject/body/status are the 3.0-3.3 contract; severity is additive.
+    assert kwargs["json"] == {"subject": "[PVE-UPS] Subject", "body": "Body.",
+                              "severity": "warning", "status": _SNAPSHOT}
+    assert "headers" not in kwargs  # httpx sets application/json itself
+
+
+def test_teams_payload_is_an_adaptive_card_in_the_message_envelope():
+    from app import notify
+
+    kwargs = notify._render_teams("[PVE-UPS] Power outage", "Runtime 12 min.", "critical",
+                                  _SNAPSHOT)
+    msg = kwargs["json"]
+    attachment = msg["attachments"][0]
+    card = attachment["content"]
+
+    assert msg["type"] == "message"
+    assert attachment["contentType"] == "application/vnd.microsoft.card.adaptive"
+    assert card["type"] == "AdaptiveCard" and card["version"] == "1.4"
+    assert card["body"][0]["text"] == "[PVE-UPS] Power outage"
+    assert card["body"][0]["color"] == "Attention"  # critical -> red
+    assert card["body"][1]["text"] == "Runtime 12 min."
+    facts = {f["title"]: f["value"] for f in card["body"][2]["facts"]}
+    assert "UPS A: battery, 84 %, 12 min" in facts["UPS"]
+    assert "UPS B: unreachable" in facts["UPS"]
+    assert facts["Mode"] == "ARMED"
+    assert facts["Appliance"] == "PVE-UPS 9.9.9"
+
+
+def test_teams_card_colour_follows_the_severity():
+    from app import notify
+
+    def colour(severity):
+        card = notify._render_teams("s", "b", severity, _SNAPSHOT)["json"]["attachments"][0]
+        return card["content"]["body"][0]["color"]
+
+    assert [colour(s) for s in ("info", "warning", "critical")] == ["Good", "Warning", "Attention"]
+
+
+def test_text_payload_is_plain_text_with_the_severity_up_front():
+    from app import notify
+
+    kwargs = notify._render_text("[PVE-UPS] Power outage", "Runtime 12 min.", "warning",
+                                 _SNAPSHOT)
+    lines = kwargs["content"].decode("utf-8").splitlines()
+
+    assert kwargs["headers"]["Content-Type"] == "text/plain; charset=utf-8"
+    assert lines[0] == "[WARNING] [PVE-UPS] Power outage"
+    assert lines[1] == "Runtime 12 min."
+    assert any(line.startswith("UPS: UPS A: battery") for line in lines)
+    assert any(line == "Mode: ARMED" for line in lines)
+
+
+def test_formatters_survive_a_malformed_snapshot():
+    # The engine may hand over anything; a notification must degrade, never raise.
+    from app import notify
+
+    for payload in ({}, {"ups": "nonsense"}, {"hosts": [None]}, {"appliance": None}):
+        for render in notify.FORMATTERS.values():
+            render("subject", "body", "warning", payload)
+
+
+@pytest.mark.asyncio
+async def test_severity_filter_sends_from_the_configured_level_upwards(monkeypatch):
+    from app import notify
+    from app.config import Notifications
+
+    sent: list = []
+
+    async def record(hook, subject, body, severity, payload):
+        sent.append(severity)
+        return "HTTP 200"
+
+    monkeypatch.setattr(notify, "send_webhook", record)
+
+    async def levels(min_severity):
+        sent.clear()
+        cfg = Notifications(webhook=_hook(min_severity=min_severity))
+        for severity in ("info", "warning", "critical"):
+            await notify.notify(cfg, "s", "b", {}, severity)
+        return list(sent)
+
+    assert await levels("warning") == ["warning", "critical"]  # the default
+    assert await levels("info") == ["info", "warning", "critical"]
+    assert await levels("critical") == ["critical"]
+
+
+@pytest.mark.asyncio
+async def test_notify_stays_silent_when_disabled_or_without_a_url(monkeypatch):
+    from app import notify
+    from app.config import Notifications
+
+    sent: list = []
+
+    async def record(*a, **k):
+        sent.append(a)
+        return "HTTP 200"
+
+    monkeypatch.setattr(notify, "send_webhook", record)
+
+    await notify.notify(Notifications(webhook=_hook(enabled=False)), "s", "b", {}, "critical")
+    await notify.notify(Notifications(webhook=_hook(url="")), "s", "b", {}, "critical")
+
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_notify_accepts_plain_strings_for_the_enum_settings(monkeypatch):
+    # Plain attribute assignment skips pydantic validation, so the fields can hold bare
+    # strings — and an AttributeError here would surface on the engine's poll loop.
+    from app import notify
+    from app.config import Notifications
+
+    calls = _fake_httpx(monkeypatch)  # defined below; resolved at call time
+    cfg = Notifications(webhook=_hook())
+    cfg.webhook.min_severity = "info"
+    cfg.webhook.format = "text"
+
+    await notify.notify(cfg, "s", "b", {}, "info")
+
+    assert calls, "the filter rejected a bare-string level"
+    assert calls[0][1]["headers"]["Content-Type"] == "text/plain; charset=utf-8"
+
+
+@pytest.mark.asyncio
+async def test_notify_swallows_a_failing_send(monkeypatch):
+    # The shutdown logic must never be affected by an unreachable notification target.
+    from app import notify
+    from app.config import Notifications
+
+    async def boom(*a, **k):
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setattr(notify, "send_webhook", boom)
+    await notify.notify(Notifications(webhook=_hook()), "s", "b", {}, "critical")
+
+
+class _FakeResponse:
+    def __init__(self, status_code):
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+def _fake_httpx(monkeypatch, status=200):
+    """Capture the POST instead of performing it; returns the recorded calls."""
+    from app import notify
+
+    calls: list = []
+
+    class _FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return _FakeResponse(status)
+
+    monkeypatch.setattr(notify.httpx, "AsyncClient", _FakeClient)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_send_webhook_posts_in_the_configured_format(monkeypatch):
+    from app import notify
+
+    calls = _fake_httpx(monkeypatch)
+
+    result = await notify.send_webhook(_hook(format="text"), "s", "b", "warning", _SNAPSHOT)
+
+    url, kwargs = calls[0]
+    assert url == "https://hook/x"
+    assert kwargs["headers"]["Content-Type"] == "text/plain; charset=utf-8"
+    assert result == "HTTP 200"
+
+
+@pytest.mark.asyncio
+async def test_send_webhook_reports_an_http_error(monkeypatch):
+    from app import notify
+
+    _fake_httpx(monkeypatch, status=404)
+
+    with pytest.raises(RuntimeError, match="404"):
+        await notify.send_webhook(_hook(), "s", "b", "warning", _SNAPSHOT)
+
+
+@pytest.mark.asyncio
+async def test_test_endpoint_sends_regardless_of_the_severity_filter(_import_target, monkeypatch):
+    main, _ = _import_target
+    sent: list = []
+
+    async def record(hook, subject, body, severity, payload):
+        sent.append((hook.format.value, subject, severity))
+        return "HTTP 202"
+
+    monkeypatch.setattr(main.notify, "send_webhook", record)
+
+    # enabled=False and "critical only" would both mute the event path — not this one.
+    result = await main.api_test_webhook(
+        {"enabled": False, "url": "https://hook/x", "format": "teams", "min_severity": "critical"}
+    )
+
+    assert result == {"ok": True, "message": "HTTP 202"}
+    assert sent == [("teams", "[PVE-UPS] Test notification", "info")]
+
+
+@pytest.mark.asyncio
+async def test_test_endpoint_reports_a_failure_instead_of_raising(_import_target, monkeypatch):
+    from fastapi import HTTPException
+
+    main, _ = _import_target
+
+    async def boom(*a, **k):
+        raise RuntimeError("name or service not known")
+
+    monkeypatch.setattr(main.notify, "send_webhook", boom)
+
+    result = await main.api_test_webhook({"url": "https://hook/x"})
+    assert result["ok"] is False and "service not known" in result["message"]
+
+    with pytest.raises(HTTPException) as exc:  # nothing to send to
+        await main.api_test_webhook({"url": ""})
+    assert exc.value.status_code == 400
+
+
+def test_unknown_webhook_values_snap_to_the_defaults():
+    # A backup from another version must import; a webhook in the wrong shape is fixable.
+    from app.config import WebhookConfig
+
+    hook = WebhookConfig.model_validate({"url": "https://hook/x", "format": "slack",
+                                         "min_severity": "verbose"})
+
+    assert hook.format.value == "json"
+    assert hook.min_severity.value == "warning"

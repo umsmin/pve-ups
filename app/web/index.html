@@ -230,9 +230,31 @@
 
       <div class="card">
         <details>
-          <summary><span class="section-num">4</span> <span data-i18n="notif.title">Notifications</span> <span class="muted" data-i18n="notif.optional">(optional)</span></summary>
-          <label class="switch" title="Send an HTTP POST with the status JSON to a URL on every notable event." data-i18n-title="notif.webhookTitle"><input type="checkbox" id="webhook_enabled" /><span data-i18n="notif.webhook">Webhook</span></label>
+          <summary><span class="section-num">4</span> <span data-i18n="notif.title">Notifications</span> <span class="muted" data-i18n="notif.optional">(optional)</span>
+            <a class="doclink" href="/manual.html#webhook" data-manual="webhook" target="_blank" rel="noopener" title="Read in the manual: Webhook notifications" data-i18n-title="notif.doc"><svg class="icon"><use href="#i-help"></use></svg></a></summary>
+          <label class="switch" title="Send an HTTP POST to a URL on every notable event." data-i18n-title="notif.webhookTitle"><input type="checkbox" id="webhook_enabled" /><span data-i18n="notif.webhook">Webhook</span></label>
           <label title="Target URL for the webhook." data-i18n-title="notif.urlTitle"><span data-i18n="notif.url">URL</span> <input id="webhook_url" placeholder="https://..." /></label>
+          <div class="row">
+            <label title="Shape of the payload that is sent to the URL." data-i18n-title="notif.formatTitle"><span data-i18n="notif.format">Format</span>
+              <select id="webhook_format">
+                <option value="json" data-i18n="whfmt.json">JSON (full status)</option>
+                <option value="teams" data-i18n="whfmt.teams">Microsoft Teams (adaptive card)</option>
+                <option value="text" data-i18n="whfmt.text">Plain text</option>
+              </select></label>
+            <label title="Which events are sent at all." data-i18n-title="notif.minSeverityTitle"><span data-i18n="notif.minSeverity">Send from level</span>
+              <select id="webhook_min_severity">
+                <option value="info" data-i18n="whlvl.info">All events (including info)</option>
+                <option value="warning" data-i18n="whlvl.warning">Warnings and critical (default)</option>
+                <option value="critical" data-i18n="whlvl.critical">Critical only</option>
+              </select></label>
+          </div>
+          <p class="help" id="webhook_help"></p>
+          <div class="row" style="margin:0;align-items:center">
+            <button id="testWebhookBtn" class="btn-ghost btn-sm" style="flex:0 0 auto"
+              title="Sends a sample notification with the settings entered here — no need to save first." data-i18n-title="notif.testTitle"
+              data-i18n="notif.test">Send test notification</button>
+            <span class="muted" id="webhookMsg"></span>
+          </div>
         </details>
       </div>
 

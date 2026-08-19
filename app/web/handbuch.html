@@ -167,7 +167,7 @@
   <header class="topbar">
     <span class="brand">
       <svg class="mark icon-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 5v6c0 5 3.4 8.5 8 11 4.6-2.5 8-6 8-11V5l-8-3z"/></svg>
-      PVE-UPS <span class="sub">Benutzerhandbuch · v3.3.0</span>
+      PVE-UPS <span class="sub">Benutzerhandbuch · v3.4.0</span>
     </span>
     <span class="spacer"></span>
     <a class="btn" href="https://github.com/ffind-dev/pve-ups" target="_blank"
@@ -241,8 +241,10 @@
       <section class="card" id="voraussetzungen">
         <h2 class="sec"><span class="n">2</span> Voraussetzungen</h2>
         <ul>
-          <li>Ein <b>Proxmox VE</b>-Host (Standalone — kein Cluster-/HA-Manager-Eingriff),
-          auf dem der LXC laufen kann. Typischerweise einer der zu schützenden Hosts.</li>
+          <li>Ein <b>Proxmox VE</b>-Host, auf dem der LXC laufen kann. Typischerweise einer
+          der zu schützenden Hosts. Standalone-Hosts und Knoten eines Clusters funktionieren
+          gleichermaßen als Ziel — jeder Host wird einzeln über seine eigene API
+          heruntergefahren, und PVE-UPS fasst weder HA-Manager noch Quorum an.</li>
           <li>Eine oder mehrere USVs, auf eine von zwei Arten erreichbar:
             <ul>
               <li>mit <b>SNMP-Netzwerkkarte</b>, die die Standard-<b>RFC-1628-UPS-MIB</b>
@@ -268,6 +270,10 @@
 # z.B. mit fester IP:
 curl -fsSL https://github.com/ffind-dev/pve-ups/releases/latest/download/install.sh | bash -s -- \
   --ctid 950 --ip 10.0.0.50/24 --gateway 10.0.0.1 --hostname pve-usv</code></pre>
+        <p>PVE-UPS ist außerdem auf <a href="https://community-scripts.org/"
+        target="_blank" rel="noopener">community-scripts.org</a> gelistet (dort nach
+        „PVE-UPS" suchen), einer community-gepflegten Sammlung von Proxmox-Helper-Skripten.
+        Der Einzeiler oben bleibt der Referenzweg.</p>
         <p>Anschließend das Webinterface unter <code>http://&lt;container-ip&gt;:8080</code>
         öffnen und den Wizard durchlaufen:</p>
         <ol class="steps">
@@ -279,7 +285,9 @@ curl -fsSL https://github.com/ffind-dev/pve-ups/releases/latest/download/install
           (UND/ODER).</li>
           <li><b>Schwellwerte</b> setzen bzw. die Standardwerte übernehmen.</li>
           <li>Optional den <b>Benachrichtigungs-Webhook</b> einrichten (HTTP-POST an ein
-          Ticket-/Chat-/Monitoring-System).</li>
+          Ticket-/Chat-/Monitoring-System): Format und Stufe wählen, anschließend mit
+          „Testbenachrichtigung senden" prüfen — siehe
+          <a href="#webhook">Webhook-Benachrichtigungen</a>.</li>
         </ol>
         <div class="callout info">
           <span>Solange der <b>Dry-Run</b> aktiv ist, wird nichts heruntergefahren — ideal
@@ -292,9 +300,9 @@ curl -fsSL https://github.com/ffind-dev/pve-ups/releases/latest/download/install
       </section>
 
       <section class="card" id="token">
-        <h2 class="sec"><span class="n">4</span> Proxmox API-Token anlegen (pro Host)</h2>
-        <p>Auf jedem Proxmox-Host einmalig einen dedizierten Benutzer mit ausschließlich dem
-        Power-Recht und einen API-Token erzeugen:</p>
+        <h2 class="sec"><span class="n">4</span> Proxmox API-Token anlegen</h2>
+        <p>Einen dedizierten Benutzer mit ausschließlich dem Power-Recht und einen API-Token
+        erzeugen — <b>einmalig</b>, in der Shell eines beliebigen Proxmox-Knotens:</p>
 <pre><code>pveum user add ups@pve
 pveum role add UpsShutdown -privs "Sys.PowerMgmt"
 pveum acl modify /nodes -user ups@pve -role UpsShutdown
@@ -302,6 +310,17 @@ pveum user token add ups@pve shutdown --privsep 0</code></pre>
         <p>Der letzte Befehl gibt <b>Token-ID</b> (<code>ups@pve!shutdown</code>) und
         <b>Secret</b> aus. Beides im Wizard unter „Proxmox-Hosts" eintragen und mit „Test"
         prüfen. Das Token ist jederzeit widerrufbar und ersetzt einen Root-SSH-Zugang.</p>
+        <div class="callout info">
+          <span><b>Im Cluster werden die Befehle nur einmal ausgeführt.</b> Benutzer,
+          API-Token und ACLs liegen auf Datacenter-Ebene (<code>/etc/pve</code>) und gelten
+          damit auf jedem Knoten — bei jedem Knoten <i>dieselbe</i> Token-ID und dasselbe
+          Secret eintragen. Nur Standalone-Hosts ohne gemeinsamen Cluster brauchen jeweils
+          einen eigenen Benutzer samt Token.</span>
+        </div>
+        <p>Jedem Host-Eintrag <b>seine eigene API-URL</b> geben
+        (<code>https://&lt;ip-dieses-knotens&gt;:8006</code>). Die Proxmox-API würde eine
+        Anfrage zwar an einen anderen Knoten weiterreichen, aber ein bereits
+        heruntergefahrener Knoten kann das für die nachfolgenden nicht mehr tun.</p>
       </section>
 
       <section class="card" id="snmp">
@@ -351,6 +370,22 @@ pveum user token add ups@pve shutdown --privsep 0</code></pre>
         wie in dessen <code>ups.conf</code> konfiguriert (<code>upsc -l &lt;host&gt;</code>
         listet die verfügbaren Namen) und optional <b>Benutzer und Passwort</b> — ein
         Standard-upsd erlaubt das Lesen von Variablen auch ohne beides.</p>
+        <h3>NAS als NUT-Server (QNAP, Synology)</h3>
+        <p>Beide Hersteller liefern ihre eigene, fest vorgegebene Einrichtung — die Werte
+        sind nicht frei wählbar:</p>
+        <table>
+          <thead><tr><th>NAS</th><th>USV-Name</th><th>Benutzer</th><th>Kennwort</th></tr></thead>
+          <tbody>
+            <tr><td>QNAP</td><td><code>qnapups</code></td><td><code>admin</code></td><td><code>123456</code></td></tr>
+            <tr><td>Synology</td><td><code>ups</code></td><td><code>ups</code></td><td>keines</td></tr>
+          </tbody>
+        </table>
+        <p>Bei beiden muss der Netzwerk-USV-Server aktiviert <b>und die IP-Adresse der
+        Appliance in der Liste der erlaubten Geräte eingetragen</b> sein — sonst antwortet
+        das NAS schlicht nicht, mit Abstand die häufigste Ursache für einen fehlschlagenden
+        Test. Die Einstellung sitzt bei der USV-Konfiguration (QNAP: Systemsteuerung,
+        externes Gerät; Synology: Systemsteuerung, Hardware &amp; Energie); die genaue
+        Bezeichnung unterscheidet sich je nach QTS- bzw. DSM-Version.</p>
         <div class="callout info">
           <span>PVE-UPS ist ein strikt <b>nur lesender</b> NUT-Client: Es fragt ausschließlich
           die Variablenliste ab, sendet nie einen Befehl und betreibt kein
@@ -512,6 +547,55 @@ curl -s http://&lt;container-ip&gt;:8080/api/status \
           <b>englisch</b> — unabhängig von der gewählten Oberflächensprache. Das hält
           Auswertung und Monitoring über Installationen hinweg konsistent.</span>
         </div>
+
+        <h3 id="webhook">Webhook-Benachrichtigungen</h3>
+        <p>Optional wird jedes wichtige Ereignis per HTTP-POST an eine URL Ihrer Wahl
+        geschickt (Einstellungen, Abschnitt 4). Zwei Einstellungen bestimmen, <i>was</i> und
+        <i>wann</i> gesendet wird.</p>
+        <p><b>Format</b> — Aufbau der Nutzlast, passend zum Zielsystem:</p>
+        <table>
+          <thead><tr><th>Format</th><th>Sendet</th></tr></thead>
+          <tbody>
+            <tr><td>JSON (vollständiger Status)</td><td><code>{subject, body, severity,
+            status}</code> — <code>status</code> ist der komplette
+            <code>/api/status</code>-Schnappschuss. Für Ticket-, Monitoring- und
+            Automatisierungssysteme.</td></tr>
+            <tr><td>Microsoft Teams</td><td>eine Adaptive Card (Überschrift nach Schweregrad
+            eingefärbt, Meldungstext, Fakten zu USVs, Hosts und Modus) im von Teams
+            erwarteten Nachrichtenumschlag.</td></tr>
+            <tr><td>Klartext</td><td>einen kurzen, menschenlesbaren Status als
+            <code>text/plain</code> — für alles, was einfach nur eine Textzeile
+            anzeigt.</td></tr>
+          </tbody>
+        </table>
+        <p>Für <b>Microsoft Teams</b> die URL eines Workflows „Beim Empfang einer
+        Webhook-Anforderung in einem Kanal posten" verwenden (Teams → Kanal →
+        <i>Workflows</i>); die URL eines klassischen eingehenden Webhooks funktioniert
+        ebenso.</p>
+        <p><b>Senden ab Stufe</b> — welche Ereignisse überhaupt gesendet werden. Alles
+        unterhalb der gewählten Stufe steht weiterhin im Ereignisprotokoll, löst aber keine
+        Nachricht aus:</p>
+        <table>
+          <thead><tr><th>Stufe</th><th>Enthält z.B.</th></tr></thead>
+          <tbody>
+            <tr><td>Alle Ereignisse (inkl. Info)</td><td>zusätzlich „Netzstrom
+            wiederhergestellt", „Verbindung wiederhergestellt"</td></tr>
+            <tr><td>Warnungen und Kritisches (Standard)</td><td>Stromausfall, USV nicht
+            erreichbar, Selbsttest fehlgeschlagen, Shutdown gesendet/abgebrochen</td></tr>
+            <tr><td>Nur Kritisches</td><td>Shutdown ausgelöst, Shutdown FEHLGESCHLAGEN</td></tr>
+          </tbody>
+        </table>
+        <div class="callout info">
+          <span>Seit dieser Version ist <b>Warnungen und Kritisches</b> der Standard — reine
+          Entwarnungen kommen also nicht mehr an. Für das bisherige Verhalten die Stufe auf
+          <b>Alle Ereignisse</b> stellen.</span>
+        </div>
+        <p>Die Schaltfläche <b>„Testbenachrichtigung senden"</b> schickt eine Beispielmeldung
+        mit den aktuell eingetragenen Werten — ohne vorher zu speichern und ohne den
+        Stufenfilter. Sie meldet das HTTP-Ergebnis des Ziels, eine falsche URL fällt also
+        sofort auf.</p>
+        <p class="muted">Benachrichtigungen sind „best effort": ein nicht erreichbares Ziel
+        wird protokolliert und beeinflusst die Shutdown-Logik nie.</p>
       </section>
 
       <section class="card" id="updates">
@@ -606,6 +690,13 @@ volumes:
 <pre><code>pct exec &lt;CTID&gt; -- systemctl start pve-usv-agent.service
 # oder direkt im Container:
 systemctl start pve-usv-agent.service</code></pre>
+        <h3>Cluster: brauche ich je Knoten ein eigenes Token?</h3>
+        <p>Nein. Benutzer, API-Token und ACLs liegen auf Datacenter-Ebene
+        (<code>/etc/pve</code>); ein einmal auf einem beliebigen Knoten angelegtes Token gilt
+        deshalb für alle. Ein zweiter Durchlauf der Befehle aus
+        <a href="#token">Abschnitt 4</a> würde nur melden, dass es den Benutzer schon gibt.
+        Jeden Knoten mit <i>derselben</i> Token-ID und demselben Secret eintragen, aber mit
+        seiner eigenen API-URL.</p>
         <h3>USV nicht erreichbar / Alarm</h3>
         <p>Adresse, Zugangsdaten und die Firewall zwischen Appliance und USV-Quelle prüfen.
         Im Wizard zeigt „USV testen" die genaue Ursache — die <b>Details je Objekt</b>
@@ -656,6 +747,24 @@ systemctl start pve-usv-agent.service</code></pre>
         <p class="muted">Vereinfachte, nutzersichtbare Highlights. Der vollständige technische
         Verlauf steht im <a href="https://github.com/ffind-dev/pve-ups/blob/main/CHANGELOG.md"
         target="_blank" rel="noopener">Changelog des GitHub-Repositories</a>.</p>
+
+        <div class="cl-ver">3.4.0 <span class="date">2026</span></div>
+        <ul>
+          <li><b>Der Webhook spricht jetzt die Sprache seines Ziels</b>: neben dem bisherigen
+          Status-JSON kann er eine <b>Microsoft-Teams</b>-Karte oder einen kurzen
+          <b>Klartext</b>-Status senden. Siehe
+          <a href="#webhook">Webhook-Benachrichtigungen</a>.</li>
+          <li>Ein neuer <b>Stufenfilter</b> bestimmt, welche Ereignisse überhaupt gesendet
+          werden. Standard ist <b>Warnungen und Kritisches</b> — reine Entwarnungen kommen
+          also nicht mehr an; für das bisherige Verhalten die Stufe auf <b>Alle
+          Ereignisse</b> stellen.</li>
+          <li><b>„Testbenachrichtigung senden"</b> schickt eine Beispielmeldung mit den
+          aktuell eingetragenen Werten — ohne vorher zu speichern — und meldet das
+          HTTP-Ergebnis des Ziels.</li>
+          <li>Ein ausgeführter oder zurückgenommener Shutdown (<code>shutdown sent</code> /
+          <code>shutdown aborted</code>) gilt als <b>Warnung</b> statt als Info und wird im
+          Ereignisprotokoll gelb dargestellt.</li>
+        </ul>
 
         <div class="cl-ver">3.3.0 <span class="date">2026</span></div>
         <ul>

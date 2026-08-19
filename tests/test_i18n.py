@@ -124,6 +124,44 @@ def test_snmp_mib_keys_exist_in_both_dictionaries():
     assert re.findall(r'\["([a-z0-9_]+)"', block.group(1)) == kinds
 
 
+def _select_values(select_id: str) -> list[str]:
+    """The option values of a static <select> in index.html, in document order."""
+    block = re.search(
+        rf'<select id="{select_id}">(.*?)</select>',
+        (WEB / "index.html").read_text(encoding="utf-8"),
+        re.DOTALL,
+    )
+    assert block, f"{select_id} <select> not found in index.html"
+    return re.findall(r'value="([a-z0-9_]+)"', block.group(1))
+
+
+def test_webhook_format_keys_exist_in_both_dictionaries():
+    """Every payload format needs a renderer, a dropdown entry and labels in EN and DE."""
+    from app.config import WebhookFormat
+    from app.notify import FORMATTERS
+
+    kinds = [f.value for f in WebhookFormat]
+    assert sorted(kinds) == sorted(FORMATTERS), "WebhookFormat and notify.FORMATTERS drifted apart"
+    # Label plus the help text shown below the dropdown (app.js builds that key dynamically).
+    missing = _both_dictionaries_define("whfmt.", kinds) + _both_dictionaries_define(
+        "whfmt.", [f"{k}Help" for k in kinds]
+    )
+    assert not missing, f"formats without a dictionary entry: {missing}"
+    assert _select_values("webhook_format") == kinds
+
+
+def test_webhook_level_keys_exist_in_both_dictionaries():
+    """The severity filter must offer exactly the severities the event log uses."""
+    from app import db
+    from app.config import WebhookLevel
+
+    kinds = [lv.value for lv in WebhookLevel]
+    assert kinds == [db.INFO, db.WARNING, db.CRITICAL], "WebhookLevel and db severities drifted apart"
+    missing = _both_dictionaries_define("whlvl.", kinds)
+    assert not missing, f"levels without a dictionary entry: {missing}"
+    assert _select_values("webhook_min_severity") == kinds
+
+
 def test_selftest_interval_options_match_the_backend():
     """The <select> in index.html must offer exactly config.SELFTEST_INTERVALS.
 

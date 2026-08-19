@@ -167,7 +167,7 @@
   <header class="topbar">
     <span class="brand">
       <svg class="mark icon-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 5v6c0 5 3.4 8.5 8 11 4.6-2.5 8-6 8-11V5l-8-3z"/></svg>
-      PVE-UPS <span class="sub">User Manual · v3.3.0</span>
+      PVE-UPS <span class="sub">User Manual · v3.4.0</span>
     </span>
     <span class="spacer"></span>
     <a class="btn" href="https://github.com/ffind-dev/pve-ups" target="_blank"
@@ -240,8 +240,10 @@
       <section class="card" id="voraussetzungen">
         <h2 class="sec"><span class="n">2</span> Requirements</h2>
         <ul>
-          <li>A <b>Proxmox VE</b> host (standalone — no cluster/HA-manager interaction) that
-          can run the LXC. Typically one of the hosts to be protected.</li>
+          <li>A <b>Proxmox VE</b> host that can run the LXC. Typically one of the hosts to be
+          protected. Standalone hosts and nodes of a cluster both work as targets — every
+          host is shut down individually through its own API, and PVE-UPS touches neither
+          the HA manager nor quorum.</li>
           <li>One or more UPS devices, reachable in one of two ways:
             <ul>
               <li>with an <b>SNMP network card</b> exposing the standard
@@ -267,6 +269,10 @@
 # e.g. with a static IP:
 curl -fsSL https://github.com/ffind-dev/pve-ups/releases/latest/download/install.sh | bash -s -- \
   --ctid 950 --ip 10.0.0.50/24 --gateway 10.0.0.1 --hostname pve-usv</code></pre>
+        <p>PVE-UPS is also listed on <a href="https://community-scripts.org/"
+        target="_blank" rel="noopener">community-scripts.org</a> (search for “PVE-UPS”), a
+        community-maintained collection of Proxmox helper scripts. The one-liner above stays
+        the reference path.</p>
         <p>Then open the web UI at <code>http://&lt;container-ip&gt;:8080</code> and walk
         through the wizard:</p>
         <ol class="steps">
@@ -277,7 +283,8 @@ curl -fsSL https://github.com/ffind-dev/pve-ups/releases/latest/download/install
           Define which UPS devices feed each host and with which logic (AND/OR).</li>
           <li>Set the <b>thresholds</b> or keep the defaults.</li>
           <li>Optionally configure the <b>notification webhook</b> (HTTP POST to a
-          ticket/chat/monitoring system).</li>
+          ticket/chat/monitoring system): pick format and level, then verify it with
+          “Send test notification” — see <a href="#webhook">Webhook notifications</a>.</li>
         </ol>
         <div class="callout info">
           <span>While <b>dry-run</b> is active nothing is shut down — ideal for testing.
@@ -290,9 +297,9 @@ curl -fsSL https://github.com/ffind-dev/pve-ups/releases/latest/download/install
       </section>
 
       <section class="card" id="token">
-        <h2 class="sec"><span class="n">4</span> Creating the Proxmox API token (per host)</h2>
-        <p>On each Proxmox host, create a dedicated user with only the power-management
-        privilege and an API token — once:</p>
+        <h2 class="sec"><span class="n">4</span> Creating the Proxmox API token</h2>
+        <p>Create a dedicated user with only the power-management privilege and an API
+        token. Run this <b>once</b>, in the shell of any Proxmox node:</p>
 <pre><code>pveum user add ups@pve
 pveum role add UpsShutdown -privs "Sys.PowerMgmt"
 pveum acl modify /nodes -user ups@pve -role UpsShutdown
@@ -300,6 +307,16 @@ pveum user token add ups@pve shutdown --privsep 0</code></pre>
         <p>The last command prints the <b>token ID</b> (<code>ups@pve!shutdown</code>) and
         the <b>secret</b>. Enter both in the wizard under “Proxmox hosts” and verify with
         “Test”. The token can be revoked at any time and replaces root SSH access.</p>
+        <div class="callout info">
+          <span><b>In a cluster the commands are run only once.</b> Users, API tokens and
+          ACLs live at datacenter level (<code>/etc/pve</code>) and are therefore valid on
+          every node — enter the <i>same</i> token ID and secret for each node. Only
+          standalone hosts that share no cluster need their own user and token each.</span>
+        </div>
+        <p>Give every host entry <b>its own API URL</b>
+        (<code>https://&lt;this-node-ip&gt;:8006</code>). The Proxmox API would proxy a
+        request to another node, but a node that has already been shut down cannot proxy for
+        the ones still to come.</p>
       </section>
 
       <section class="card" id="snmp">
@@ -348,6 +365,21 @@ pveum user token add ups@pve shutdown --privsep 0</code></pre>
         configured in its <code>ups.conf</code> (<code>upsc -l &lt;host&gt;</code> lists the
         available names), and optionally a <b>user name and password</b> — a default upsd
         allows reading variables without either.</p>
+        <h3>NAS as the NUT server (QNAP, Synology)</h3>
+        <p>Both vendors ship their own, fixed setup — the values cannot be chosen freely:</p>
+        <table>
+          <thead><tr><th>NAS</th><th>UPS name</th><th>User</th><th>Password</th></tr></thead>
+          <tbody>
+            <tr><td>QNAP</td><td><code>qnapups</code></td><td><code>admin</code></td><td><code>123456</code></td></tr>
+            <tr><td>Synology</td><td><code>ups</code></td><td><code>ups</code></td><td>none</td></tr>
+          </tbody>
+        </table>
+        <p>On both, the network UPS server has to be enabled <b>and the appliance's IP
+        address has to be on the list of permitted devices</b> — otherwise the NAS simply
+        does not answer, which is by far the most common cause of a failing test. The
+        setting sits with the UPS configuration (QNAP: control panel, external device;
+        Synology: control panel, hardware &amp; power); the exact wording differs between
+        QTS and DSM versions.</p>
         <div class="callout info">
           <span>PVE-UPS is a strictly <b>read-only</b> NUT client: it only ever asks for the
           variable list, never sends a command, and never runs <code>upsmon</code>. NUT acts
@@ -505,6 +537,50 @@ curl -s http://&lt;container-ip&gt;:8080/api/status \
           <b>English</b> — regardless of the selected UI language. This keeps analysis and
           monitoring consistent across installations.</span>
         </div>
+
+        <h3 id="webhook">Webhook notifications</h3>
+        <p>Optionally, every notable event is pushed to a URL of your choice via HTTP POST
+        (settings, section 4). Two settings decide <i>what</i> is sent and <i>when</i>.</p>
+        <p><b>Format</b> — the shape of the payload, matching your target system:</p>
+        <table>
+          <thead><tr><th>Format</th><th>Sends</th></tr></thead>
+          <tbody>
+            <tr><td>JSON (full status)</td><td><code>{subject, body, severity, status}</code> —
+            <code>status</code> is the complete <code>/api/status</code> snapshot. For ticket,
+            monitoring and automation systems.</td></tr>
+            <tr><td>Microsoft Teams</td><td>an adaptive card (heading coloured by severity,
+            message text, facts about UPS devices, hosts and mode) in the message envelope
+            Teams expects.</td></tr>
+            <tr><td>Plain text</td><td>a short, human-readable status as
+            <code>text/plain</code> — for anything that simply displays a line of text.</td></tr>
+          </tbody>
+        </table>
+        <p>For <b>Microsoft Teams</b>, use the URL of a workflow “Post to a channel when a
+        webhook request is received” (Teams → channel → <i>Workflows</i>); the URL of a
+        classic incoming webhook works just as well.</p>
+        <p><b>Send from level</b> — which events are sent at all. Everything below the
+        selected level is still written to the event log, it just does not trigger a
+        message:</p>
+        <table>
+          <thead><tr><th>Level</th><th>Includes for example</th></tr></thead>
+          <tbody>
+            <tr><td>All events (including info)</td><td>additionally “mains power restored”,
+            “network connection restored”</td></tr>
+            <tr><td>Warnings and critical (default)</td><td>power outage, UPS unreachable,
+            self-test failed, shutdown sent/aborted</td></tr>
+            <tr><td>Critical only</td><td>shutdown triggered, shutdown FAILED</td></tr>
+          </tbody>
+        </table>
+        <div class="callout info">
+          <span>Since this version the default is <b>Warnings and critical</b> — pure
+          all-clear messages no longer arrive. Set the filter to <b>All events</b> for the
+          previous behaviour.</span>
+        </div>
+        <p>The <b>“Send test notification”</b> button sends a sample message with the values
+        currently entered — no need to save first, and the level filter does not apply. It
+        reports the HTTP result of the target, so a wrong URL shows up immediately.</p>
+        <p class="muted">Notifications are best-effort: an unreachable target is logged and
+        never affects the shutdown logic.</p>
       </section>
 
       <section class="card" id="updates">
@@ -595,6 +671,12 @@ volumes:
 <pre><code>pct exec &lt;CTID&gt; -- systemctl start pve-usv-agent.service
 # or directly inside the container:
 systemctl start pve-usv-agent.service</code></pre>
+        <h3>Cluster: do I need a separate token per node?</h3>
+        <p>No. Users, API tokens and ACLs are stored at datacenter level
+        (<code>/etc/pve</code>), so a token created once on any node is valid on all of
+        them — running the commands from <a href="#token">section 4</a> a second time would
+        only report that the user already exists. Add every node with the <i>same</i> token
+        ID and secret, but with its own API URL.</p>
         <h3>UPS unreachable / alarm</h3>
         <p>Check the address, credentials and the firewall between the appliance and the UPS
         source. “Test UPS” in the wizard shows the exact cause — unfold <b>Details per
@@ -643,6 +725,21 @@ systemctl start pve-usv-agent.service</code></pre>
         <p class="muted">Simplified, user-visible highlights. The full technical changelog
         lives in the <a href="https://github.com/ffind-dev/pve-ups/blob/main/CHANGELOG.md"
         target="_blank" rel="noopener">GitHub repository</a>.</p>
+
+        <div class="cl-ver">3.4.0 <span class="date">2026</span></div>
+        <ul>
+          <li><b>The webhook now speaks the language of its target</b>: besides the previous
+          status JSON it can post a <b>Microsoft Teams</b> card or a short <b>plain text</b>
+          status. See <a href="#webhook">Webhook notifications</a>.</li>
+          <li>A new <b>level filter</b> decides which events are sent at all. The default is
+          <b>Warnings and critical</b> — pure all-clear messages no longer arrive; set the
+          filter to <b>All events</b> for the previous behaviour.</li>
+          <li><b>“Send test notification”</b> sends a sample message with the values
+          currently entered — without saving first — and reports the target's HTTP result.</li>
+          <li>An executed or withdrawn shutdown (<code>shutdown sent</code> /
+          <code>shutdown aborted</code>) counts as a <b>warning</b> instead of info, and is
+          shown amber in the event log.</li>
+        </ul>
 
         <div class="cl-ver">3.3.0 <span class="date">2026</span></div>
         <ul>

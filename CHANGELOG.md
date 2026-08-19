@@ -10,6 +10,35 @@ reads it dynamically. On every release: bump `__version__` **and** add a section
 
 ## [Unreleased]
 
+## [3.4.0] - 2026-08-19
+
+### Added
+- **Selectable webhook payload format.** The webhook is no longer tied to one JSON shape.
+  Besides `JSON (full status)` (unchanged default) it can now post a **Microsoft Teams**
+  adaptive card — the message envelope an incoming webhook / "post to a channel when a
+  webhook request is received" workflow expects — or a short, human-readable **plain text**
+  status (`text/plain`). Each format is one entry in a table in `app/notify.py`, so further
+  target systems are a table row rather than new code.
+- **Severity filter for notifications.** A new *Send from level* setting decides which
+  events reach the webhook at all: all events, warnings and critical (new default), or
+  critical only. Everything below the threshold still goes to the event log.
+- **"Send test notification" button** in the notification settings: posts a sample message
+  with the values currently entered — without saving first, and regardless of the severity
+  filter — and reports the HTTP result (`POST /api/test/webhook`).
+
+### Changed
+- **Info events are no longer sent by default.** Existing installations move to the new
+  *warnings and critical* default and therefore receive fewer messages; set the filter back
+  to *All events (including info)* for the previous behaviour.
+- `Host …: shutdown sent` and `Host …: shutdown aborted` are logged as **warnings** instead
+  of info — an executed or withdrawn shutdown is not routine, and both now pass the default
+  notification filter. They appear amber in the event log from now on.
+- Webhook posts check the HTTP status: a `404`/`401` from the target is written to the
+  process log instead of passing silently. Notification failures still never affect the
+  shutdown logic.
+- Documentation touch-ups: the Proxmox user and API token in a cluster, NUT on a
+  QNAP/Synology NAS, and community-scripts.org as an additional listing.
+
 ## [3.3.0] - 2026-08-06
 
 ### Added
@@ -186,7 +215,8 @@ keep working).
   needs; a legacy `notifications.smtp` config key is ignored on load and dropped on the
   next save.
 
-[Unreleased]: https://github.com/ffind-dev/pve-ups/compare/v3.3.0...HEAD
+[Unreleased]: https://github.com/ffind-dev/pve-ups/compare/v3.4.0...HEAD
+[3.4.0]: https://github.com/ffind-dev/pve-ups/compare/v3.3.0...v3.4.0
 [3.3.0]: https://github.com/ffind-dev/pve-ups/compare/v3.2.0...v3.3.0
 [3.2.0]: https://github.com/ffind-dev/pve-ups/compare/v3.1.0...v3.2.0
 [3.1.0]: https://github.com/ffind-dev/pve-ups/compare/v3.0.0...v3.1.0

@@ -498,7 +498,9 @@ class Engine:
                     await self._emit(
                         f"Host {host.name}: shutdown aborted",
                         "Feeding UPS device(s) sufficient again — shutdown no longer needed.",
-                        db.INFO,
+                        # A withdrawn shutdown is not routine: warning, so it also passes
+                        # the webhook's default severity filter.
+                        db.WARNING,
                     )
                 continue
 
@@ -777,7 +779,8 @@ class Engine:
         await self._emit(
             f"Host {host.name}: shutdown {'sent' if ok else 'FAILED'}",
             f"Reason: {reason}. {msg}",
-            db.INFO if ok else db.CRITICAL,
+            # An executed shutdown is not routine either (see "shutdown aborted" above).
+            db.WARNING if ok else db.CRITICAL,
         )
 
     # -- notifications + event log ------------------------------------------
@@ -792,7 +795,9 @@ class Engine:
             db.log_event(subject, body, severity)
         except Exception as exc:  # noqa: BLE001
             log.warning("Event log write failed: %s", exc)
-        await notify.notify(self.cfg.notifications, f"[PVE-UPS] {subject}", body, self.snapshot())
+        await notify.notify(
+            self.cfg.notifications, f"[PVE-UPS] {subject}", body, self.snapshot(), severity
+        )
 
     # -- status snapshot for the REST API -----------------------------------
     def _ups_snapshot(self, u: UpsBase, rt: _UpsRuntime) -> dict:

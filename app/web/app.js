@@ -578,6 +578,9 @@ async function loadConfig() {
 
   const wh = c.notifications.webhook;
   setChk("webhook_enabled", wh.enabled); setVal("webhook_url", wh.url);
+  setVal("webhook_format", wh.format || "json");
+  setVal("webhook_min_severity", wh.min_severity || "warning");
+  showWebhookHelp();
 
   drawConfigTopology();
   refreshUpdateStatus();
@@ -780,6 +783,33 @@ function drawConfigTopology() {
   drawTopology($("topoDiagram"), upsMeta(), hosts, null);
 }
 
+// ===== notifications =======================================================
+function showWebhookHelp() {
+  // Dynamic key (like t("mib." + …) above); tests/test_i18n.py keeps whfmt.*Help complete.
+  $("webhook_help").textContent = t("whfmt." + getVal("webhook_format") + "Help");
+}
+
+$("webhook_format").onchange = showWebhookHelp;
+
+// A "?" inside a <summary> would fold the card on click — the link alone must win.
+document.querySelectorAll("details > summary .doclink")
+  .forEach((a) => { a.onclick = (e) => e.stopPropagation(); });
+
+$("testWebhookBtn").onclick = async () => {
+  const msg = $("webhookMsg");
+  msg.textContent = t("msg.testing");
+  try {
+    // Sends with the values entered here, saved or not — and regardless of the level
+    // filter, because the user asked for this one explicitly.
+    const r = await api("/api/test/webhook", "POST", {
+      url: getVal("webhook_url").trim(),
+      format: getVal("webhook_format"),
+      min_severity: getVal("webhook_min_severity"),
+    });
+    msg.textContent = (r.ok ? "✓ " : "✗ ") + r.message;
+  } catch (e) { msg.textContent = "✗ " + e.message; }
+};
+
 function buildConfig() {
   const hosts = Array.from(document.querySelectorAll("#hostRows .host-cfg"))
     .map(hostFromRow).filter((h) => h.name);
@@ -808,7 +838,10 @@ function buildConfig() {
       keep_shutdown_on_comm_loss: getChk("th_keep_shutdown_on_comm_loss"),
     },
     notifications: {
-      webhook: { enabled: getChk("webhook_enabled"), url: getVal("webhook_url").trim() },
+      webhook: {
+        enabled: getChk("webhook_enabled"), url: getVal("webhook_url").trim(),
+        format: getVal("webhook_format"), min_severity: getVal("webhook_min_severity"),
+      },
     },
   };
 }
