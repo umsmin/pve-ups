@@ -8,9 +8,18 @@ Konfigurationsdateien.**
 PVE-UPS überwacht eine oder mehrere USVs — **mit SNMP-Netzwerkkarte (Standard RFC 1628
 oder Hersteller-MIB wie APC PowerNet)** oder **über einen NUT-Server**, worüber USB- und
 seriell angeschlossene USVs gelesen werden — und fährt bei Stromausfall einen oder mehrere
-**Proxmox-VE-Hosts** geordnet herunter. Der moderne Ersatz für herstellergebundene Appliances wie APC
-PowerChute Network Shutdown. Die komplette Einrichtung läuft über einen **Web-Wizard**;
-Monitoring gibt es als **REST/JSON**.
+**Proxmox-VE-Hosts** (auf Wunsch auch einen **Proxmox Backup Server**) geordnet herunter.
+Der moderne Ersatz für herstellergebundene Appliances wie APC PowerChute Network Shutdown.
+Die komplette Einrichtung läuft über einen **Web-Wizard**; Monitoring gibt es als
+**REST/JSON**.
+
+> [!IMPORTANT]
+> PVE-UPS ist für ein **internes (Management-)Netz** ausgelegt. Die Appliance hält
+> API-Token, mit denen sich Server ausschalten lassen — sie gehört also wie jedes andere
+> Management-Werkzeug betrieben: nur aus vertrauenswürdigen Netzen erreichbar, niemals ins
+> Internet exponiert, hinter derselben Firewallierung und Zugriffskontrolle wie die
+> Proxmox-Weboberflächen. Zu beachten: `/api/status` und `/api/health` sind bewusst ohne
+> Anmeldung lesbar, damit ein Monitoring sie abfragen kann.
 
 ## Warum nicht NUT?
 
@@ -127,11 +136,27 @@ Alles Weitere (SNMP-Polling, Proxmox-Shutdown, Schwellwerte, Webhook, Selbsttest
 funktioniert identisch zur LXC-Bereitstellung. Die LXC-Installation (oben) bleibt der
 primäre, vollständig selbst-aktualisierende Weg.
 
-## Proxmox-Hosts anbinden (API-Token)
+## Hosts anbinden (API-Token)
 
 Die Appliance fährt Hosts über die Proxmox-API herunter — kein Root-SSH, kein Agent auf
-dem Host. Sie braucht einen dedizierten Benutzer mit **einem einzigen Recht**
-(`Sys.PowerMgmt`) und einen API-Token. **Einmalig** in einer Node-Shell (als root):
+dem Host. Jeder Host-Eintrag hat einen **Typ**, denn Proxmox VE und Proxmox Backup Server
+nutzen unterschiedliche Token-Schemata und Rechtenamen:
+
+| | Proxmox VE | Proxmox Backup Server |
+|---|---|---|
+| API-Port | 8006 | 8007 |
+| Recht | `Sys.PowerMgmt` | `Sys.PowerManagement` |
+| Vergeben auf | `/nodes` | `/system/status` |
+| Feld „Node" | der echte Node-Name | freie Bezeichnung (PBS ignoriert es) |
+
+Der falsch gewählte Typ ist die häufigste Ursache für einen fehlschlagenden Test: ein als
+„Proxmox VE" eingetragener Backup Server weist die Anfrage rundweg ab und meldet
+*„Authentication failed (token invalid?)"* — egal wie gültig das Token ist.
+
+### Proxmox VE
+
+Es braucht einen dedizierten Benutzer mit **einem einzigen Recht** (`Sys.PowerMgmt`) und
+einen API-Token. **Einmalig** in einer Node-Shell (als root):
 
 ```bash
 # 1) Dedizierten Benutzer anlegen (PVE-Realm)
@@ -162,10 +187,50 @@ UUID, wird nur dieses eine Mal angezeigt — jetzt kopieren). Beides im Wizard u
 - **TLS prüfen** aus lassen, solange der Host das selbstsignierte Proxmox-Zertifikat nutzt.
 - Der Token ist jederzeit widerrufbar: `pveum user token remove ups@pve shutdown`.
 
+### Proxmox Backup Server
+
+Diese Befehle in der Shell des Backup Servers ausführen. Die ACL wird **zweimal** vergeben
+— einmal an den Benutzer, einmal an das Token:
+
+```bash
+proxmox-backup-manager user create ups@pbs
+proxmox-backup-manager user generate-token ups@pbs shutdown
+proxmox-backup-manager acl update /system/status Admin --auth-id 'ups@pbs'
+proxmox-backup-manager acl update /system/status Admin --auth-id 'ups@pbs!shutdown'
+```
+
+Als API-URL `https://<pbs-ip>:8007` eintragen und mit **Test** prüfen. Drei Dinge
+unterscheiden sich von Proxmox VE und erklären die Befehle oben:
+
+- **Beide ACL-Einträge sind nötig.** Die Rechte eines Tokens werden aus dessen eigenen
+  ACL-Einträgen berechnet und anschließend mit denen seines Benutzers geschnitten — ein
+  Token kann seinen Benutzer also nie übersteigen. Fehlt einer der beiden, hat das Token
+  das Recht nicht.
+- **Die Rolle ist `Admin`.** PBS kennt keine feingranulare Power-Rolle —
+  `Sys.PowerManagement` trägt nur `Admin`. Die Vergabe auf `/system/status` statt auf `/`
+  hält den Umfang so eng, wie PBS es zulässt.
+- **Das Feld „Node" ist nur eine Bezeichnung.** PBS ignoriert den Node im API-Pfad, der
+  Shutdown geht immer an `/nodes/localhost/status`; nichts muss zum Hostnamen passen.
+
+> [!WARNING]
+> **Gut abwägen, ob ein Backup Server hier überhaupt eingebunden werden soll.** Das obige
+> Token ist ein `Admin`-Token, und PVE-UPS muss die PBS-API aus genau der Umgebung heraus
+> erreichen, die es schützt. Das verbreitert den Weg von einem kompromittierten
+> Virtualisierungshost zu den Backups — also zu dem, was eine solche Kompromittierung
+> gerade überleben soll. Für Produktivumgebungen **empfehlen wir daher, PBS nicht** an
+> dieselbe PVE-UPS-Instanz zu hängen, die die PVE-Hosts verwaltet. Alternativen: dem Backup
+> Server einen eigenen Shutdown-Weg geben (eigene PVE-UPS-Instanz, nur aus einem getrennten
+> Management-Segment erreichbar) oder ihn kurze Ausfälle auf seiner eigenen USV-Laufzeit
+> aussitzen lassen.
+
 ## Funktionen
 
 - **Mehrere USVs** pro Instanz mit Host↔USV-Zuordnung und Logik pro Host
   (**UND** = redundante Netzteile, **ODER** = aufgeteilte Last), inkl. Live-Schaubild.
+- **Zwei Ziel-Typen**, in einer Instanz mischbar: **Proxmox-VE**-Knoten und ein **Proxmox
+  Backup Server** — je Host-Eintrag wählbar, jeweils mit eigenem Token-Schema und eigener
+  Rechteprüfung (vor dem Anbinden eines PBS in Produktion aber bitte die Warnung oben
+  lesen).
 - **Zwei USV-Quellen**, in einer Instanz frei mischbar:
   - **SNMP v1/v2c und v3** (authPriv), nur lesend. Liest die Standard-RFC-1628-UPS-MIB
     oder eine **Hersteller-MIB** — derzeit **APC PowerNet**, womit APC-Karten
@@ -189,11 +254,12 @@ UUID, wird nur dieses eine Mal angezeigt — jetzt kopieren). Beides im Wizard u
 - **Webhook-Benachrichtigungen** bei wichtigen Ereignissen — als vollständiges Status-JSON,
   als **Microsoft-Teams**-Karte oder als Klartext, mit Stufenfilter und Testversand.
 - **REST-Status** (`/api/status`, `/api/health`) — lesend, ohne Auth, ohne Secrets;
-  Ereignisprotokoll der letzten 48 h inklusive. Ereignis-/Webhook-Texte sind einheitlich
-  englisch.
-- **Konfigurations-Export/-Import**, NTP/Zeitzone, regelmäßiger Proxmox-Selbsttest
-  (Startzeit plus Intervall von 15 min bis 24 h), In-Place-**Updates per Paket-Upload**
-  im Webinterface.
+  Ereignisprotokoll der letzten 48 h inklusive. `/api/health` zählt zusätzlich, wie viele
+  Shutdown-Ziele ihren letzten Selbsttest bestanden haben. Ereignis-/Webhook-Texte sind
+  einheitlich englisch.
+- **Konfigurations-Export/-Import**, NTP/Zeitzone, regelmäßiger Selbsttest je Ziel
+  (Startzeit plus Intervall von 15 min bis 24 h; das Ergebnis wird je Host gemerkt und im
+  Dashboard angezeigt), In-Place-**Updates per Paket-Upload** im Webinterface.
 
 ## Sicherheitsmodell
 
@@ -210,6 +276,10 @@ UUID, wird nur dieses eine Mal angezeigt — jetzt kopieren). Beides im Wizard u
   und überstehen einen Dienst-Neustart.
 - **„Eigener Host zuletzt":** der Host, der die Appliance trägt, fährt immer zuletzt
   herunter.
+- **Ziele blockieren sich nicht gegenseitig:** Hosts mit gleicher Abschaltreihenfolge
+  werden gleichzeitig angewiesen, jeder Aufruf hat eine harte Obergrenze, und der eigene
+  Host bildet weiterhin die letzte Stufe — eine Maschine, die nicht mehr antwortet, kann
+  die übrigen und den Akku-Countdown damit nicht aufhalten.
 - Die App läuft **unprivilegiert**; ein schmaler privilegierter Begleiter wendet Updates
   und NTP-/Zeitzonen-Änderungen an. Secrets verlassen die Appliance nie über die API.
 
@@ -269,6 +339,9 @@ PVE_USV_CONFIG=./dev-config.yaml PVE_USV_DB=./dev-events.db python -m app.main
   Clusters funktionieren als Ziel (ein datacenter-weites Token deckt alle ab), aber PVE-UPS
   fasst **HA-Manager und Quorum nicht an** und löst keine Abhängigkeiten zwischen Knoten
   auf — mögliche spätere Erweiterung.
+- Shutdown-Ziele sind **Proxmox VE und Proxmox Backup Server**. Proxmox Mail Gateway und
+  Datacenter Manager sind nicht umgesetzt: beide sprechen ihr eigenes Token-Schema, und
+  ungetesteter Support wäre schlechter als keiner.
 - Liest die Standard-RFC-1628-UPS-MIB, die APC-PowerNet-MIB oder die Variablen eines
   NUT-Servers. Weitere Hersteller-MIBs sind noch nicht umgesetzt — ein Gerät außerhalb
   davon braucht entweder RFC 1628 oder einen NUT-Treiber. Die Appliance selbst spricht kein

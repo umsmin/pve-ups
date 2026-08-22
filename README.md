@@ -8,9 +8,16 @@ and no config files.**
 PVE-UPS monitors one or more UPS devices — **with an SNMP network card (standard RFC 1628
 or a vendor MIB such as APC PowerNet)** or **through a NUT server**, which is how USB and
 serial UPS devices are read — and, on a power outage, shuts down one or more **Proxmox VE
-hosts** in an orderly fashion. The modern replacement for vendor-locked appliances such as APC
-PowerChute Network Shutdown. Everything is configured through a **web wizard**; monitoring
-is available as **REST/JSON**.
+hosts** (and, if you want, a **Proxmox Backup Server**) in an orderly fashion. The modern
+replacement for vendor-locked appliances such as APC PowerChute Network Shutdown.
+Everything is configured through a **web wizard**; monitoring is available as **REST/JSON**.
+
+> [!IMPORTANT]
+> PVE-UPS is built for an **internal (management) network**. It holds API tokens that can
+> power off servers, so run it like any other management tool: reachable only from trusted
+> networks, never exposed to the internet, behind the same firewalling and access control
+> as the Proxmox web interfaces. Note that `/api/status` and `/api/health` are deliberately
+> readable without a login so monitoring can poll them.
 
 ## Why not NUT?
 
@@ -121,10 +128,26 @@ Everything else (SNMP polling, Proxmox shutdown, thresholds, webhook, self-test)
 identically to the LXC deployment. The LXC install (above) remains the primary, fully
 self-updating path.
 
-## Connecting the Proxmox hosts (API token)
+## Connecting the hosts (API token)
 
 The appliance shuts hosts down through the Proxmox API — no root SSH, no agent on the
-host. It needs a dedicated user with a **single privilege** (`Sys.PowerMgmt`) and an API
+host. Each host entry has a **type**, because Proxmox VE and Proxmox Backup Server use
+different token schemes and privilege names:
+
+| | Proxmox VE | Proxmox Backup Server |
+|---|---|---|
+| API port | 8006 | 8007 |
+| Privilege | `Sys.PowerMgmt` | `Sys.PowerManagement` |
+| Granted on | `/nodes` | `/system/status` |
+| "Node" field | the real node name | a free label (PBS ignores it) |
+
+Picking the wrong type is the most common cause of a failing test: a Backup Server entered
+as "Proxmox VE" rejects the request outright and reports *"Authentication failed (token
+invalid?)"*, however valid the token is.
+
+### Proxmox VE
+
+It needs a dedicated user with a **single privilege** (`Sys.PowerMgmt`) and an API
 token. Run **once** in a node shell (as root):
 
 ```bash
@@ -155,10 +178,47 @@ shown only this once — copy it now). Enter both in the wizard under **Proxmox 
 - Leave **Verify TLS** off as long as the host uses Proxmox's self-signed certificate.
 - The token is revocable at any time: `pveum user token remove ups@pve shutdown`.
 
+### Proxmox Backup Server
+
+Run this in the shell of the Backup Server. The ACL is granted **twice** — once to the
+user, once to the token:
+
+```bash
+proxmox-backup-manager user create ups@pbs
+proxmox-backup-manager user generate-token ups@pbs shutdown
+proxmox-backup-manager acl update /system/status Admin --auth-id 'ups@pbs'
+proxmox-backup-manager acl update /system/status Admin --auth-id 'ups@pbs!shutdown'
+```
+
+Enter the API URL as `https://<pbs-ip>:8007` and check with **Test**. Three things differ
+from Proxmox VE and explain the commands above:
+
+- **Both ACL entries are required.** A token's permissions are computed from its own ACL
+  entries and then intersected with those of its user, so a token can never exceed its
+  user. Granting only one leaves the token without the privilege.
+- **The role is `Admin`.** PBS has no fine-grained power-management role —
+  `Sys.PowerManagement` is only carried by `Admin`. Granting it on `/system/status` rather
+  than `/` keeps the scope as narrow as PBS allows.
+- **The "Node" field is only a label.** PBS ignores the node in the API path, so the
+  shutdown always addresses `/nodes/localhost/status`; nothing has to match the hostname.
+
+> [!WARNING]
+> **Consider carefully whether to attach a Backup Server here at all.** The token above is
+> an `Admin` token, and PVE-UPS has to reach the PBS API from the very environment it
+> protects. That widens the path from a compromised virtualisation host to the backups —
+> which are exactly what should survive such a compromise. For production environments we
+> **recommend against** attaching PBS to the same PVE-UPS instance that manages the PVE
+> hosts. Alternatives: give the Backup Server its own shutdown path (a separate PVE-UPS
+> instance, reachable only from a separate management segment), or let it ride out short
+> outages on its own UPS runtime.
+
 ## Features
 
 - **Multiple UPS devices** per instance with host↔UPS mapping and per-host logic
   (**AND** = redundant power supplies, **OR** = split load), including a live feed diagram.
+- **Two target types**, mixable in one instance: **Proxmox VE** nodes and a **Proxmox
+  Backup Server** — selected per host entry, each with its own token scheme and privilege
+  check (but see the warning above before attaching a PBS in production).
 - **Two UPS sources**, freely mixable in one instance:
   - **SNMP v1/v2c and v3** (authPriv), read-only. Reads the standard RFC 1628 UPS MIB or a
     **vendor MIB** — currently **APC PowerNet**, which is what makes APC cards work that
@@ -180,10 +240,11 @@ shown only this once — copy it now). Enter both in the wizard under **Proxmox 
 - **Webhook notifications** on notable events, as full status JSON, a **Microsoft Teams**
   adaptive card or plain text — with a severity filter and a test-send button.
 - **REST status** (`/api/status`, `/api/health`) — read-only, no auth, no secrets;
-  event log of the last 48 h included. Event/webhook texts are uniformly English.
-- **Config export/import**, NTP/timezone setup, scheduled Proxmox connectivity self-test
-  (start time plus an interval from 15 min to 24 h), in-place **updates via package
-  upload** in the web UI.
+  event log of the last 48 h included. `/api/health` also counts how many shutdown targets
+  passed their last self-test. Event/webhook texts are uniformly English.
+- **Config export/import**, NTP/timezone setup, scheduled connectivity self-test per target
+  (start time plus an interval from 15 min to 24 h; the result is kept per host and shown
+  on the dashboard), in-place **updates via package upload** in the web UI.
 
 ## Safety model
 
@@ -198,6 +259,10 @@ shown only this once — copy it now). Enter both in the wizard under **Proxmox 
 - A confirmed trigger and the on-battery countdown are **persisted to disk** and survive
   a service restart.
 - **"Own host last":** the host carrying the appliance is always shut down last.
+- **Targets cannot block each other:** hosts sharing a shutdown order are commanded at the
+  same time, each call has a hard deadline, and the appliance's own host still forms the
+  final stage — so one machine that stops responding cannot delay the others or the
+  battery countdown.
 - The app runs **unprivileged**; a slim privileged companion applies updates and
   NTP/timezone changes. Secrets never leave the appliance via the API.
 
@@ -256,6 +321,9 @@ PVE_USV_CONFIG=./dev-config.yaml PVE_USV_DB=./dev-events.db python -m app.main
   as targets (one datacenter-wide token covers them all), but PVE-UPS does not touch the
   **HA manager or quorum** and resolves no dependencies between nodes — a possible future
   extension.
+- Shutdown targets are **Proxmox VE and Proxmox Backup Server**. Proxmox Mail Gateway and
+  Datacenter Manager are not implemented: each speaks its own token scheme, and shipping
+  untested support would be worse than none.
 - Reads the standard RFC 1628 UPS MIB, the APC PowerNet MIB, or a NUT server's variables.
   Other vendor MIBs are not implemented yet — a device outside those needs either RFC 1628
   or a NUT driver. There is no direct USB/serial support in the appliance itself; a locally

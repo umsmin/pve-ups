@@ -178,14 +178,16 @@
       </div>
 
       <div class="card">
-        <div class="card-h"><h3><span class="section-num">2</span> <svg class="icon"><use href="#i-server"></use></svg> <span data-i18n="wiz.hosts">Proxmox hosts</span></h3>
-          <a class="doclink" href="/manual.html#token" data-manual="token" target="_blank" rel="noopener" title="Read in the manual: Creating the Proxmox API token" data-i18n-title="wiz.hostsDoc"><svg class="icon"><use href="#i-help"></use></svg></a></div>
-        <p class="help" data-i18n-html="wiz.hostsHelp">API token with the <code>Sys.PowerMgmt</code> privilege. The host marked <span class="lg-star">★</span>
+        <div class="card-h"><h3><span class="section-num">2</span> <svg class="icon"><use href="#i-server"></use></svg> <span data-i18n="wiz.hosts">Proxmox hosts (VE / Backup Server)</span></h3>
+          <a class="doclink" href="/manual.html#token" data-manual="token" target="_blank" rel="noopener" title="Read in the manual: Creating the API token" data-i18n-title="wiz.hostsDoc"><svg class="icon"><use href="#i-help"></use></svg></a></div>
+        <p class="help" data-i18n-html="wiz.hostsHelp">Pick the type per target: Proxmox VE needs a token with <code>Sys.PowerMgmt</code>,
+          Proxmox Backup Server one with <code>Sys.PowerManagement</code>. The host marked <span class="lg-star">★</span>
           “This host” (the appliance) is shut down last.</p>
         <div id="hostRows"></div>
         <div class="row" style="margin-top:12px;align-items:center">
           <button id="addHostBtn" class="btn-ghost btn-sm" style="flex:0 0 auto" data-i18n="wiz.addHost">+ Host</button>
         </div>
+        <p class="help" id="shutdownSeq"></p>
         <div class="topo-wrap">
           <div class="card-h"><h3 style="font-size:14px" data-i18n="topo.diagram">Feed diagram</h3></div>
           <svg id="topoDiagram" class="topo" width="100%"></svg>

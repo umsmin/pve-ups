@@ -129,6 +129,15 @@ const ENGINE_STATES = ["ONLINE", "ON_BATTERY", "SHUTDOWN_PENDING", "SHUTTING_DOW
 const SHUTDOWN_STATES = ["idle", "sent", "failed"];
 function engineStateLabel(s) { return ENGINE_STATES.includes(s) ? t("state.engine." + s) : s; }
 function shutdownStateLabel(s) { return SHUTDOWN_STATES.includes(s) ? t("state.shutdown." + s) : (s || "–"); }
+// Short label for tight spots (dashboard chip, host card heading) — "Proxmox BS" instead
+// of the full product name, so a PBS row is no wider than a PVE one. The type dropdown
+// keeps the spelled-out name, where being unambiguous matters more than width.
+// HOST_TYPES is declared further down (with the other config tables); a config written
+// before the type existed reports none, which reads as the only target type back then.
+function hostTypeLabel(ty) {
+  const known = HOST_TYPES.some(([v]) => v === ty);
+  return known ? t("htype." + ty + "Short") : (ty || t("htype.pveShort"));
+}
 
 // Seconds -> "1 d 3 h 20 min" (compact, readable uptime).
 function fmtUptime(s) {
@@ -264,9 +273,13 @@ async function refreshStatus() {
     const stLbl = shutdownStateLabel(st);
     const star = h.this_host
       ? ` <span class='chip star' title="${esc(t("hosts.thisChipTitle"))}">${esc(t("hosts.thisChip"))}</span>` : "";
-    return `<tr><td>${esc(h.name)}${star}</td>
+    const kind = ` <span class='chip muted'>${esc(hostTypeLabel(h.type))}</span>`;
+    // A credential that broke long before any outage would otherwise stay invisible:
+    // show the self-test complaint whenever there is no fresher shutdown error.
+    const err = h.last_error || h.last_test_error || "";
+    return `<tr><td>${esc(h.name)}${kind}${star}</td>
       <td>${feeds} <span class="muted">(${esc(policy)})</span></td>
-      <td>${pill(stLbl, cls)}</td><td class="muted">${esc(h.last_error || "")}</td></tr>`;
+      <td>${pill(stLbl, cls)}</td><td class="muted">${esc(err)}</td></tr>`;
   }).join("");
   $("d_hosts").innerHTML = rows || `<tr><td class='empty' colspan='4'>${esc(t("hosts.none"))}</td></tr>`;
 
@@ -326,6 +339,9 @@ const SOURCE_TYPES = [["snmp", t("src.snmp")], ["nut", t("src.nut")]];
 // Must match config.SnmpMib; tests/test_i18n.py keeps the labels in both dictionaries.
 const SNMP_MIBS = [["auto", t("mib.auto")], ["rfc1628", t("mib.rfc1628")], ["apc", t("mib.apc")]];
 const DEFAULT_PORTS = { snmp: 161, nut: 3493 };
+// Must match config.HostType; tests/test_i18n.py keeps the labels in both dictionaries.
+const HOST_TYPES = [["pve", t("htype.pve")], ["pbs", t("htype.pbs")]];
+const HOST_DEFAULT_PORTS = { pve: 8006, pbs: 8007 };
 const TRISTATE = [["", t("tristate.global")], ["on", t("tristate.on")], ["off", t("tristate.off")]];
 const opts = (list, val) => list.map(([v, l]) => `<option value="${v}" ${v === val ? "selected" : ""}>${l}</option>`).join("");
 const triVal = (v) => v === true ? "on" : v === false ? "off" : "";
@@ -601,25 +617,28 @@ function addHostRow(h, isNew, open) {
   const secretSet = h.token_secret === SECRET_PLACEHOLDER;
   // Remember the desired feeds so renderHostUpsCheckboxes() can preselect them.
   el.dataset.feeds = h.ups_ids ? JSON.stringify(h.ups_ids) : (isNew ? "ALL" : "[]");
+  const type = h.type || "pve";
   el.innerHTML = `
     <summary class="cfg-head">${svgIcon("i-server")}<span class="cfg-title h_sum_name"></span><span class="cfg-sub h_sum_meta"></span></summary>
     <div class="row">
-      <label title="${esc(t("host.nodeTitle"))}">${esc(t("host.node"))} <input class="h_name" value="${esc(h.name || "")}" placeholder="pve01" /></label>
-      <label title="${esc(t("host.apiurlTitle"))}">${esc(t("host.apiurl"))} <input class="h_url" value="${esc(h.api_url || "")}" placeholder="https://10.0.0.10:8006" /></label>
+      <label title="${esc(t("host.typeTitle"))}">${esc(t("host.type"))} <select class="h_type">${opts(HOST_TYPES, type)}</select></label>
+      <label class="h_namelbl" title=""><span class="h_namecap"></span> <input class="h_name" value="${esc(h.name || "")}" /></label>
+      <label title="${esc(t("host.apiurlTitle"))}">${esc(t("host.apiurl"))} <input class="h_url" value="${esc(h.api_url || "")}" /></label>
     </div>
     <div class="row">
-      <label title="${esc(t("host.tokenIdTitle"))}">${esc(t("host.tokenId"))} <input class="h_token_id" value="${esc(h.token_id || "")}" placeholder="ups@pve!shutdown" /></label>
+      <label title="${esc(t("host.tokenIdTitle"))}">${esc(t("host.tokenId"))} <input class="h_token_id" value="${esc(h.token_id || "")}" /></label>
       <label title="${esc(t("host.tokenSecretTitle"))}">${esc(t("host.tokenSecret"))} <input class="h_token_secret" type="password" placeholder="${esc(secretSet ? t("cfg.unchanged") : t("host.tokenSecretPh"))}" /></label>
     </div>
+    <p class="help h_hint"><span class="h_hinttext"></span> <a class="h_hintdoc" data-manual="token-pve" target="_blank" rel="noopener"></a></p>
     <div class="feedsblock" title="${esc(t("host.feedsTitle"))}">
       <span class="cfg-label">${esc(t("host.feeds"))}</span>
       <div class="h_feeds"></div>
     </div>
     <div class="row hostflags">
       <label title="${esc(t("host.policyTitle"))}">${esc(t("host.policy"))} <select class="h_policy"><option value="all">${esc(t("hosts.policyAnd"))}</option><option value="any">${esc(t("hosts.policyOr"))}</option></select></label>
-      <label title="${esc(t("host.orderTitle"))}">${esc(t("host.order"))} <input class="h_order" type="number" value="${h.order || 0}" /></label>
+      <label class="h_orderlbl" title="${esc(t("host.orderTitle"))}">${esc(t("host.order"))} <input class="h_order" type="number" value="${h.order || 0}" /></label>
       <label class="chkline" title="${esc(t("host.verifyTitle"))}"><input class="h_verify" type="checkbox" ${h.verify_tls ? "checked" : ""} /> ${esc(t("host.verify"))}</label>
-      <label class="chkline" title="${esc(t("host.thisTitle"))}"><input class="h_this" type="checkbox" ${h.this_host ? "checked" : ""} /> ${esc(t("host.this"))}</label>
+      <label class="chkline h_thislbl" title="${esc(t("host.thisTitle"))}"><input class="h_this" type="checkbox" ${h.this_host ? "checked" : ""} /> ${esc(t("host.this"))}</label>
       <label class="chkline" title="${esc(t("host.enabledTitle"))}"><input class="h_enabled" type="checkbox" ${h.enabled !== false ? "checked" : ""} /> ${esc(t("host.enabled"))}</label>
     </div>
     <div class="row" style="margin:0;align-items:center">
@@ -632,16 +651,67 @@ function addHostRow(h, isNew, open) {
     const nm = el.querySelector(".h_name").value.trim() || t("host.newName");
     const isThis = el.querySelector(".h_this").checked;
     const en = el.querySelector(".h_enabled").checked;
+    const ty = el.querySelector(".h_type").value;
     el.querySelector(".h_sum_name").textContent = nm + (isThis ? " ★" : "");
-    el.querySelector(".h_sum_meta").textContent = en ? "" : t("host.inactive");
+    el.querySelector(".h_sum_meta").textContent =
+      "· " + hostTypeLabel(ty) + (en ? "" : " " + t("host.inactive"));
+  };
+  // Everything that reads differently per product: the name field is a real node name on
+  // PVE but only a label on PBS, and each has its own port, token realm and manual anchor.
+  const toggleHostType = () => {
+    const ty = el.querySelector(".h_type").value;
+    const pbs = ty === "pbs";
+    const lbl = el.querySelector(".h_namelbl");
+    lbl.title = t(pbs ? "host.nameTitle" : "host.nodeTitle");
+    el.querySelector(".h_namecap").textContent = t(pbs ? "host.name" : "host.node");
+    el.querySelector(".h_name").placeholder = pbs ? "Backup-Server" : "pve01";
+    el.querySelector(".h_url").placeholder = pbs ? "https://10.0.0.20:8007" : "https://10.0.0.10:8006";
+    el.querySelector(".h_token_id").placeholder = pbs ? "ups@pbs!shutdown" : "ups@pve!shutdown";
+    el.querySelector(".h_hinttext").textContent = t("htype." + ty + "Help");
+    const doc = el.querySelector(".h_hintdoc");
+    doc.textContent = t("host.hintDoc");
+    doc.dataset.manual = pbs ? "token-pbs" : "token-pve";
+    applyTranslations(el);  // rewrites the doc link to the current language's manual
+    syncFlags();
+  };
+  // Which of the flags can apply at all. Order matters here: the "this host" rule may
+  // clear the tick, and the order field has to come back in the same pass.
+  const syncFlags = () => {
+    const pbs = el.querySelector(".h_type").value === "pbs";
+    // An LXC never runs on a Backup Server, so "this host" cannot apply there. In a
+    // Docker deployment the container may well sit on the PBS — and then the mark
+    // matters, or the appliance kills itself midway through the sequence.
+    const impossible = pbs && deployment !== "docker";
+    el.querySelector(".h_thislbl").hidden = impossible;
+    // Clear it as well: hostFromRow() still reads the checkbox, and a hidden tick
+    // would keep being submitted.
+    if (impossible) el.querySelector(".h_this").checked = false;
+    // "This host" is the first sort key, so it beats the number outright — a marked
+    // host is last whatever it says. Hide the field rather than let it suggest an
+    // effect it does not have. The value is kept, so unticking restores it.
+    el.querySelector(".h_orderlbl").hidden = el.querySelector(".h_this").checked;
+    updSum();
   };
   el.querySelector(".h_del").onclick = () => { el.remove(); drawConfigTopology(); };
   el.querySelector(".h_test").onclick = () => testHost(el);
   el.querySelector(".h_name").oninput = () => { updSum(); drawConfigTopology(); };
-  el.querySelector(".h_this").onchange = () => { updSum(); drawConfigTopology(); };
-  el.querySelector(".h_enabled").onchange = updSum;
+  el.querySelector(".h_this").onchange = () => { syncFlags(); drawConfigTopology(); };
+  // Order and "active" do not touch the diagram, but they do change the shutdown
+  // sequence shown below it.
+  el.querySelector(".h_order").oninput = renderShutdownSequence;
+  el.querySelector(".h_enabled").onchange = () => { updSum(); drawConfigTopology(); };
+  el.querySelector(".h_type").onchange = () => {
+    // Carry the URL over to the new type's default port, unless the user typed their own.
+    const ty = el.querySelector(".h_type").value;
+    const urlEl = el.querySelector(".h_url");
+    const known = Object.values(HOST_DEFAULT_PORTS).map(String);
+    urlEl.value = urlEl.value.replace(/:(\d+)\/?$/, (m, port) =>
+      known.includes(port) ? ":" + HOST_DEFAULT_PORTS[ty] : m);
+    toggleHostType();
+    drawConfigTopology();
+  };
   $("hostRows").appendChild(el);
-  updSum();
+  toggleHostType();
 }
 $("addHostBtn").onclick = () => { addHostRow({}, true, true); renderHostUpsCheckboxes(); drawConfigTopology(); };
 
@@ -671,6 +741,7 @@ function hostFromRow(tr) {
   const secret = tr.querySelector(".h_token_secret").value;
   return {
     name: tr.querySelector(".h_name").value.trim(),
+    type: tr.querySelector(".h_type").value,
     api_url: tr.querySelector(".h_url").value.trim(),
     method: "api_token",
     token_id: tr.querySelector(".h_token_id").value.trim(),
@@ -734,6 +805,8 @@ function drawTopology(svg, ups, hosts, statusMap) {
   // Host nodes (right)
   hosts.forEach((h, j) => {
     const y = hostY[j];
+    // Name only: the nodes are NW wide and a product name in front pushes it out. The
+    // type is shown where there is room for it (dashboard chip, host card heading).
     const label = esc(h.name) + (h.this_host ? " ★" : "");
     out += `<g class="topo-node host" data-host="${j}"><rect x="${rightX}" y="${y}" width="${NW}" height="${NH}" rx="6"/>` +
       `<text x="${rightX + 10}" y="${y + NH / 2 + 4}">${label}</text></g>`;
@@ -777,10 +850,49 @@ function wireTopoHover(svg) {
 function drawConfigTopology() {
   const hosts = Array.from(document.querySelectorAll("#hostRows .host-cfg")).map((tr) => ({
     name: tr.querySelector(".h_name").value.trim(),
+    type: tr.querySelector(".h_type").value,
     this_host: tr.querySelector(".h_this").checked,
     ups_ids: Array.from(tr.querySelectorAll(".h_feed")).filter((c) => c.checked).map((c) => c.value),
   })).filter((h) => h.name);
   drawTopology($("topoDiagram"), upsMeta(), hosts, null);
+  renderShutdownSequence();
+}
+
+// Preview of the order the engine would actually use, live from the form. Mirrors
+// AppConfig.ordered_hosts(): sort by (this_host, order, name), then group — hosts
+// sharing a stage are commanded at the same time, and "this host" forms the last
+// stage on its own. Without this, neither "which number goes first" nor the staged
+// behaviour is visible anywhere in the UI.
+function renderShutdownSequence() {
+  const el = $("shutdownSeq");
+  if (!el) return;
+  const hosts = Array.from(document.querySelectorAll("#hostRows .host-cfg"))
+    .map((tr) => ({
+      name: tr.querySelector(".h_name").value.trim(),
+      order: Number(tr.querySelector(".h_order").value || 0),
+      this_host: tr.querySelector(".h_this").checked,
+      enabled: tr.querySelector(".h_enabled").checked,
+    }))
+    .filter((h) => h.name && h.enabled)
+    .sort((a, b) => (a.this_host - b.this_host) || (a.order - b.order)
+      || a.name.localeCompare(b.name));
+
+  if (!hosts.length) {
+    el.innerHTML = `<b>${esc(t("hosts.seq"))}</b> <span class="muted">${esc(t("hosts.seqNone"))}</span>`;
+    return;
+  }
+  const stages = [];
+  hosts.forEach((h) => {
+    const prev = stages[stages.length - 1];
+    const same = prev && prev[0].this_host === h.this_host && prev[0].order === h.order;
+    if (same) prev.push(h); else stages.push([h]);
+  });
+  const chain = stages.map((stage, i) =>
+    `<span class="chip muted">${i + 1}.</span> ` +
+    stage.map((h) => esc(h.name) + (h.this_host ? " ★" : "")).join(" + ")
+  ).join(" &rarr; ");
+  el.innerHTML = `<b>${esc(t("hosts.seq"))}</b> ${chain}<br>`
+    + `<span class="muted">${esc(t("hosts.seqHint"))}</span>`;
 }
 
 // ===== notifications =======================================================

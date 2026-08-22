@@ -28,9 +28,11 @@ from pydantic import BaseModel
 
 from . import __version__, db
 from .config import (
+    TARGET_MODELS,
     UPS_SOURCE_MODELS,
     AppConfig,
     HostConfig,
+    PveHostConfig,
     SnmpConfig,
     UpsBase,
     WebhookConfig,
@@ -40,7 +42,7 @@ from .config import (
     save_config,
 )
 from .engine import Engine
-from . import notify, proxmox, sources
+from . import notify, sources, targets
 
 log = logging.getLogger("pve-usv")
 
@@ -251,6 +253,11 @@ async def api_health():
     snap = engine.snapshot()
     ok = engine._task is not None and not engine._task.done()
     ups_list = snap["ups"]
+    host_list = snap["hosts"]
+    # A shutdown target counts as ok once the self-test confirmed both its credentials
+    # and its power-management privilege; hosts never tested yet count as neither.
+    hosts_ok = sum(1 for h in host_list if h["credentials_ok"] and h["power_mgmt_ok"])
+    tested = [h for h in host_list if h["last_test_at"]]
     payload = {
         "status": "ok" if ok else "degraded",
         "version": __version__,
@@ -259,6 +266,13 @@ async def api_health():
         "ups_reachable": all(u["reachable"] for u in ups_list),
         "ups_reachable_count": sum(1 for u in ups_list if u["reachable"]),
         "ups_total": len(ups_list),
+        # Shutdown targets (PVE + PBS). Reported for monitoring, but deliberately not
+        # part of ``status``/the HTTP code: an expired token is a problem for the next
+        # outage, not a reason to declare a running appliance down.
+        "hosts_total": len(host_list),
+        "hosts_ok": hosts_ok,
+        "hosts_selftest_ok": (hosts_ok == len(host_list)) if tested else None,
+        "hosts_selftest_at": max((h["last_test_at"] for h in tested), default=None),
     }
     return JSONResponse(payload, status_code=200 if ok else 503)
 
@@ -357,6 +371,27 @@ def _reconcile_ups_secrets(ups_entry: dict, old: Optional[UpsBase]) -> None:
         ups_entry[fld] = _reconcile_secret(ups_entry.get(fld), old_secret)
 
 
+def _host_model(host_entry: dict) -> type[HostConfig]:
+    """Model class for a submitted host entry; unknown/absent type means a PVE node."""
+    return TARGET_MODELS.get(str(host_entry.get("type") or "pve"), PveHostConfig)
+
+
+def _host_key(host_entry: dict) -> str:
+    """The stored host's key for a submitted entry (mirrors HostConfig.key)."""
+    return f"{host_entry.get('type') or 'pve'}:{host_entry.get('name')}"
+
+
+def _reconcile_host_secrets(host_entry: dict, old: Optional[HostConfig]) -> None:
+    """Carry over unchanged (masked) per-host secrets, in place."""
+    model = _host_model(host_entry)
+    for fld, default in model.secret_fields().items():
+        # Only reuse the stored secret while the entry is still the same target type —
+        # repointing a host from PVE to PBS must not inherit the old token.
+        keep = old is not None and isinstance(old, model)
+        old_secret = getattr(old, fld).get_secret_value() if keep else default
+        host_entry[fld] = _reconcile_secret(host_entry.get(fld), old_secret)
+
+
 def _merge_config(incoming: dict, existing: AppConfig) -> AppConfig:
     """Build a new config, carrying over unchanged (masked) secrets."""
     data = dict(incoming)
@@ -367,12 +402,10 @@ def _merge_config(incoming: dict, existing: AppConfig) -> AppConfig:
         _reconcile_ups_secrets(ups_entry, existing_ups.get(ups_entry.get("id")))
     data.pop("snmp", None)  # legacy key never accepted from the form
 
-    # Host token secrets matched by node name
-    existing_hosts = {h.name: h for h in existing.hosts}
-    for host in data.get("hosts", []):
-        old = existing_hosts.get(host.get("name"))
-        old_secret = old.token_secret.get_secret_value() if old else ""
-        host["token_secret"] = _reconcile_secret(host.get("token_secret"), old_secret)
+    # Host token secrets, matched by type + node name (hosts have no id of their own).
+    existing_hosts = {h.key: h for h in existing.hosts}
+    for host in data.get("hosts", []) or []:
+        _reconcile_host_secrets(host, existing_hosts.get(_host_key(host)))
 
     # Never overwrite auth/session material from the config form.
     data["ui_password_hash"] = existing.ui_password_hash
@@ -511,14 +544,15 @@ async def api_test_snmp(incoming: dict):
 @app.post("/api/test/host", dependencies=[Depends(require_auth)])
 async def api_test_host(incoming: dict):
     assert engine is not None
-    # Reconcile this single host's secret against the stored one (by name).
-    existing_hosts = {h.name: h for h in engine.cfg.hosts}
-    old = existing_hosts.get(incoming.get("name"))
-    old_secret = old.token_secret.get_secret_value() if old else ""
+    # Reconcile this single host's secret against the stored one (by type + name).
     incoming = dict(incoming)
-    incoming["token_secret"] = _reconcile_secret(incoming.get("token_secret"), old_secret)
-    host = HostConfig.model_validate(incoming)
-    result = await proxmox.test_connection(host)
+    existing_hosts = {h.key: h for h in engine.cfg.hosts}
+    _reconcile_host_secrets(incoming, existing_hosts.get(_host_key(incoming)))
+    try:
+        host = _host_model(incoming).model_validate(incoming)
+    except Exception as exc:  # noqa: BLE001 - validation error -> 400
+        raise HTTPException(status_code=400, detail=f"Invalid host settings: {exc}")
+    result = await targets.test_connection(host)
     return {"ok": result.ok, "message": result.message, "has_power_mgmt": result.has_power_mgmt}
 
 

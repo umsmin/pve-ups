@@ -27,7 +27,9 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
-from . import __version__, db, notify, proxmox
+from itertools import groupby
+
+from . import __version__, db, notify, targets
 from .config import AppConfig, HostConfig, UpsBase
 from .sources import poll
 from .ups import UpsState
@@ -127,7 +129,9 @@ class Engine:
         self.triggered_at: Optional[datetime] = None
 
         # Per-host latch: do not re-fire while still pending. host_states holds the
-        # committed (real) shutdown result per host.
+        # committed (real) shutdown result and the last self-test result per host.
+        # Both are keyed by HostConfig.key ("<type>:<name>"), never by name alone —
+        # a PVE and a PBS entry may share a name without sharing a latch.
         self.host_fired: dict[str, bool] = {}
         self.host_states: dict[str, dict] = {}
 
@@ -485,7 +489,7 @@ class Engine:
         eligible: list[tuple[HostConfig, str]] = []
         for host in self.cfg.ordered_hosts():
             reason = self._host_trigger_reason(host)
-            committed = self.host_states.get(host.name, {}).get("shutdown_state") in (
+            committed = self.host_states.get(host.key, {}).get("shutdown_state") in (
                 "sent",
                 "failed",
             )
@@ -493,8 +497,8 @@ class Engine:
             if reason is None:
                 # No longer eligible (a required feed recovered): release a not-yet-committed
                 # (dry-run) latch so the dashboard can recover. A real, sent shutdown stays.
-                if self.host_fired.get(host.name) and not committed:
-                    self.host_fired[host.name] = False
+                if self.host_fired.get(host.key) and not committed:
+                    self.host_fired[host.key] = False
                     await self._emit(
                         f"Host {host.name}: shutdown aborted",
                         "Feeding UPS device(s) sufficient again — shutdown no longer needed.",
@@ -504,12 +508,18 @@ class Engine:
                     )
                 continue
 
-            if self.host_fired.get(host.name):
+            if self.host_fired.get(host.key):
                 continue  # already fired this episode
             eligible.append((host, reason))
 
-        for host, reason in eligible:
-            await self._fire_host(host, reason)
+        # Fire in stages: hosts sharing an ``order`` go at once, and ``this_host`` forms
+        # the final stage on its own. Concurrency within a stage is what keeps one target
+        # that stops responding from delaying its peers — and, because every stage is
+        # awaited inside the poll loop, from stalling the battery countdown as well.
+        # ``eligible`` is already sorted by (this_host, order, name), so the groups are
+        # contiguous; targets.shutdown() carries a hard deadline, so no stage can outlast it.
+        for _, group in groupby(eligible, key=lambda hr: (hr[0].this_host, hr[0].order)):
+            await asyncio.gather(*(self._fire_host(h, r) for h, r in group))
 
         # Clear the aggregate once nothing is pending/committed anymore.
         if not any(self.host_fired.values()):
@@ -667,7 +677,8 @@ class Engine:
             feeds = [self.cfg.ups_by_id(i) for i in self.cfg.feed_ids_for(h)]
             labels = "+".join(u.label for u in feeds if u) or "(no UPS)"
             policy = "AND" if h.ups_policy == "all" else "OR"
-            return f"{h.name} [{labels}, {policy}]"
+            kind = str(getattr(h, "type", "pve")).upper()
+            return f"{h.name} ({kind}) [{labels}, {policy}]"
 
         hosts = ", ".join(_desc(h) for h in self.cfg.ordered_hosts()) or "(no hosts)"
         msg = f"Test (dry-run): order {hosts}. NOTHING was shut down."
@@ -685,7 +696,7 @@ class Engine:
         except Exception as exc:  # noqa: BLE001 - housekeeping must never affect the loop
             log.warning("Event log prune failed: %s", exc)
 
-    # -- scheduled self-test of the Proxmox API credentials -----------------
+    # -- scheduled self-test of the shutdown targets' credentials -----------
     async def _maybe_selftest(self) -> None:
         """Run the credential self-test once per scheduled slot (see selftest_slot())."""
         cfg = self.cfg
@@ -712,16 +723,28 @@ class Engine:
         await self._run_selftest()
 
     async def _run_selftest(self) -> None:
-        """Verify token + Sys.PowerMgmt per host. Success is logged quietly (no notify),
-        failure is emitted (notify) so a broken credential is noticed."""
+        """Verify token + power-management privilege per host. Success is logged quietly
+        (no notify), failure is emitted (notify) so a broken credential is noticed."""
         hosts = self.cfg.ordered_hosts()
         # Concurrently: sequentially, five unreachable hosts would stall the poll loop for
         # 5 x 10 s. gather preserves the order, so the events stay in host order.
-        results = await asyncio.gather(*(proxmox.test_connection(h) for h in hosts))
+        results = await asyncio.gather(*(targets.test_connection(h) for h in hosts))
         today = _local_now().date()
         ok_all = True
         for host, result in zip(hosts, results):
-            if result.ok and result.has_power_mgmt:
+            # Keep the outcome per host: it is what /api/status and /api/health report,
+            # so a credential that broke months before an outage is visible on the
+            # dashboard instead of only in the event log.
+            host_ok = result.ok and result.has_power_mgmt
+            self.host_states.setdefault(host.key, {}).update(
+                {
+                    "credentials_ok": result.ok,
+                    "power_mgmt_ok": result.has_power_mgmt,
+                    "last_test_at": _now().isoformat(),
+                    "last_test_error": None if host_ok else result.message,
+                }
+            )
+            if host_ok:
                 # At a 15-minute cadence a quiet "ok" per host and run would be ~100
                 # events per host per day and drown the 48 h event feed. Write one per
                 # day, plus whenever the test recovers from a failure; otherwise the
@@ -749,8 +772,12 @@ class Engine:
 
     # -- shutdown execution --------------------------------------------------
     async def _fire_host(self, host: HostConfig, reason: str) -> None:
-        """Shut down a single host (or latch/log it in dry-run)."""
-        self.host_fired[host.name] = True
+        """Shut down a single host (or latch/log it in dry-run).
+
+        Runs concurrently with its stage peers (see _evaluate_hosts), so it must not
+        assume it is alone: state is merged into host_states, never replaced.
+        """
+        self.host_fired[host.key] = True
         if not self.shutdown_triggered:
             self.shutdown_triggered = True
             self.triggered_at = _now()
@@ -764,18 +791,20 @@ class Engine:
             )
             return
 
-        self.host_states.setdefault(host.name, {})
-        ok, msg = await proxmox.shutdown_node(
+        ok, msg = await targets.shutdown(
             host, timeout=self.cfg.thresholds.host_shutdown_timeout_s
         )
-        self.host_states[host.name] = {
-            "shutdown_state": "sent" if ok else "failed",
-            "last_action_at": _now().isoformat(),
-            "last_error": None if ok else msg,
-            "reachable": ok,
-            "this_host": host.this_host,
-            "order": host.order,
-        }
+        # Merge, so the last self-test result stays visible next to the shutdown result.
+        self.host_states.setdefault(host.key, {}).update(
+            {
+                "shutdown_state": "sent" if ok else "failed",
+                "last_action_at": _now().isoformat(),
+                "last_error": None if ok else msg,
+                "reachable": ok,
+                "this_host": host.this_host,
+                "order": host.order,
+            }
+        )
         await self._emit(
             f"Host {host.name}: shutdown {'sent' if ok else 'FAILED'}",
             f"Reason: {reason}. {msg}",
@@ -863,7 +892,7 @@ class Engine:
 
         hosts = []
         for h in self.cfg.ordered_hosts():
-            st = self.host_states.get(h.name, {})
+            st = self.host_states.get(h.key, {})
             feed_ids = self.cfg.feed_ids_for(h)
             feeds = []
             for uid in feed_ids:
@@ -879,6 +908,8 @@ class Engine:
             hosts.append(
                 {
                     "name": h.name,
+                    # getattr default: a config that predates the type field still renders.
+                    "type": getattr(h, "type", "pve"),
                     "this_host": h.this_host,
                     "order": h.order,
                     "ups_ids": list(h.ups_ids),
@@ -890,6 +921,11 @@ class Engine:
                     "shutdown_state": st.get("shutdown_state", "idle"),
                     "last_action_at": st.get("last_action_at"),
                     "last_error": st.get("last_error"),
+                    # Last self-test outcome (None until the first run).
+                    "credentials_ok": st.get("credentials_ok"),
+                    "power_mgmt_ok": st.get("power_mgmt_ok"),
+                    "last_test_at": st.get("last_test_at"),
+                    "last_test_error": st.get("last_test_error"),
                 }
             )
 

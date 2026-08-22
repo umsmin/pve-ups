@@ -205,8 +205,28 @@ class ShutdownMethod(str, Enum):
     api_token = "api_token"
 
 
+class HostType(str, Enum):
+    """Which Proxmox product a shutdown target is. The value is the ``type``
+    discriminator in the config.
+
+    Every member needs a matching ``htype.<value>`` i18n key in en.js *and* de.js
+    (enforced by tests/test_i18n.py).
+    """
+
+    pve = "pve"  # Proxmox VE node
+    pbs = "pbs"  # Proxmox Backup Server
+
+
 class HostConfig(BaseModel):
-    name: str  # Proxmox node name, e.g. "pve01"
+    """Fields every shutdown target shares, regardless of which product it runs.
+
+    The engine, the host↔UPS mapping and the whole trigger machinery only ever touch
+    these — a new target type therefore inherits the eligibility, ordering and
+    fail-safe logic unchanged. What differs per product (auth header, ACL path,
+    privilege name, node path) lives in the client module behind app/targets.py.
+    """
+
+    name: str  # Proxmox node name, e.g. "pve01"; a free label for products that ignore it
     api_url: str  # e.g. "https://10.0.0.10:8006"
     method: ShutdownMethod = ShutdownMethod.api_token
     # API token: user@realm!tokenid + secret
@@ -224,6 +244,58 @@ class HostConfig(BaseModel):
     # redundant load).
     ups_ids: list[str] = Field(default_factory=list)
     ups_policy: Literal["all", "any"] = "all"
+
+    @property
+    def key(self) -> str:
+        """Stable runtime key (shutdown latches, per-host state, secret reconcile).
+
+        Hosts have no id field, so the name carries that role — but a PVE and a PBS
+        entry may legitimately share one, which must not make them share a latch.
+        """
+        return f"{getattr(self, 'type', 'pve')}:{self.name}"
+
+    @property
+    def api_node(self) -> str:
+        """The ``{node}`` path segment of the shutdown call."""
+        return self.name
+
+    @classmethod
+    def secret_fields(cls) -> dict[str, str]:
+        """Secret field names -> default value, for the API's masked-secret reconcile."""
+        return {"token_secret": ""}
+
+
+class PveHostConfig(HostConfig):
+    """A Proxmox VE node (the original, and still the default target)."""
+
+    # Plain string literal (not the enum) for the same reason as SnmpConfig.type: a
+    # YAML/JSON "pve" validates directly and round-trips through yaml.safe_dump
+    # untouched. HostType stays the single list of valid values.
+    type: Literal["pve"] = "pve"
+
+
+class PbsHostConfig(HostConfig):
+    """A Proxmox Backup Server instance (default API port 8007)."""
+
+    type: Literal["pbs"] = "pbs"
+
+    @property
+    def api_node(self) -> str:
+        # PBS ignores the {node} path segment — its router matches any value and the
+        # handler does not even take it — and its own web UI calls /nodes/localhost/…
+        # So ``name`` is a free label here and the path stays constant, which removes
+        # the "wrong node name" guessing that made PBS look unsupported.
+        return "localhost"
+
+
+# Discriminated union of every supported shutdown target. Adding a type means: a model
+# here, a branch in app/targets.py, an entry in HostType and the matching i18n keys.
+ShutdownTarget = Annotated[Union[PveHostConfig, PbsHostConfig], Field(discriminator="type")]
+
+TARGET_MODELS: dict[str, type[HostConfig]] = {
+    "pve": PveHostConfig,
+    "pbs": PbsHostConfig,
+}
 
 
 class Thresholds(BaseModel):
@@ -326,12 +398,12 @@ class AppConfig(BaseModel):
     dry_run: bool = True
 
     ups: list[UpsSource] = Field(default_factory=list)
-    hosts: list[HostConfig] = Field(default_factory=list)
+    hosts: list[ShutdownTarget] = Field(default_factory=list)
     thresholds: Thresholds = Thresholds()
     notifications: Notifications = Notifications()
 
-    # Scheduled self-test: verify the Proxmox API token + Sys.PowerMgmt still work, so a
-    # broken/expired credential is caught long before a real outage needs it.
+    # Scheduled self-test: verify the API token + power-management privilege still work,
+    # so a broken/expired credential is caught long before a real outage needs it.
     selftest_enabled: bool = True
     selftest_hour: int = 9  # anchor: hour of day (0-23, server local time)
     selftest_interval_min: int = 1440  # repeat every N minutes from the anchor; 1440 = daily
@@ -381,6 +453,29 @@ class AppConfig(BaseModel):
         if isinstance(ups, list):
             data["ups"] = [
                 {**u, "type": u.get("type") or "snmp"} if isinstance(u, dict) else u for u in ups
+            ]
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_host_list(cls, data):
+        """Give pre-3.5 hosts the ``type`` the discriminated union needs.
+
+        Proxmox VE was the only shutdown target back then, so a host without a type is
+        a PVE node. This runs for every entry point that builds a config — the stored
+        config.yaml, a backup import, and the form POST of a stale, cached app.js — so
+        none of them can be refused over a key that simply did not exist yet.
+
+        Only a missing/empty type is filled in. An unknown one is left alone and the
+        union rejects it: mistaking one product for another would send the wrong auth
+        header to a real machine, which is worse than a clear error.
+        """
+        if not isinstance(data, dict):
+            return data
+        hosts = data.get("hosts")
+        if isinstance(hosts, list):
+            data["hosts"] = [
+                {**h, "type": h.get("type") or "pve"} if isinstance(h, dict) else h for h in hosts
             ]
         return data
 

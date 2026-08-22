@@ -5,13 +5,15 @@ These tests need no UPS hardware and no network.
 """
 
 from datetime import datetime, timedelta, timezone
+from itertools import groupby
 
 import pytest
 
 from app.config import (
     AppConfig,
-    HostConfig,
     NutConfig,
+    PbsHostConfig,
+    PveHostConfig,
     SnmpConfig,
     SnmpMib,
     SnmpVersion,
@@ -38,7 +40,7 @@ def test_config_roundtrip_keeps_secrets(tmp_path):
     cfg = AppConfig(
         ups=[SnmpConfig(id="ups1", name="USV A", host="10.0.0.9",
                         version=SnmpVersion.v2c, community="topsecret")],
-        hosts=[HostConfig(name="pve01", api_url="https://10.0.0.10:8006",
+        hosts=[PveHostConfig(name="pve01", api_url="https://10.0.0.10:8006",
                           token_id="ups@pve!shutdown", token_secret="uuid-secret",
                           this_host=True, ups_ids=["ups1"])],
     )
@@ -65,7 +67,7 @@ def test_config_roundtrip_multi_ups_and_overrides(tmp_path):
             SnmpConfig(id="b", name="B", host="10.0.0.2", community="cb",
                        overrides=UpsThresholdOverride(runtime_below_minutes=2)),
         ],
-        hosts=[HostConfig(name="pve01", api_url="x", ups_ids=["a", "b"], ups_policy="all")],
+        hosts=[PveHostConfig(name="pve01", api_url="x", ups_ids=["a", "b"], ups_policy="all")],
     )
     save_config(cfg, path)
     loaded = load_config(path)
@@ -113,6 +115,123 @@ def test_config_defaults_untyped_ups_entries_to_snmp(tmp_path):
     assert yaml.safe_load(path.read_text(encoding="utf-8"))["ups"][0]["type"] == "snmp"
 
 
+def test_config_defaults_untyped_hosts_to_pve(tmp_path):
+    """Pre-3.5 hosts have no ``type``; PVE was the only shutdown target back then."""
+    import yaml
+
+    path = tmp_path / "config.yaml"
+    old = {"hosts": [{"name": "pve01", "api_url": "https://x:8006", "token_id": "u!t"}]}
+    path.write_text(yaml.safe_dump(old), encoding="utf-8")
+    cfg = load_config(path)
+    assert isinstance(cfg.hosts[0], PveHostConfig)
+    assert cfg.hosts[0].type == "pve"
+    # ... and the type is written back explicitly on the next save.
+    save_config(cfg, path)
+    assert yaml.safe_load(path.read_text(encoding="utf-8"))["hosts"][0]["type"] == "pve"
+
+
+def test_pre_3_5_config_yaml_loads_unchanged(tmp_path):
+    """A full 3.4.0 config must survive the update field for field.
+
+    The host type is the only thing that may appear; nothing else about an existing
+    installation is allowed to shift when the appliance is updated underneath it.
+    """
+    import yaml
+
+    path = tmp_path / "config.yaml"
+    old = {
+        "configured": True,
+        "dry_run": False,
+        "ups": [{"id": "ups1", "type": "snmp", "name": "USV A", "host": "10.0.0.9",
+                 "version": "v2c", "community": "snmp-secret", "mib": "apc"}],
+        "hosts": [
+            {"name": "pve01", "api_url": "https://10.0.0.10:8006", "method": "api_token",
+             "token_id": "ups@pve!shutdown", "token_secret": "secret-1",
+             "verify_tls": False, "this_host": False, "order": 2, "enabled": True,
+             "ups_ids": ["ups1"], "ups_policy": "all"},
+            {"name": "pve02", "api_url": "https://10.0.0.11:8006", "method": "api_token",
+             "token_id": "ups@pve!shutdown", "token_secret": "secret-2",
+             "verify_tls": True, "this_host": True, "order": 0, "enabled": False,
+             "ups_ids": [], "ups_policy": "any"},
+        ],
+        "thresholds": {"runtime_below_minutes": 7, "host_shutdown_timeout_s": 45},
+        "selftest_enabled": True, "selftest_hour": 3, "selftest_interval_min": 360,
+    }
+    path.write_text(yaml.safe_dump(old), encoding="utf-8")
+
+    cfg = load_config(path)
+    assert cfg.configured is True and cfg.dry_run is False
+    assert cfg.thresholds.runtime_below_minutes == 7
+    assert cfg.thresholds.host_shutdown_timeout_s == 45
+    assert cfg.selftest_hour == 3 and cfg.selftest_interval_min == 360
+    assert cfg.ups[0].community.get_secret_value() == "snmp-secret"
+    for old_host, host in zip(old["hosts"], cfg.hosts):
+        assert host.type == "pve"
+        assert host.token_secret.get_secret_value() == old_host["token_secret"]
+        for field in ("name", "api_url", "token_id", "verify_tls", "this_host",
+                      "order", "enabled", "ups_ids", "ups_policy"):
+            assert getattr(host, field) == old_host[field], field
+    # The node path a PVE shutdown uses is still the node name.
+    assert cfg.hosts[0].api_node == "pve01"
+
+
+def test_pre_2_0_snmp_config_still_migrates_with_typed_hosts(tmp_path):
+    """The oldest schema (single ``snmp`` block, hosts without ups_ids *and* without
+    type) has to pass both migrations at once."""
+    import yaml
+
+    path = tmp_path / "config.yaml"
+    old = {
+        "snmp": {"host": "10.0.0.9", "community": "sec"},
+        "hosts": [{"name": "pve01", "api_url": "https://x:8006"}],
+    }
+    path.write_text(yaml.safe_dump(old), encoding="utf-8")
+
+    cfg = load_config(path)
+    assert isinstance(cfg.ups[0], SnmpConfig) and cfg.ups[0].id == "ups1"
+    assert isinstance(cfg.hosts[0], PveHostConfig)
+    assert cfg.hosts[0].ups_ids == ["ups1"]
+
+
+def test_config_rejects_an_unknown_host_type(tmp_path):
+    """Better a clear error than silently treating an unknown product as PVE and
+    firing a PVE token at it."""
+    import yaml
+
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(
+        {"hosts": [{"name": "x", "api_url": "https://x:8007", "type": "pmg"}]}
+    ), encoding="utf-8")
+    with pytest.raises(Exception):
+        load_config(path)
+
+
+def test_config_roundtrip_mixes_pve_and_pbs_targets(tmp_path):
+    path = tmp_path / "config.yaml"
+    cfg = AppConfig(hosts=[
+        PveHostConfig(name="pve01", api_url="https://10.0.0.10:8006", token_secret="a"),
+        PbsHostConfig(name="Backup-Server", api_url="https://10.0.0.20:8007",
+                      token_id="ups@pbs!shutdown", token_secret="b", order=1),
+    ])
+    save_config(cfg, path)
+    loaded = load_config(path)
+
+    assert isinstance(loaded.hosts[0], PveHostConfig)
+    assert isinstance(loaded.hosts[1], PbsHostConfig)
+    assert loaded.hosts[1].token_secret.get_secret_value() == "b"
+    # PBS ignores the {node} segment, so the free label never reaches the API path.
+    assert loaded.hosts[1].api_node == "localhost"
+    assert loaded.hosts[0].api_node == "pve01"
+
+
+def test_host_key_separates_targets_of_the_same_name():
+    """Runtime latches are keyed by type + name: a PBS and a PVE entry may share a name."""
+    pve = PveHostConfig(name="backup", api_url="x")
+    pbs = PbsHostConfig(name="backup", api_url="x")
+    assert pve.key != pbs.key
+    assert pve.key == "pve:backup" and pbs.key == "pbs:backup"
+
+
 def test_config_defaults_the_mib_of_pre_3_3_entries_to_auto(tmp_path):
     """A config written before MIB profiles must pick up "auto", so an existing APC UPS
     starts using its vendor MIB after an update without anyone touching the wizard."""
@@ -146,7 +265,7 @@ def test_config_roundtrip_mixes_snmp_and_nut_sources(tmp_path):
                       username="monitor", password="np",
                       overrides=UpsThresholdOverride(charge_below_percent=25)),
         ],
-        hosts=[HostConfig(name="pve01", api_url="x", ups_ids=["a", "b"], ups_policy="any")],
+        hosts=[PveHostConfig(name="pve01", api_url="x", ups_ids=["a", "b"], ups_policy="any")],
     )
     save_config(cfg, path)
     loaded = load_config(path)
@@ -238,12 +357,34 @@ def test_merge_config_reconciles_nut_password_and_ignores_the_other_type():
 # --- ordered_hosts: own host last ------------------------------------------
 def test_ordered_hosts_puts_this_host_last():
     cfg = AppConfig(hosts=[
-        HostConfig(name="self", api_url="x", this_host=True, order=0),
-        HostConfig(name="a", api_url="x", order=5),
-        HostConfig(name="b", api_url="x", order=1),
+        PveHostConfig(name="self", api_url="x", this_host=True, order=0),
+        PveHostConfig(name="a", api_url="x", order=5),
+        PveHostConfig(name="b", api_url="x", order=1),
     ])
     order = [h.name for h in cfg.ordered_hosts()]
     assert order == ["b", "a", "self"]
+
+
+def test_shutdown_order_is_ascending_and_this_host_overrides_it():
+    """The contract the wizard's sequence preview visualises: 0 goes first, equal
+    numbers form one stage, and "this host" is last whatever number it carries."""
+    cfg = AppConfig(hosts=[
+        PveHostConfig(name="late", api_url="x", order=9),
+        PbsHostConfig(name="early-b", api_url="x", order=0),
+        PveHostConfig(name="early-a", api_url="x", order=0),
+        # Lowest possible number, yet it must still end up last.
+        PveHostConfig(name="appliance", api_url="x", order=0, this_host=True),
+        PveHostConfig(name="skipped", api_url="x", order=1, enabled=False),
+    ])
+    hosts = cfg.ordered_hosts()
+
+    assert [h.name for h in hosts] == ["early-a", "early-b", "late", "appliance"]
+    # Same (this_host, order) = one stage; the engine fires those concurrently.
+    stages = [
+        [h.name for h in group]
+        for _, group in groupby(hosts, key=lambda h: (h.this_host, h.order))
+    ]
+    assert stages == [["early-a", "early-b"], ["late"], ["appliance"]]
 
 
 # --- per-UPS trigger logic --------------------------------------------------
@@ -320,7 +461,7 @@ async def test_unreachable_nut_source_alarms_but_never_shuts_down():
     """Fail safe is a property of the engine, so it holds for every source type."""
     cfg = AppConfig(
         ups=[NutConfig(id="u", name="USB UPS", host="127.0.0.1", ups_name="ups")],
-        hosts=[HostConfig(name="pve01", api_url="https://x:8006", ups_ids=["u"])],
+        hosts=[PveHostConfig(name="pve01", api_url="https://x:8006", ups_ids=["u"])],
         thresholds=Thresholds(unreachable_alarm_after_polls=1),
         dry_run=False,
     )
@@ -340,7 +481,7 @@ def _multi_engine(policy: str, *, dry_run=True, ups_ids=("a", "b")) -> Engine:
         dry_run=dry_run,
         ups=[SnmpConfig(id="a", name="A", host="10.0.0.1"),
              SnmpConfig(id="b", name="B", host="10.0.0.2")],
-        hosts=[HostConfig(name="pve01", api_url="x", ups_ids=list(ups_ids), ups_policy=policy)],
+        hosts=[PveHostConfig(name="pve01", api_url="x", ups_ids=list(ups_ids), ups_policy=policy)],
         thresholds=th,
     )
     return Engine(cfg)
@@ -361,12 +502,12 @@ async def test_and_policy_waits_for_all_feeds():
     _on_battery_low_runtime(eng, "a")
     _on_mains(eng, "b")
     await eng._evaluate()
-    assert eng.host_fired.get("pve01") in (None, False)
+    assert eng.host_fired.get("pve:pve01") in (None, False)
     assert eng.shutdown_triggered is False
     # now the second UPS also goes critical -> shutdown fires
     _on_battery_low_runtime(eng, "b")
     await eng._evaluate()
-    assert eng.host_fired.get("pve01") is True
+    assert eng.host_fired.get("pve:pve01") is True
     assert eng.shutdown_triggered is True
 
 
@@ -376,7 +517,7 @@ async def test_or_policy_fires_on_first_feed():
     _on_battery_low_runtime(eng, "a")
     _on_mains(eng, "b")
     await eng._evaluate()
-    assert eng.host_fired.get("pve01") is True
+    assert eng.host_fired.get("pve:pve01") is True
     assert eng.shutdown_triggered is True
 
 
@@ -387,7 +528,7 @@ async def test_single_ups_host_behaves_like_before():
     _on_battery_low_runtime(eng, "a")
     _on_mains(eng, "b")
     await eng._evaluate()
-    assert eng.host_fired.get("pve01") is True
+    assert eng.host_fired.get("pve:pve01") is True
 
 
 @pytest.mark.asyncio
@@ -397,10 +538,10 @@ async def test_and_policy_abort_when_feed_recovers():
     _on_battery_low_runtime(eng, "a")
     _on_battery_low_runtime(eng, "b")
     await eng._evaluate()
-    assert eng.host_fired.get("pve01") is True
+    assert eng.host_fired.get("pve:pve01") is True
     _on_mains(eng, "a")  # one feed recovers
     await eng._evaluate()
-    assert eng.host_fired.get("pve01") is False  # latch released (abort)
+    assert eng.host_fired.get("pve:pve01") is False  # latch released (abort)
     assert eng.shutdown_triggered is False
 
 
@@ -420,8 +561,8 @@ async def test_eligible_hosts_shut_down_this_host_last(monkeypatch):
         dry_run=False,
         ups=[SnmpConfig(id="a", host="10.0.0.1")],
         hosts=[
-            HostConfig(name="self", api_url="x", this_host=True, ups_ids=["a"]),
-            HostConfig(name="other", api_url="x", order=1, ups_ids=["a"]),
+            PveHostConfig(name="self", api_url="x", this_host=True, ups_ids=["a"]),
+            PveHostConfig(name="other", api_url="x", order=1, ups_ids=["a"]),
         ],
         thresholds=th,
     )
@@ -440,8 +581,8 @@ async def test_per_ups_override_changes_only_that_ups():
         ups=[SnmpConfig(id="a", host="10.0.0.1",
                         overrides=UpsThresholdOverride(runtime_below_minutes=2)),
              SnmpConfig(id="b", host="10.0.0.2")],
-        hosts=[HostConfig(name="ha", api_url="x", ups_ids=["a"]),
-               HostConfig(name="hb", api_url="x", ups_ids=["b"])],
+        hosts=[PveHostConfig(name="ha", api_url="x", ups_ids=["a"]),
+               PveHostConfig(name="hb", api_url="x", ups_ids=["b"])],
         thresholds=th,
     )
     eng = Engine(cfg)
@@ -449,8 +590,8 @@ async def test_per_ups_override_changes_only_that_ups():
     eng.ups_rt["a"].state = UpsState(reachable=True, power_source="battery", runtime_remaining_min=3)
     eng.ups_rt["b"].state = UpsState(reachable=True, power_source="battery", runtime_remaining_min=3)
     await eng._evaluate()
-    assert eng.host_fired.get("ha") in (None, False)  # a's stricter threshold not met
-    assert eng.host_fired.get("hb") is True            # b uses global 5 -> met
+    assert eng.host_fired.get("pve:ha") in (None, False)  # a's stricter threshold not met
+    assert eng.host_fired.get("pve:hb") is True            # b uses global 5 -> met
 
 
 # --- snapshot ---------------------------------------------------------------
@@ -506,13 +647,13 @@ async def test_dry_run_latches_and_does_not_shutdown():
     th = Thresholds(on_battery_seconds=1, runtime_below_minutes=None,
                     charge_below_percent=None, on_battery_low=False)
     cfg = AppConfig(dry_run=True, ups=[SnmpConfig(id="u", host="10.0.0.9")],
-                    hosts=[HostConfig(name="pve01", api_url="x", ups_ids=["u"])],
+                    hosts=[PveHostConfig(name="pve01", api_url="x", ups_ids=["u"])],
                     thresholds=th)
     eng = Engine(cfg)
     eng.ups_rt["u"].state = UpsState(reachable=True, power_source="battery", seconds_on_battery=10)
     await eng._evaluate()  # enters ON_BATTERY + fires dry-run
     assert eng.shutdown_triggered is True
-    assert eng.host_fired.get("pve01") is True
+    assert eng.host_fired.get("pve:pve01") is True
     assert eng.state == SHUTDOWN_PENDING
     # No real host shutdown recorded because nothing was actually shut down.
     assert eng.host_states == {}
@@ -533,7 +674,7 @@ async def test_comm_loss_shutdown_when_configured():
     th = Thresholds(unreachable_alarm_after_polls=1, comm_loss_shutdown_after_min=1,
                     poll_interval_normal_s=30)
     cfg = AppConfig(dry_run=True, ups=[SnmpConfig(id="u", host="10.0.0.9")],
-                    hosts=[HostConfig(name="pve01", api_url="x", ups_ids=["u"])], thresholds=th)
+                    hosts=[PveHostConfig(name="pve01", api_url="x", ups_ids=["u"])], thresholds=th)
     eng = Engine(cfg)
     eng.ups_rt["u"].state = UpsState(reachable=False, error="timeout")
     await eng._evaluate()  # arms the wall-clock timer; ~0 s elapsed
@@ -553,7 +694,7 @@ def _comm_loss_battery_engine(**th_kw) -> Engine:
     # dry_run so the (real) shutdown path needs no Proxmox; a host depends on the UPS so a
     # shutdown can actually fire.
     cfg = AppConfig(dry_run=True, ups=[SnmpConfig(id="u", host="10.0.0.9")],
-                    hosts=[HostConfig(name="pve01", api_url="x", ups_ids=["u"])], thresholds=th)
+                    hosts=[PveHostConfig(name="pve01", api_url="x", ups_ids=["u"])], thresholds=th)
     eng = Engine(cfg)
     eng.ups_rt["u"].state = UpsState(reachable=False, error="timeout")  # comms dropped
     return eng
@@ -640,7 +781,7 @@ async def test_immediate_trigger_fires_during_running_countdown():
     th = Thresholds(on_battery_seconds=600, runtime_below_minutes=None,
                     charge_below_percent=30, on_battery_low=True)
     cfg = AppConfig(dry_run=True, ups=[SnmpConfig(id="u", host="10.0.0.9")],
-                    hosts=[HostConfig(name="pve01", api_url="x", ups_ids=["u"])], thresholds=th)
+                    hosts=[PveHostConfig(name="pve01", api_url="x", ups_ids=["u"])], thresholds=th)
     eng = Engine(cfg)
     eng.ups_rt["u"].state = UpsState(reachable=True, power_source="battery",
                                      battery_charge_pct=80)
@@ -661,7 +802,7 @@ async def test_countdown_hidden_once_ups_triggered():
     th = Thresholds(on_battery_seconds=600, runtime_below_minutes=None,
                     charge_below_percent=None, on_battery_low=True)
     cfg = AppConfig(dry_run=True, ups=[SnmpConfig(id="u", host="10.0.0.9")],
-                    hosts=[HostConfig(name="pve01", api_url="x", ups_ids=["u"])], thresholds=th)
+                    hosts=[PveHostConfig(name="pve01", api_url="x", ups_ids=["u"])], thresholds=th)
     eng = Engine(cfg)
     eng.ups_rt["u"].state = UpsState(reachable=True, power_source="battery",
                                      battery_charge_pct=80)
@@ -725,7 +866,7 @@ async def test_latched_trigger_persists_across_restart():
                     charge_below_percent=30, on_battery_low=False,
                     unreachable_alarm_after_polls=1)
     cfg = AppConfig(dry_run=True, ups=[SnmpConfig(id="u", host="10.0.0.9")],
-                    hosts=[HostConfig(name="pve01", api_url="x", ups_ids=["u"])], thresholds=th)
+                    hosts=[PveHostConfig(name="pve01", api_url="x", ups_ids=["u"])], thresholds=th)
     eng1 = Engine(cfg)
     eng1.ups_rt["u"].state = UpsState(reachable=True, power_source="battery",
                                       battery_charge_pct=20)
@@ -968,7 +1109,7 @@ async def test_battery_timer_persists_and_restores_across_restart():
                     charge_below_percent=None, on_battery_low=False,
                     unreachable_alarm_after_polls=1)
     cfg = AppConfig(dry_run=True, ups=[SnmpConfig(id="u", host="10.0.0.9")],
-                    hosts=[HostConfig(name="pve01", api_url="x", ups_ids=["u"])], thresholds=th)
+                    hosts=[PveHostConfig(name="pve01", api_url="x", ups_ids=["u"])], thresholds=th)
 
     eng1 = Engine(cfg)
     eng1.ups_rt["u"].state = UpsState(reachable=True, power_source="battery")
@@ -1636,7 +1777,7 @@ def _selftest_engine(monkeypatch, now, **cfg_kwargs):
     from app import engine as engine_mod
 
     cfg = AppConfig(
-        hosts=[HostConfig(name="pve01", api_url="https://10.0.0.10:8006")], **cfg_kwargs
+        hosts=[PveHostConfig(name="pve01", api_url="https://10.0.0.10:8006")], **cfg_kwargs
     )
     clock = {"now": now}
     monkeypatch.setattr(engine_mod, "_local_now", lambda: clock["now"])
@@ -1713,7 +1854,7 @@ async def test_selftest_never_runs_when_disabled_or_without_hosts(monkeypatch):
 
     configs = [
         AppConfig(
-            hosts=[HostConfig(name="pve01", api_url="https://x:8006")], selftest_enabled=False
+            hosts=[PveHostConfig(name="pve01", api_url="https://x:8006")], selftest_enabled=False
         ),
         AppConfig(selftest_enabled=True),  # no hosts
     ]
@@ -1765,13 +1906,13 @@ async def test_selftest_outcome_survives_a_restart(monkeypatch):
     from app.proxmox import TestResult
 
     monkeypatch.setattr(engine_mod, "_local_now", lambda: datetime(2026, 7, 25, 10, 0))
-    cfg = AppConfig(hosts=[HostConfig(name="pve01", api_url="https://10.0.0.10:8006")])
+    cfg = AppConfig(hosts=[PveHostConfig(name="pve01", api_url="https://10.0.0.10:8006")])
     eng = Engine(cfg)
 
     async def fake_test(host, *a, **k):
         return TestResult(True, "ok", has_power_mgmt=True)
 
-    monkeypatch.setattr(engine_mod.proxmox, "test_connection", fake_test)
+    monkeypatch.setattr(engine_mod.targets, "test_connection", fake_test)
     monkeypatch.setattr(eng, "_log_quiet", lambda *a: None)
     await eng._maybe_selftest()
     eng._persist_state()  # the loop persists again on its next _evaluate
@@ -1822,8 +1963,8 @@ async def test_run_selftest_queries_hosts_concurrently_and_damps_success_events(
     monkeypatch.setattr(engine_mod, "_local_now", lambda: datetime(2026, 7, 25, 10, 0))
     cfg = AppConfig(
         hosts=[
-            HostConfig(name="pve01", api_url="https://10.0.0.10:8006"),
-            HostConfig(name="pve02", api_url="https://10.0.0.11:8006"),
+            PveHostConfig(name="pve01", api_url="https://10.0.0.10:8006"),
+            PveHostConfig(name="pve02", api_url="https://10.0.0.11:8006"),
         ]
     )
     eng = Engine(cfg)
@@ -1838,7 +1979,7 @@ async def test_run_selftest_queries_hosts_concurrently_and_damps_success_events(
         return TestResult(True, "ok", has_power_mgmt=True)
 
     logged: list = []
-    monkeypatch.setattr(engine_mod.proxmox, "test_connection", fake_test)
+    monkeypatch.setattr(engine_mod.targets, "test_connection", fake_test)
     monkeypatch.setattr(eng, "_log_quiet", lambda s, b, sev: logged.append(s))
 
     await eng._run_selftest()
@@ -1856,7 +1997,7 @@ async def test_run_selftest_always_reports_failures(monkeypatch):
     from app.proxmox import TestResult
 
     monkeypatch.setattr(engine_mod, "_local_now", lambda: datetime(2026, 7, 25, 10, 0))
-    eng = Engine(AppConfig(hosts=[HostConfig(name="pve01", api_url="https://10.0.0.10:8006")]))
+    eng = Engine(AppConfig(hosts=[PveHostConfig(name="pve01", api_url="https://10.0.0.10:8006")]))
 
     async def fake_test(host, *a, **k):
         return TestResult(False, "Authentication failed (token invalid?)")
@@ -1866,7 +2007,7 @@ async def test_run_selftest_always_reports_failures(monkeypatch):
     async def fake_emit(subject, body, severity):
         emitted.append((subject, severity))
 
-    monkeypatch.setattr(engine_mod.proxmox, "test_connection", fake_test)
+    monkeypatch.setattr(engine_mod.targets, "test_connection", fake_test)
     monkeypatch.setattr(eng, "_emit", fake_emit)
 
     await eng._run_selftest()
@@ -1912,9 +2053,12 @@ def _full_config() -> AppConfig:
             ),
         ],
         hosts=[
-            HostConfig(name="pve01", api_url="https://10.0.0.10:8006",
+            PveHostConfig(name="pve01", api_url="https://10.0.0.10:8006",
                        token_id="ups@pve!sd", token_secret="tok-1", ups_ids=["a"]),
-            HostConfig(name="pve02", api_url="https://10.0.0.11:8006",
+            PbsHostConfig(name="Backup-Server", api_url="https://10.0.0.20:8007",
+                       token_id="ups@pbs!sd", token_secret="tok-pbs", ups_ids=["b"],
+                       order=1),
+            PveHostConfig(name="pve02", api_url="https://10.0.0.11:8006",
                        token_id="ups@pve!sd", token_secret="tok-2",
                        ups_ids=["a", "b"], ups_policy="any", this_host=True),
         ],
@@ -1988,10 +2132,13 @@ async def test_export_import_round_trip_preserves_every_field(_import_target):
     assert restored.ups[1].port == 1161
     assert restored.ups[1].overrides.runtime_below_minutes == 2
     assert restored.ups[1].overrides.on_battery_low is True
-    assert [h.name for h in restored.hosts] == ["pve01", "pve02"]
-    assert restored.hosts[1].token_secret.get_secret_value() == "tok-2"
-    assert restored.hosts[1].ups_policy == "any"
-    assert restored.hosts[1].this_host is True
+    assert [h.name for h in restored.hosts] == ["pve01", "Backup-Server", "pve02"]
+    assert [h.type for h in restored.hosts] == ["pve", "pbs", "pve"]
+    assert isinstance(restored.hosts[1], PbsHostConfig)
+    assert restored.hosts[1].token_secret.get_secret_value() == "tok-pbs"
+    assert restored.hosts[2].token_secret.get_secret_value() == "tok-2"
+    assert restored.hosts[2].ups_policy == "any"
+    assert restored.hosts[2].this_host is True
     assert restored.thresholds.runtime_below_minutes == 7
     assert restored.thresholds.comm_loss_shutdown_after_min == 15
     assert restored.notifications.webhook.url == "https://hook/x"
@@ -2065,6 +2212,22 @@ def test_buildconfig_sends_every_system_field():
     for field in ("selftest_enabled", "selftest_hour", "selftest_interval_min",
                   "ntp_server", "timezone", "dry_run"):
         assert field in body.group(1), f"buildConfig() does not send {field}"
+
+
+def test_hostfromrow_sends_every_host_field():
+    """Same trap one level down: hostFromRow() builds each host entry, so a field it
+    omits silently reverts on every save — the target type above all."""
+    import re
+    from pathlib import Path
+
+    app_js = (Path(__file__).resolve().parents[1] / "app" / "web" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    body = re.search(r"function hostFromRow\(tr\)\s*\{(.*?)\n\}", app_js, re.DOTALL)
+    assert body, "hostFromRow() not found in app.js"
+
+    for field in PveHostConfig.model_fields:
+        assert field in body.group(1), f"hostFromRow() does not send {field}"
 
 
 # --- SNMPv3 privacy ciphers -------------------------------------------------
@@ -2459,3 +2622,386 @@ def test_unknown_webhook_values_snap_to_the_defaults():
 
     assert hook.format.value == "json"
     assert hook.min_severity.value == "warning"
+
+
+# --- Proxmox Backup Server client ------------------------------------------
+class _FakeApiClient:
+    """Records requests and replays canned responses; patched over the client's httpx."""
+
+    def __init__(self, routes, calls):
+        self._routes, self._calls = routes, calls
+
+    def __call__(self, *a, **kw):
+        self._calls.append(("client", kw))
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, url, **kw):
+        self._calls.append(("GET", url, kw))
+        return self._routes.get(url, _FakeJson(404, {}))
+
+    async def post(self, url, **kw):
+        self._calls.append(("POST", url, kw))
+        return self._routes.get(url, _FakeJson(404, {}))
+
+
+class _FakeJson:
+    def __init__(self, status_code, payload):
+        self.status_code, self._payload, self.text = status_code, payload, ""
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+def _fake_pbs(monkeypatch, permissions):
+    """Patch app.pbs's httpx with a server answering /version and /access/permissions."""
+    from app import pbs
+
+    calls: list = []
+    routes = {
+        "/version": _FakeJson(200, {"data": {"version": "4.2.5"}}),
+        "/access/permissions": _FakeJson(200, {"data": permissions}),
+        "/nodes/localhost/status": _FakeJson(200, {"data": None}),
+    }
+    monkeypatch.setattr(pbs.httpx, "AsyncClient", _FakeApiClient(routes, calls))
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_pbs_auth_header_uses_the_pbs_scheme_and_a_colon(monkeypatch):
+    """The exact separator is what issues #9/#16/#19 tripped over: PBS wants
+    ``PBSAPIToken=<id>:<secret>``, not the ``PVEAPIToken=<id>=<secret>`` of PVE."""
+    from app import pbs
+
+    calls = _fake_pbs(monkeypatch, {"/system/status": {"Sys.PowerManagement": 1}})
+    host = PbsHostConfig(name="Backup-Server", api_url="https://10.0.0.20:8007/",
+                         token_id="ups@pbs!shutdown", token_secret="uuid-secret")
+
+    await pbs.test_connection(host)
+
+    kwargs = next(c[1] for c in calls if c[0] == "client")
+    assert kwargs["headers"]["Authorization"] == "PBSAPIToken=ups@pbs!shutdown:uuid-secret"
+    assert kwargs["base_url"] == "https://10.0.0.20:8007/api2/json"
+
+
+@pytest.mark.asyncio
+async def test_pbs_test_connection_accepts_the_privilege_on_system_status(monkeypatch):
+    from app import pbs
+
+    _fake_pbs(monkeypatch, {"/system/status": {"Sys.PowerManagement": 1}})
+    result = await pbs.test_connection(
+        PbsHostConfig(name="b", api_url="https://x:8007", token_id="u!t"))
+
+    assert result.ok is True and result.has_power_mgmt is True
+
+
+@pytest.mark.asyncio
+async def test_pbs_test_connection_accepts_the_privilege_inherited_from_root(monkeypatch):
+    from app import pbs
+
+    _fake_pbs(monkeypatch, {"/": {"Sys.PowerManagement": 1}})
+    result = await pbs.test_connection(
+        PbsHostConfig(name="b", api_url="https://x:8007", token_id="u!t"))
+
+    assert result.ok is True and result.has_power_mgmt is True
+
+
+@pytest.mark.asyncio
+async def test_pbs_test_connection_warns_without_the_privilege(monkeypatch):
+    """Reachable with a valid token but no power rights: ok, yet flagged — the engine
+    turns that into a warning rather than a critical event."""
+    from app import pbs
+
+    _fake_pbs(monkeypatch, {"/system/status": {"Sys.Audit": 1}})
+    result = await pbs.test_connection(
+        PbsHostConfig(name="b", api_url="https://x:8007", token_id="u!t"))
+
+    assert result.ok is True and result.has_power_mgmt is False
+    assert "Sys.PowerManagement" in result.message and "Admin" in result.message
+
+
+@pytest.mark.asyncio
+async def test_pbs_shutdown_posts_to_the_localhost_node(monkeypatch):
+    """PBS ignores the {node} segment, so the free-form name must never reach the path."""
+    from app import pbs
+
+    calls = _fake_pbs(monkeypatch, {})
+    ok, msg = await pbs.shutdown_node(
+        PbsHostConfig(name="Server Backup (DC1)", api_url="https://x:8007", token_id="u!t"))
+
+    assert ok is True
+    post = next(c for c in calls if c[0] == "POST")
+    assert post[1] == "/nodes/localhost/status"
+    assert post[2]["data"] == {"command": "shutdown"}
+
+
+# --- shutdown target dispatch ----------------------------------------------
+@pytest.mark.asyncio
+async def test_targets_dispatch_picks_the_client_per_type(monkeypatch):
+    from app import targets
+
+    seen = []
+
+    async def fake_pve(host, timeout):
+        seen.append("pve")
+        return True, "pve"
+
+    async def fake_pbs(host, timeout):
+        seen.append("pbs")
+        return True, "pbs"
+
+    monkeypatch.setattr(targets.proxmox, "shutdown_node", fake_pve)
+    monkeypatch.setattr(targets.pbs, "shutdown_node", fake_pbs)
+
+    await targets.shutdown(PveHostConfig(name="a", api_url="x"), 5)
+    await targets.shutdown(PbsHostConfig(name="b", api_url="x"), 5)
+    assert seen == ["pve", "pbs"]
+
+
+@pytest.mark.asyncio
+async def test_targets_dispatch_reports_an_unknown_type_instead_of_guessing():
+    from app import targets
+    from app.config import HostConfig
+
+    ok, msg = await targets.shutdown(HostConfig(name="a", api_url="x"), 5)
+    assert ok is False and "Unsupported shutdown target type" in msg
+
+    result = await targets.test_connection(HostConfig(name="a", api_url="x"))
+    assert result.ok is False and "Unsupported shutdown target type" in result.message
+
+
+@pytest.mark.asyncio
+async def test_target_calls_give_up_instead_of_hanging(monkeypatch):
+    """A machine that accepts the connection and then goes quiet must not tie up the
+    loop: the deadline is enforced here, not left to httpx."""
+    import asyncio
+
+    from app import targets
+
+    async def never_answers(host, timeout):
+        await asyncio.sleep(60)
+        return True, "too late"
+
+    monkeypatch.setattr(targets, "DEADLINE_GRACE_S", 0.05)
+    monkeypatch.setattr(targets.proxmox, "shutdown_node", never_answers)
+    ok, msg = await targets.shutdown(PveHostConfig(name="a", api_url="x"), 0.01)
+    assert ok is False and "No response within" in msg
+
+    monkeypatch.setattr(targets.proxmox, "test_connection", never_answers)
+    result = await targets.test_connection(PveHostConfig(name="a", api_url="x"), 0.01)
+    assert result.ok is False and "No response within" in result.message
+
+
+# --- staged shutdown: one hanging target must not delay its peers -----------
+def _staged_engine(**pbs_kwargs):
+    cfg = AppConfig(
+        dry_run=False,
+        ups=[SnmpConfig(id="u", name="U", host="10.0.0.1")],
+        hosts=[
+            PveHostConfig(name="pve01", api_url="x", ups_ids=["u"]),
+            PbsHostConfig(name="pbs01", api_url="x", ups_ids=["u"], **pbs_kwargs),
+            PveHostConfig(name="self", api_url="x", ups_ids=["u"], this_host=True),
+        ],
+        thresholds=Thresholds(runtime_below_minutes=5),
+    )
+    eng = Engine(cfg)
+    eng.ups_rt["u"].state = UpsState(reachable=True, power_source="battery",
+                                     runtime_remaining_min=1)
+    return eng
+
+
+@pytest.mark.asyncio
+async def test_a_hanging_target_does_not_delay_its_stage_peers(monkeypatch):
+    """The PBS entry stops responding; the PVE host on the same stage must still get its
+    command straight away, and it must not have to wait for the hanging one to finish."""
+    import asyncio
+
+    from app import engine as engine_mod
+
+    started, finished, release = [], [], asyncio.Event()
+
+    async def fake_shutdown(host, timeout):
+        started.append(host.name)
+        if host.type == "pbs":
+            await release.wait()
+        finished.append(host.name)
+        return True, "ok"
+
+    monkeypatch.setattr(engine_mod.targets, "shutdown", fake_shutdown)
+    eng = _staged_engine()
+
+    task = asyncio.create_task(eng._evaluate())
+    for _ in range(200):  # let the loop reach the first stage
+        if finished:
+            break
+        await asyncio.sleep(0.005)
+
+    # pve01 and pbs01 share order 0 -> same stage, so both are under way at once (their
+    # relative start order inside a stage is deliberately not guaranteed). pve01 is served
+    # to completion while pbs01 hangs; sequentially it would have had to wait for pbs01.
+    assert sorted(started) == ["pbs01", "pve01"]
+    assert finished == ["pve01"]
+    assert "self" not in started  # the last stage still waits for the first to drain
+
+    release.set()
+    await task
+    assert finished[-1] == "self"
+
+
+@pytest.mark.asyncio
+async def test_stage_order_is_kept_across_different_order_values(monkeypatch):
+    from app import engine as engine_mod
+
+    fired = []
+
+    async def fake_shutdown(host, timeout):
+        fired.append(host.name)
+        return True, "ok"
+
+    monkeypatch.setattr(engine_mod.targets, "shutdown", fake_shutdown)
+    eng = _staged_engine(order=5)
+
+    await eng._evaluate()
+
+    assert fired == ["pve01", "pbs01", "self"]
+    assert eng.host_states["pbs:pbs01"]["shutdown_state"] == "sent"
+
+
+# --- self-test results + health --------------------------------------------
+@pytest.mark.asyncio
+async def test_selftest_records_its_outcome_per_host(monkeypatch):
+    from app import engine as engine_mod
+    from app.proxmox import TestResult
+
+    eng = Engine(AppConfig(hosts=[
+        PveHostConfig(name="pve01", api_url="https://x:8006"),
+        PbsHostConfig(name="pbs01", api_url="https://x:8007"),
+    ]))
+
+    async def fake_test(host, *a, **k):
+        if host.type == "pbs":
+            return TestResult(True, "no power rights", has_power_mgmt=False)
+        return TestResult(True, "ok", has_power_mgmt=True)
+
+    monkeypatch.setattr(engine_mod.targets, "test_connection", fake_test)
+    await eng._run_selftest()
+
+    snap = {h["name"]: h for h in eng.snapshot()["hosts"]}
+    assert snap["pve01"]["credentials_ok"] is True
+    assert snap["pve01"]["power_mgmt_ok"] is True
+    assert snap["pve01"]["last_test_error"] is None
+    assert snap["pbs01"]["power_mgmt_ok"] is False
+    assert snap["pbs01"]["last_test_error"] == "no power rights"
+    assert snap["pbs01"]["type"] == "pbs"
+
+
+@pytest.mark.asyncio
+async def test_a_shutdown_does_not_erase_the_selftest_result(monkeypatch):
+    from app import engine as engine_mod
+    from app.proxmox import TestResult
+
+    async def fake_test(host, *a, **k):
+        return TestResult(True, "ok", has_power_mgmt=True)
+
+    async def fake_shutdown(host, timeout):
+        return True, "sent"
+
+    monkeypatch.setattr(engine_mod.targets, "test_connection", fake_test)
+    monkeypatch.setattr(engine_mod.targets, "shutdown", fake_shutdown)
+
+    eng = _staged_engine()
+    await eng._run_selftest()
+    await eng._evaluate()
+
+    state = eng.host_states["pbs:pbs01"]
+    assert state["shutdown_state"] == "sent"
+    assert state["power_mgmt_ok"] is True  # survived the shutdown write
+
+
+@pytest.mark.asyncio
+async def test_health_reports_the_shutdown_targets(_import_target, monkeypatch):
+    import json
+
+    from app import engine as engine_mod
+    from app.proxmox import TestResult
+
+    main, _ = _import_target
+    main.engine = Engine(AppConfig(hosts=[
+        PveHostConfig(name="pve01", api_url="https://x:8006"),
+        PbsHostConfig(name="pbs01", api_url="https://x:8007"),
+    ]))
+
+    before = json.loads((await main.api_health()).body)
+    assert before["hosts_total"] == 2
+    assert before["hosts_ok"] == 0
+    # Never tested is not the same as failing.
+    assert before["hosts_selftest_ok"] is None
+    assert before["hosts_selftest_at"] is None
+
+    async def fake_test(host, *a, **k):
+        return TestResult(True, "ok", has_power_mgmt=host.type == "pve")
+
+    monkeypatch.setattr(engine_mod.targets, "test_connection", fake_test)
+    await main.engine._run_selftest()
+
+    after = json.loads((await main.api_health()).body)
+    assert after["hosts_ok"] == 1
+    assert after["hosts_selftest_ok"] is False
+    assert after["hosts_selftest_at"]
+    # A broken token is reported, but it must not move status/HTTP code by itself:
+    # existing uptime monitors keep watching the engine, not the credentials.
+    assert after["status"] == before["status"]
+
+
+# --- host secret reconcile --------------------------------------------------
+def test_merge_config_reconciles_host_secrets_by_type_and_name():
+    from app import main
+
+    existing = AppConfig(hosts=[
+        PveHostConfig(name="node", api_url="x", token_secret="pve-secret"),
+        PbsHostConfig(name="node", api_url="x", token_secret="pbs-secret"),
+    ])
+    incoming = {"hosts": [
+        {"name": "node", "type": "pve", "api_url": "x", "token_secret": "**********"},
+        {"name": "node", "type": "pbs", "api_url": "x", "token_secret": "**********"},
+    ]}
+
+    merged = main._merge_config(incoming, existing)
+    # Same name, different product: the secrets must not cross over.
+    assert merged.hosts[0].token_secret.get_secret_value() == "pve-secret"
+    assert merged.hosts[1].token_secret.get_secret_value() == "pbs-secret"
+
+
+def test_repointing_a_host_to_another_product_drops_the_old_secret():
+    from app import main
+
+    existing = AppConfig(hosts=[
+        PveHostConfig(name="node", api_url="x", token_secret="pve-secret")])
+    incoming = {"hosts": [
+        {"name": "node", "type": "pbs", "api_url": "x", "token_secret": "**********"}]}
+
+    merged = main._merge_config(incoming, existing)
+    assert merged.hosts[0].token_secret.get_secret_value() == ""
+
+
+def test_merge_config_accepts_hosts_without_a_type():
+    """A stale, cached app.js posts the pre-3.5 payload; that must not be refused."""
+    from app import main
+
+    existing = AppConfig(hosts=[
+        PveHostConfig(name="pve01", api_url="x", token_secret="kept")])
+    incoming = {"hosts": [
+        {"name": "pve01", "api_url": "x", "method": "api_token", "token_secret": "**********"}]}
+
+    merged = main._merge_config(incoming, existing)
+    assert merged.hosts[0].type == "pve"
+    assert merged.hosts[0].token_secret.get_secret_value() == "kept"

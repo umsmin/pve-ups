@@ -167,7 +167,7 @@
   <header class="topbar">
     <span class="brand">
       <svg class="mark icon-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 5v6c0 5 3.4 8.5 8 11 4.6-2.5 8-6 8-11V5l-8-3z"/></svg>
-      PVE-UPS <span class="sub">User Manual · v3.4.0</span>
+      PVE-UPS <span class="sub">User Manual · v3.5.0</span>
     </span>
     <span class="spacer"></span>
     <a class="btn" href="https://github.com/ffind-dev/pve-ups" target="_blank"
@@ -188,7 +188,7 @@
         <li><a href="#was">What is PVE-UPS?</a></li>
         <li><a href="#voraussetzungen">Requirements</a></li>
         <li><a href="#installation">Installation &amp; setup</a></li>
-        <li><a href="#token">Proxmox API token</a></li>
+        <li><a href="#token">API tokens (VE and Backup Server)</a></li>
         <li><a href="#snmp">UPS sources</a></li>
         <li><a href="#logik">How it works &amp; logic</a></li>
         <li><a href="#failsafe">Fail-safe &amp; edge cases</a></li>
@@ -222,8 +222,10 @@
           (standard RFC&nbsp;1628 <i>or</i> a vendor MIB such as APC PowerNet,
           <b>SNMP v1/v2c/v3</b>, pure-Python implementation) or through a <b>NUT server</b>,
           which is how USB and serial UPS devices are read.</li>
-          <li>Orderly host shutdown through a <b>Proxmox API token</b> (privilege
-          <code>Sys.PowerMgmt</code>) — no root SSH required.</li>
+          <li>Orderly host shutdown through a <b>Proxmox API token</b> — no root SSH
+          required. Targets can be <b>Proxmox VE</b> nodes (privilege
+          <code>Sys.PowerMgmt</code>) or a <b>Proxmox Backup Server</b>
+          (<code>Sys.PowerManagement</code>), selectable per host.</li>
           <li><b>Host↔UPS mapping</b> with per-host logic (AND/OR) for redundant power
           supplies or split load, including a feed diagram in the web UI.</li>
           <li>Complete setup through a <b>web wizard</b> with test buttons.</li>
@@ -255,9 +257,23 @@
             </ul>
           </li>
           <li>Network connectivity between the appliance and the UPS source (read access is
-          enough: UDP 161 for SNMP, TCP 3493 for NUT) and to the Proxmox API of the
-          protected hosts (HTTPS, port 8006).</li>
+          enough: UDP 161 for SNMP, TCP 3493 for NUT) and to the API of the protected
+          targets (HTTPS, port 8006 for Proxmox VE, 8007 for Proxmox Backup Server).</li>
         </ul>
+        <p>Besides Proxmox VE nodes, a <b>Proxmox Backup Server</b> can be shut down as
+        well — each host entry carries a type. The two differ only in how they are
+        addressed; everything else (UPS mapping, AND/OR logic, order, thresholds) works
+        the same for both. See <a href="#token">section 4</a>.</p>
+        <div class="callout warn">
+          <span><b>PVE-UPS belongs on an internal (management) network.</b> It holds API
+          tokens that can power off servers, so treat it like any other management tool:
+          reachable only from trusted networks, never exposed to the internet, and behind
+          the same firewalling, segmentation and access control as the Proxmox web
+          interfaces themselves. The web UI is password-protected, but
+          <code>/api/status</code> and <code>/api/health</code> are deliberately readable
+          without a login so monitoring can poll them — that is another reason the
+          appliance should not be publicly reachable.</span>
+        </div>
       </section>
 
       <section class="card" id="installation">
@@ -279,8 +295,9 @@ curl -fsSL https://github.com/ffind-dev/pve-ups/releases/latest/download/install
           <li>Set the UI password.</li>
           <li>Add the <b>UPS devices</b> (source, address, credentials — see section 5) and
           verify each one with “Test UPS”.</li>
-          <li>Add the <b>Proxmox hosts</b> (API token, see section 4) and use “Test”.
-          Define which UPS devices feed each host and with which logic (AND/OR).</li>
+          <li>Add the <b>hosts</b>: pick the <b>type</b> per entry (Proxmox VE or Proxmox
+          Backup Server), enter its API token (see section 4) and use “Test”. Define which
+          UPS devices feed each host and with which logic (AND/OR).</li>
           <li>Set the <b>thresholds</b> or keep the defaults.</li>
           <li>Optionally configure the <b>notification webhook</b> (HTTP POST to a
           ticket/chat/monitoring system): pick format and level, then verify it with
@@ -297,7 +314,31 @@ curl -fsSL https://github.com/ffind-dev/pve-ups/releases/latest/download/install
       </section>
 
       <section class="card" id="token">
-        <h2 class="sec"><span class="n">4</span> Creating the Proxmox API token</h2>
+        <h2 class="sec"><span class="n">4</span> Creating the API token</h2>
+        <p>Every host entry authenticates with an API token — revocable, and a replacement
+        for root SSH access. Which token to create depends on the <b>type</b> selected for
+        that entry, because Proxmox VE and Proxmox Backup Server use different token
+        schemes and different privilege names:</p>
+        <table>
+          <thead><tr><th></th><th>Proxmox VE</th><th>Proxmox Backup Server</th></tr></thead>
+          <tbody>
+            <tr><td>API port</td><td>8006</td><td>8007</td></tr>
+            <tr><td>Privilege</td><td><code>Sys.PowerMgmt</code></td>
+            <td><code>Sys.PowerManagement</code></td></tr>
+            <tr><td>Granted on</td><td><code>/nodes</code></td>
+            <td><code>/system/status</code></td></tr>
+            <tr><td>“Node” field</td><td>the real node name</td>
+            <td>a free label (PBS ignores it)</td></tr>
+          </tbody>
+        </table>
+        <div class="callout warn">
+          <span>Picking the wrong type is the most common cause of a failing test: a
+          Backup Server entered as “Proxmox VE” rejects the request outright and reports
+          <i>“Authentication failed (token invalid?)”</i>, even though the token itself is
+          perfectly valid.</span>
+        </div>
+
+        <h3 id="token-pve">Proxmox VE</h3>
         <p>Create a dedicated user with only the power-management privilege and an API
         token. Run this <b>once</b>, in the shell of any Proxmox node:</p>
 <pre><code>pveum user add ups@pve
@@ -305,8 +346,7 @@ pveum role add UpsShutdown -privs "Sys.PowerMgmt"
 pveum acl modify /nodes -user ups@pve -role UpsShutdown
 pveum user token add ups@pve shutdown --privsep 0</code></pre>
         <p>The last command prints the <b>token ID</b> (<code>ups@pve!shutdown</code>) and
-        the <b>secret</b>. Enter both in the wizard under “Proxmox hosts” and verify with
-        “Test”. The token can be revoked at any time and replaces root SSH access.</p>
+        the <b>secret</b>. Enter both in the wizard and verify with “Test”.</p>
         <div class="callout info">
           <span><b>In a cluster the commands are run only once.</b> Users, API tokens and
           ACLs live at datacenter level (<code>/etc/pve</code>) and are therefore valid on
@@ -317,6 +357,43 @@ pveum user token add ups@pve shutdown --privsep 0</code></pre>
         (<code>https://&lt;this-node-ip&gt;:8006</code>). The Proxmox API would proxy a
         request to another node, but a node that has already been shut down cannot proxy for
         the ones still to come.</p>
+
+        <h3 id="token-pbs">Proxmox Backup Server</h3>
+        <p>Run this in the shell of the Backup Server. Note that the ACL is granted
+        <b>twice</b> — once to the user, once to the token:</p>
+<pre><code>proxmox-backup-manager user create ups@pbs
+proxmox-backup-manager user generate-token ups@pbs shutdown
+proxmox-backup-manager acl update /system/status Admin --auth-id 'ups@pbs'
+proxmox-backup-manager acl update /system/status Admin --auth-id 'ups@pbs!shutdown'</code></pre>
+        <p><code>generate-token</code> prints the <b>token ID</b>
+        (<code>ups@pbs!shutdown</code>) and the <b>secret</b> — the secret is shown once and
+        cannot be retrieved afterwards. Enter the API URL as
+        <code>https://&lt;pbs-ip&gt;:8007</code>, then verify with “Test”.</p>
+        <p>Three details differ from Proxmox VE and explain the commands above:</p>
+        <ul>
+          <li><b>Both entries are required.</b> On PBS a token's permissions are computed
+          from its own ACL entries and then intersected with those of its user, so a token
+          can never exceed its user. Granting only one of the two leaves the token without
+          the privilege.</li>
+          <li><b>The role is <code>Admin</code>.</b> PBS has no fine-grained
+          power-management role — <code>Sys.PowerManagement</code> is only carried by
+          <code>Admin</code>. Granting it on <code>/system/status</code> instead of
+          <code>/</code> keeps the scope as narrow as PBS allows.</li>
+          <li><b>The “Node” field is only a label.</b> PBS ignores the node in the API path,
+          so the shutdown always addresses <code>/nodes/localhost/status</code>. Name the
+          entry whatever is readable on the dashboard; nothing has to match the hostname.</li>
+        </ul>
+        <div class="callout warn">
+          <span><b>Consider carefully whether to attach a Backup Server here at all.</b>
+          The token above is an <code>Admin</code> token, and PVE-UPS has to reach the PBS
+          API from the environment it protects. That combination widens the path from a
+          compromised virtualisation host to the backups — which are exactly what should
+          survive such a compromise. For production environments we therefore
+          <b>recommend against</b> attaching PBS to the same PVE-UPS instance that manages
+          the PVE hosts. Alternatives: give the Backup Server its own UPS shutdown path
+          (its own PVE-UPS instance, reachable only from a separate management segment), or
+          let it ride out short outages on its own UPS runtime.</span>
+        </div>
       </section>
 
       <section class="card" id="snmp">
@@ -445,10 +522,18 @@ pveum user token add ups@pve shutdown --privsep 0</code></pre>
           <li><b>OR</b> (<code>ups_policy = any</code>): the host shuts down as soon as
           <i>one</i> assigned UPS triggers — for split, non-redundant load.</li>
         </ul>
-        <p>Multiple due hosts are shut down <b>in order</b>. The host carrying the appliance
-        itself (<code>this_host</code>) always goes <b>last</b>, so it can still shut down
-        the others. Tip: attach the appliance host to <i>all</i> UPS devices so it reliably
-        becomes due last.</p>
+        <p>Multiple due hosts are shut down <b>in stages</b>, following the “Order” field —
+        ascending, so <b>0 goes first</b>: everything sharing a number is commanded <i>at
+        the same time</i>, and the next stage only starts once that one is done. The host
+        carrying the appliance itself (<code>this_host</code>) always forms the <b>last</b>
+        stage regardless of its number, so it can still shut down the others. Tip: attach
+        the appliance host to <i>all</i> UPS devices so it reliably becomes due last. The
+        wizard shows the resulting sequence live underneath the host list.</p>
+        <p>Every command also carries a <b>hard deadline</b> (“Host shutdown timeout”). Both
+        together mean a machine that stops responding cannot hold up its stage peers, the
+        stages behind it, or the battery countdown itself. Use the order field when one
+        target genuinely has to go down before another — otherwise leaving them equal is
+        both faster and safer.</p>
         <p>If a required UPS recovers (mains returns), a shutdown that has not been executed
         yet is <b>aborted</b> and the state is reset.</p>
       </section>
@@ -479,7 +564,7 @@ pveum user token add ups@pve shutdown --privsep 0</code></pre>
           <thead><tr><th>Situation</th><th>Behaviour</th></tr></thead>
           <tbody>
             <tr><td>On mains, all good</td><td>nothing (shows “On mains”)</td></tr>
-            <tr><td>On battery, a trigger fires</td><td>shutdown (hosts in order, own host last)</td></tr>
+            <tr><td>On battery, a trigger fires</td><td>shutdown (hosts in stages by order, own host last)</td></tr>
             <tr><td>Contact lost while on mains</td><td>alarm only, <b>no</b> shutdown</td></tr>
             <tr><td>Contact lost during a running battery countdown</td><td>countdown continues, shutdown when it expires</td></tr>
             <tr><td>Contact lost after an already fired trigger</td><td>trigger stays latched (no downgrade)</td></tr>
@@ -524,7 +609,12 @@ pveum user token add ups@pve shutdown --privsep 0</code></pre>
           summary.</li>
           <li><code>GET /api/health</code> — <code>200</code> when the engine is running
           (with version and UPS reachability), otherwise <code>503</code>. Ideal for uptime
-          checks.</li>
+          checks. It also reports the shutdown targets: <code>hosts_total</code>,
+          <code>hosts_ok</code> (last self-test confirmed token <i>and</i> privilege),
+          <code>hosts_selftest_ok</code> and <code>hosts_selftest_at</code>. Those are
+          informational — a broken token does <i>not</i> turn the endpoint into
+          <code>503</code>, because the appliance itself is still doing its job. Alert on
+          <code>hosts_selftest_ok</code> separately if you want to be told.</li>
         </ul>
 <pre><code>curl http://&lt;container-ip&gt;:8080/api/status | jq
 # only critical events of the last 48 h:
@@ -594,9 +684,10 @@ curl -s http://&lt;container-ip&gt;:8080/api/status \
         should be set, otherwise the container runs in UTC. The <b>self-test start time</b>
         is interpreted in this local time; after setting the timezone the service restarts
         briefly.</p>
-        <h3>Self-test of the Proxmox connection</h3>
-        <p>The appliance checks on its own whether the API token and the
-        <code>Sys.PowerMgmt</code> privilege still work per host — so an expired or revoked
+        <h3>Self-test of the target connections</h3>
+        <p>The appliance checks on its own whether the API token and its power-management
+        privilege still work per host — <code>Sys.PowerMgmt</code> on Proxmox VE,
+        <code>Sys.PowerManagement</code> on a Backup Server — so an expired or revoked
         credential surfaces long before an outage needs it. Two settings in the
         <i>System</i> section control it: a <b>start time</b> (full hour) and an
         <b>interval</b> from 15 minutes up to 24 hours. Both together define fixed times of
@@ -607,6 +698,9 @@ curl -s http://&lt;container-ip&gt;:8080/api/status \
         short interval does not bury the event log. While a UPS is on battery the self-test
         is skipped entirely — during an outage the countdown has priority. A restart does
         not repeat a self-test that already ran in the current slot.</p>
+        <p>The result is also kept <b>per host</b>: the dashboard's host table shows the
+        complaint in its error column even when nothing has been shut down, and
+        <a href="#monitoring">/api/health</a> counts how many targets last passed.</p>
         <h3>Updating from version 2.x to 3.x</h3>
         <p>Download the current release package (<code>pve-usv-&lt;version&gt;.tar.gz</code>)
         from the <a href="https://github.com/ffind-dev/pve-ups/releases" target="_blank"
@@ -664,6 +758,15 @@ volumes:
 
       <section class="card" id="faq">
         <h2 class="sec"><span class="n">11</span> Troubleshooting</h2>
+        <h3>A Backup Server reports “Authentication failed (token invalid?)”</h3>
+        <p>Almost always the wrong <b>type</b> on the host entry. Proxmox VE and Proxmox
+        Backup Server use different token schemes, and PBS does not recognise the PVE one at
+        all — so the request is rejected before the token is even looked at, no matter how
+        valid it is. Set the type to <i>Proxmox Backup Server</i> and test again. If the
+        test then succeeds but warns that <code>Sys.PowerManagement</code> could not be
+        confirmed, the ACL is missing on the user, on the token, or on both — see
+        <a href="#token-pbs">section 4</a>. Also check that the API URL uses port
+        <b>8007</b>.</p>
         <h3>Update stays in the queue</h3>
         <p>If an uploaded update stays at “⏳ Queued”, the queue drainer is not active on
         this instance. This happens once on boxes updated from a very old version. Run once
@@ -725,6 +828,27 @@ systemctl start pve-usv-agent.service</code></pre>
         <p class="muted">Simplified, user-visible highlights. The full technical changelog
         lives in the <a href="https://github.com/ffind-dev/pve-ups/blob/main/CHANGELOG.md"
         target="_blank" rel="noopener">GitHub repository</a>.</p>
+
+        <div class="cl-ver">3.5.0 <span class="date">2026</span></div>
+        <ul>
+          <li><b>A Proxmox Backup Server can now be shut down too.</b> Every host entry has
+          a <b>type</b> — Proxmox VE or Proxmox Backup Server — which decides the token
+          scheme and the privilege that is checked. Entering a PBS used to fail as an
+          invalid token no matter what; see <a href="#token-pbs">section 4</a> for the
+          set-up, including why we <b>advise against</b> attaching PBS to the same instance
+          in production.</li>
+          <li>For a Backup Server the <b>“Node” field is just a label</b>. PBS ignores the
+          node name in the API path, so nothing there has to match the hostname.</li>
+          <li><b>Hosts are now shut down in stages</b> instead of strictly one after
+          another: entries sharing an “Order” are commanded at the same time, the appliance's
+          own host still goes last, and every command has a hard deadline. One machine that
+          stops responding can no longer delay the others or the battery countdown — see
+          <a href="#logik">section 6</a>. The wizard shows the resulting sequence live
+          under the host list, so it is visible which hosts go together and which follow.</li>
+          <li>The <b>self-test result is kept per host</b>: a broken token now shows up in
+          the dashboard's host table and in <a href="#monitoring">/api/health</a>, not only
+          in the event log.</li>
+        </ul>
 
         <div class="cl-ver">3.4.0 <span class="date">2026</span></div>
         <ul>

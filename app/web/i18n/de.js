@@ -118,6 +118,9 @@ I18N.de = {
   "hosts.thisChip": "★ dieser",
   "hosts.thisChipTitle": "Dieser Host – die Appliance, fährt zuletzt herunter",
   "hosts.none": "keine Hosts konfiguriert",
+  "hosts.seq": "Abschaltfolge:",
+  "hosts.seqHint": "Gleiche Zahl = gleichzeitig. ★ „Dieser Host“ ist unabhängig von seiner Zahl immer der Letzte.",
+  "hosts.seqNone": "noch keine Hosts",
   "events.none": "keine Ereignisse",
 
   // confirms + short action messages
@@ -149,9 +152,9 @@ I18N.de = {
   "wiz.addUps": "+ USV",
 
   // settings: hosts
-  "wiz.hosts": "Proxmox-Hosts",
-  "wiz.hostsDoc": "Im Handbuch nachlesen: Proxmox API-Token anlegen",
-  "wiz.hostsHelp": "API-Token mit Recht <code>Sys.PowerMgmt</code>. Der mit <span class=\"lg-star\">★</span> markierte „Dieser Host“ (Appliance) wird zuletzt heruntergefahren.",
+  "wiz.hosts": "Proxmox-Hosts (VE / Backup Server)",
+  "wiz.hostsDoc": "Im Handbuch nachlesen: API-Token anlegen",
+  "wiz.hostsHelp": "Typ je Ziel wählen: Proxmox VE braucht ein Token mit <code>Sys.PowerMgmt</code>, Proxmox Backup Server eines mit <code>Sys.PowerManagement</code>. Der mit <span class=\"lg-star\">★</span> markierte „Dieser Host“ (Appliance) wird zuletzt heruntergefahren.",
   "wiz.addHost": "+ Host",
 
   // settings: triggers
@@ -171,7 +174,7 @@ I18N.de = {
   "th.pollBattery": "Poll-Intervall Akku (s)",
   "th.pollBatteryTitle": "Abfrageintervall während eines Stromausfalls (Akkubetrieb). Üblich kürzer als im Netzbetrieb, um die Schwellwerte engmaschig zu prüfen.",
   "th.hostTimeout": "Host-Shutdown-Timeout (s)",
-  "th.hostTimeoutTitle": "Maximale Wartezeit auf die Antwort der Proxmox-API beim Senden des Shutdown-Befehls für EINEN Host, bevor zum nächsten weitergegangen wird. Es ist NICHT die Zeit, bis der Host real aus ist – das Herunterfahren der VMs übernimmt Proxmox selbst.",
+  "th.hostTimeoutTitle": "Maximale Wartezeit darauf, dass die API eines Ziels den Shutdown-Befehl annimmt. Es ist eine harte Obergrenze je Host: Ziele mit gleicher Reihenfolge laufen gleichzeitig, eine nicht antwortende Maschine verzögert die anderen also nie. Es ist NICHT die Zeit, bis der Host real aus ist – das Herunterfahren der VMs übernimmt Proxmox selbst.",
   "th.keepShutdown": "Shutdown bei Verbindungsverlust im Akkubetrieb nicht abbrechen",
   "th.keepShutdownTitle": "Reißt der Kontakt zur USV ab, während sie bereits im Akkubetrieb ist (laufender Stromausfall, z. B. ein zwischenliegender Switch wird stromlos), wird der bereits laufende Akkubetrieb-Countdown NICHT abgebrochen, sondern auf der lokalen Uhr fortgesetzt. Benötigt einen gesetzten „Akkubetrieb länger als (s)“-Wert. Ein reiner Kommunikationsverlust im Netzbetrieb bleibt fail-safe.",
   "th.commLoss": "Shutdown bei reinem Kommunikationsverlust nach (min)",
@@ -212,8 +215,8 @@ I18N.de = {
   "sys.tz": "Zeitzone",
   "sys.tzTitle": "Zeitzone der Appliance (IANA-Name, z.B. Europe/Berlin). Wird im Container gesetzt; der Dienst startet danach neu. Wichtig: die Selbsttest-Startzeit gilt in dieser lokalen Zeit. Leer = System-Standard (meist UTC) unverändert lassen.",
   "sys.tzPh": "z.B. Europe/Berlin (leer = unverändert)",
-  "sys.selftest": "Automatischer Selbsttest der Proxmox-Verbindung",
-  "sys.selftestTitle": "Prüft regelmäßig automatisch je Host, ob API-Token und das Recht Sys.PowerMgmt noch funktionieren – damit abgelaufene/falsche Zugangsdaten auffallen, bevor sie im Ernstfall gebraucht werden. Erfolg wird still geloggt (höchstens einmal täglich), ein Fehler gemeldet/benachrichtigt.",
+  "sys.selftest": "Automatischer Selbsttest der Ziel-Verbindungen",
+  "sys.selftestTitle": "Prüft regelmäßig automatisch je Host, ob API-Token und das jeweilige Power-Management-Recht noch funktionieren – damit abgelaufene/falsche Zugangsdaten auffallen, bevor sie im Ernstfall gebraucht werden. Erfolg wird still geloggt (höchstens einmal täglich), ein Fehler gemeldet/benachrichtigt.",
   "sys.selftestHour": "Selbsttest-Startzeit (Stunde 0–23)",
   "sys.selftestHourTitle": "Verankerung des Selbsttest-Rasters: volle Stunde (0–23) in der oben gesetzten Zeitzone (ohne Zeitzone: Containerzeit, meist UTC). Zusammen mit dem Intervall ergeben sich feste Tageszeiten, z.B. Start 09:00 alle 6 h → 09:00, 15:00, 21:00, 03:00.",
   "sys.selftestInterval": "Intervall",
@@ -347,14 +350,27 @@ I18N.de = {
   "tristate.global": "(global)",
   "tristate.on": "immer an",
   "tristate.off": "immer aus",
+  "htype.pve": "Proxmox VE",
+  "htype.pbs": "Proxmox Backup Server",
+  // Short forms for tight spots (dashboard chip, host card heading); the type dropdown
+  // uses the full names above.
+  "htype.pveShort": "Proxmox VE",
+  "htype.pbsShort": "Proxmox BS",
+  "htype.pveHelp": "Braucht ein API-Token mit dem Privileg „Sys.PowerMgmt“ auf /nodes.",
+  "htype.pbsHelp": "Standard-Port 8007. Braucht ein API-Token mit dem Privileg „Sys.PowerManagement“ auf /system/status — auf PBS trägt das nur die Rolle „Admin“, und sowohl der Benutzer als auch das Token brauchen den Eintrag.",
 
   // dynamic host row (settings)
+  "host.type": "Typ",
+  "host.typeTitle": "Welches Proxmox-Produkt auf diesem Ziel läuft. Davon hängen das Token-Schema und das geprüfte Privileg ab — ein als „Proxmox VE“ eingetragener Backup Server wird als ungültiges Token abgewiesen.",
   "host.node": "Node",
   "host.nodeTitle": "Node-Name exakt wie in Proxmox (z.B. „pve01“). Muss zum API-Pfad /nodes/<name> passen.",
+  "host.name": "Name",
+  "host.nameTitle": "Freie Bezeichnung für diesen Backup Server, sichtbar im Dashboard und in Ereignissen. Proxmox Backup Server ignoriert den Node-Namen im API-Pfad, hier muss also nichts zum Hostnamen passen.",
+  "host.hintDoc": "Einrichtungsschritte →",
   "host.apiurl": "API-URL",
-  "host.apiurlTitle": "Basis-URL der Proxmox-API inkl. Port, z.B. https://10.0.0.10:8006",
+  "host.apiurlTitle": "Basis-URL der API inkl. Port, z.B. https://10.0.0.10:8006 (Proxmox VE) oder https://10.0.0.20:8007 (Backup Server)",
   "host.tokenId": "Token-ID",
-  "host.tokenIdTitle": "API-Token-Kennung im Format benutzer@realm!tokenname, z.B. ups@pve!shutdown. Im Cluster gilt dasselbe Token für jeden Knoten.",
+  "host.tokenIdTitle": "API-Token-Kennung im Format benutzer@realm!tokenname, z.B. ups@pve!shutdown. Im PVE-Cluster gilt dasselbe Token für jeden Knoten.",
   "host.tokenSecret": "Token-Secret",
   "host.tokenSecretTitle": "Geheimer Token-Wert (UUID). Wird sicher gespeichert und nie zurückgegeben.",
   "host.tokenSecretPh": "Secret",
@@ -362,8 +378,8 @@ I18N.de = {
   "host.feedsTitle": "Welche USV(s) diesen Host versorgen. Bei redundanten Netzteilen mehrere ankreuzen.",
   "host.policy": "Logik",
   "host.policyTitle": "UND = Shutdown erst, wenn ALLE angekreuzten USVs kritisch sind (redundante Netzteile). ODER = Shutdown sobald EINE kritisch ist (aufgeteilte, nicht redundante Last).",
-  "host.order": "Reihenfolge",
-  "host.orderTitle": "Abschaltreihenfolge, aufsteigend (kleinste Zahl zuerst). „Dieser Host“ ist davon unabhängig immer der Letzte.",
+  "host.order": "Reihenfolge (0 = zuerst)",
+  "host.orderTitle": "Abschaltreihenfolge, aufsteigend – die 0 kommt zuerst. Hosts mit derselben Zahl werden gleichzeitig heruntergefahren (eine Stufe), was der schnellere und sicherere Normalfall ist; eine höhere Zahl nur vergeben, wenn ein Ziel wirklich vor einem anderen herunter muss. „Dieser Host“ ist unabhängig von seiner Zahl immer der Letzte.",
   "host.verify": "TLS prüfen",
   "host.verifyTitle": "TLS-Zertifikat prüfen. Aus lassen, solange Proxmox ein selbstsigniertes Zertifikat nutzt.",
   "host.this": "★ Dieser Host",

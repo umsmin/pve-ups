@@ -10,6 +10,45 @@ reads it dynamically. On every release: bump `__version__` **and** add a section
 
 ## [Unreleased]
 
+## [3.5.0] - 2026-08-23
+
+### Added
+- **Proxmox Backup Server as a shutdown target.** Each host now has a type (Proxmox VE or
+  Proxmox Backup Server) that decides how it is talked to. PBS uses its own
+  `PBSAPIToken=<id>:<secret>` header scheme and needs the `Sys.PowerManagement` privilege
+  on `/system/status`, which is why entering one as a PVE host used to fail as an invalid
+  token. The node name is a free label for PBS entries: PBS ignores the node in the API
+  path, so the shutdown always addresses `/nodes/localhost/status`.
+- **Self-test results per host.** The scheduled credential check now records its outcome
+  for every target (`credentials_ok`, `power_mgmt_ok`, `last_test_at`, `last_test_error`).
+  They appear in `/api/status` and in the dashboard's host table, so an expired token is
+  visible long before an outage needs it.
+- `/api/health` reports the shutdown targets: `hosts_total`, `hosts_ok`,
+  `hosts_selftest_ok` and `hosts_selftest_at`. The `status` field and the HTTP code are
+  deliberately unchanged — they still track the engine, not the credentials.
+- **Live preview of the shutdown sequence** under the host list in the wizard. It shows the
+  order the engine would actually use, including which hosts share a stage and therefore go
+  at the same time — previously that was only readable in a tooltip, and the staged
+  behaviour was not visible at all. The *Order* field now also says `0 = first` in its
+  label, and it is hidden while *This host* is ticked: that flag is the first sort key, so
+  a marked host is last whatever number it carries. The value is kept, so unticking
+  restores it.
+
+### Changed
+- **Hosts are shut down in stages instead of strictly one after another.** Targets sharing
+  a shutdown `order` are now commanded at the same time, and the appliance's own host still
+  forms the final stage. Together with a hard per-target deadline this means one machine
+  that stops responding can no longer delay the other hosts, the poll loop or the battery
+  countdown.
+- The feed diagram shows a host's name only; the product name is no longer prefixed, which
+  kept overflowing the node. The type stays visible as a chip in the dashboard's host table
+  and in the host card's heading, shortened there to `Proxmox BS` so a Backup Server row is
+  no wider than a Proxmox VE one.
+- *This host* is hidden for Proxmox Backup Server entries in LXC deployments, where the
+  combination is impossible — an LXC never runs on a Backup Server. It stays available in
+  Docker deployments, where the container may genuinely sit on the PBS and the mark decides
+  whether it shuts itself down last.
+
 ## [3.4.0] - 2026-08-19
 
 ### Added
@@ -215,7 +254,8 @@ keep working).
   needs; a legacy `notifications.smtp` config key is ignored on load and dropped on the
   next save.
 
-[Unreleased]: https://github.com/ffind-dev/pve-ups/compare/v3.4.0...HEAD
+[Unreleased]: https://github.com/ffind-dev/pve-ups/compare/v3.5.0...HEAD
+[3.5.0]: https://github.com/ffind-dev/pve-ups/compare/v3.4.0...v3.5.0
 [3.4.0]: https://github.com/ffind-dev/pve-ups/compare/v3.3.0...v3.4.0
 [3.3.0]: https://github.com/ffind-dev/pve-ups/compare/v3.2.0...v3.3.0
 [3.2.0]: https://github.com/ffind-dev/pve-ups/compare/v3.1.0...v3.2.0

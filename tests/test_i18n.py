@@ -105,6 +105,48 @@ def test_source_type_keys_exist_in_both_dictionaries():
     assert re.findall(r'\["([a-z]+)"', block.group(1)) == kinds
 
 
+def test_manual_deep_links_resolve_in_both_manuals():
+    """Every anchor the UI deep-links to must exist in manual.html *and* handbuch.html.
+
+    The links are built from data-manual attributes (static markup and, for the per-type
+    host hint, from app.js), so a renamed section would silently land readers at the top
+    of the document in one language only.
+    """
+    anchors = set()
+    for name in ("index.html", "app.js"):
+        anchors |= set(re.findall(r'data-manual="([a-z0-9-]+)"', (WEB / name).read_text(encoding="utf-8")))
+    # app.js also assigns the attribute at runtime: doc.dataset.manual = … ? "a" : "b"
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    for line in re.findall(r"dataset\.manual\s*=\s*(.+)", js):
+        anchors |= set(re.findall(r'"([a-z0-9-]+)"', line))
+    assert "token-pbs" in anchors and "token-pve" in anchors, "host hint links not detected"
+
+    for manual in ("manual.html", "handbuch.html"):
+        have = set(re.findall(r'id="([a-z0-9-]+)"', (WEB / manual).read_text(encoding="utf-8")))
+        missing = sorted(a for a in anchors if a not in have)
+        assert not missing, f"{manual} has no section for: {missing}"
+
+
+def test_host_type_keys_exist_in_both_dictionaries():
+    """Every shutdown target type needs a label + a help line in EN and DE."""
+    from app.config import TARGET_MODELS, HostType
+
+    kinds = [t.value for t in HostType]
+    assert sorted(kinds) == sorted(TARGET_MODELS), "HostType and the model map drifted apart"
+    missing = _both_dictionaries_define("htype.", kinds)
+    # Two more dynamic keys per type: the hint under the host form
+    # (t("htype." + ty + "Help")) and the short label used where the full product name
+    # would blow up the column (t("htype." + ty + "Short"), see hostTypeLabel).
+    for suffix in ("Help", "Short"):
+        missing += _both_dictionaries_define("htype.", [f"{k}{suffix}" for k in kinds])
+    assert not missing, f"host types without a dictionary entry: {missing}"
+
+    # The host dropdown is built in JS; a type missing there is unreachable in the UI.
+    block = re.search(r"const HOST_TYPES = \[(.*?)\];", (WEB / "app.js").read_text(encoding="utf-8"))
+    assert block, "HOST_TYPES not found in app.js"
+    assert re.findall(r'\["([a-z]+)"', block.group(1)) == kinds
+
+
 def test_snmp_mib_keys_exist_in_both_dictionaries():
     """Every selectable MIB needs a label in EN and DE (wizard dropdown + dashboard)."""
     from app.ups import PROFILES
