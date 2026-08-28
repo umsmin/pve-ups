@@ -225,11 +225,54 @@ def test_config_roundtrip_mixes_pve_and_pbs_targets(tmp_path):
 
 
 def test_host_key_separates_targets_of_the_same_name():
-    """Runtime latches are keyed by type + name: a PBS and a PVE entry may share a name."""
+    """Runtime latches are keyed by the stable id, never by anything the user edits."""
+    from app.config import assign_host_ids
+
     pve = PveHostConfig(name="backup", api_url="x")
     pbs = PbsHostConfig(name="backup", api_url="x")
+    # Until ids are assigned, the pre-id form keeps the key non-empty and distinct.
     assert pve.key != pbs.key
     assert pve.key == "pve:backup" and pbs.key == "pbs:backup"
+
+    assign_host_ids([pve, pbs])
+    assert pve.key == pve.id and pbs.key == pbs.id
+    assert pve.key != pbs.key
+    # And the key survives what the pre-id scheme could not: a rename.
+    before = pve.key
+    pve.name = "backup-01"
+    assert pve.key == before
+
+
+def test_two_entries_with_the_same_name_do_not_share_a_shutdown_latch():
+    """A duplicated row with the IP not adjusted used to collide: both entries produced
+    the key "pve:pve01", so the second was treated as already fired and stayed up."""
+    from app.config import assign_host_ids
+
+    a = PveHostConfig(name="pve01", api_url="https://10.0.0.10:8006")
+    b = PveHostConfig(name="pve01", api_url="https://10.0.0.11:8006")
+    assign_host_ids([a, b])
+    assert a.key != b.key
+
+
+def test_assign_host_ids_is_stable_collision_free_and_not_ups_flavoured():
+    from app.config import assign_host_ids
+
+    hosts = [
+        PveHostConfig(id="kept", name="pve01", api_url="x"),
+        PveHostConfig(name="pve01", api_url="x"),   # same name, needs its own id
+        PveHostConfig(name="!!!", api_url="x"),     # slugifies to nothing
+        PbsHostConfig(name="", api_url="x"),        # no name at all
+    ]
+    assign_host_ids(hosts)
+    ids = [h.id for h in hosts]
+
+    assert ids[0] == "kept"                 # an existing id is never rewritten
+    assert ids[1] == "pve01"
+    assert len(set(ids)) == len(ids)        # collision-free
+    # _slugify's default fallback is "ups"; a host must not inherit it.
+    assert "ups" not in ids
+
+
 
 
 def test_config_defaults_the_mib_of_pre_3_3_entries_to_auto(tmp_path):
@@ -300,16 +343,22 @@ def test_config_ignores_legacy_smtp_key(tmp_path):
     }
     path.write_text(yaml.safe_dump(old), encoding="utf-8")
     cfg = load_config(path)
-    assert cfg.notifications.webhook.enabled is True
-    assert cfg.notifications.webhook.url == "https://hook.example/x"
+    # The single pre-4.0 webhook block is migrated into the one-element list.
+    assert len(cfg.notifications.webhooks) == 1
+    assert cfg.notifications.webhooks[0].enabled is True
+    assert cfg.notifications.webhooks[0].url == "https://hook.example/x"
     save_config(cfg, path)
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert "smtp" not in raw["notifications"]
-    assert raw["notifications"]["webhook"]["url"] == "https://hook.example/x"
+    # ... and the file is rewritten in the current shape: a list, no legacy key left.
+    assert "webhook" not in raw["notifications"]
+    assert raw["notifications"]["webhooks"][0]["url"] == "https://hook.example/x"
     # A pre-3.4 webhook block has neither key; both must appear with their defaults, and
     # as plain strings (an Enum would not survive yaml.safe_dump).
-    assert raw["notifications"]["webhook"]["format"] == "json"
-    assert raw["notifications"]["webhook"]["min_severity"] == "warning"
+    assert raw["notifications"]["webhooks"][0]["format"] == "json"
+    assert raw["notifications"]["webhooks"][0]["min_severity"] == "warning"
+    # The migration also gives the entry the id the per-webhook secret reconcile needs.
+    assert raw["notifications"]["webhooks"][0]["id"]
 
 
 def test_default_config_missing_file_returns_defaults(tmp_path):
@@ -327,6 +376,48 @@ def test_merge_config_reconciles_ups_secrets_by_id():
     }
     merged = main._merge_config(incoming, existing)
     assert merged.ups[0].community.get_secret_value() == "keep"  # placeholder kept old secret
+
+
+def test_merge_config_reconciles_webhook_auth_header_by_id():
+    """A masked auth header must survive a save, or the token is lost on every edit."""
+    from app import main
+    from app.config import Notifications, WebhookConfig
+
+    existing = AppConfig(notifications=Notifications(webhooks=[
+        WebhookConfig(id="w1", url="https://ntfy/x", auth_header_name="Authorization",
+                      auth_header_value="Bearer keep-me"),
+    ]))
+    incoming = {
+        "ups": [], "hosts": [],
+        "notifications": {"webhooks": [{
+            "id": "w1", "url": "https://ntfy/x", "auth_header_name": "Authorization",
+            "auth_header_value": main.SECRET_PLACEHOLDER,
+        }]},
+    }
+    merged = main._merge_config(incoming, existing)
+    assert merged.notifications.webhooks[0].auth_header_value.get_secret_value() == "Bearer keep-me"
+
+    # A genuinely new value replaces it, and a brand-new webhook starts empty.
+    incoming["notifications"]["webhooks"][0]["auth_header_value"] = "Bearer new"
+    incoming["notifications"]["webhooks"].append({"url": "https://other/x"})
+    merged = main._merge_config(incoming, existing)
+    assert merged.notifications.webhooks[0].auth_header_value.get_secret_value() == "Bearer new"
+    assert merged.notifications.webhooks[1].auth_header_value.get_secret_value() == ""
+    # ... and the new entry is given an id, which is what the reconcile matches on.
+    assert merged.notifications.webhooks[1].id
+
+
+def test_webhook_secrets_never_leave_through_the_api():
+    """The sanitized config must mask the auth header, like every other secret."""
+    from app import main
+    from app.config import Notifications, WebhookConfig
+
+    cfg = AppConfig(notifications=Notifications(webhooks=[
+        WebhookConfig(id="w1", url="https://ntfy/x", auth_header_value="Bearer top-secret"),
+    ]))
+    data = main._sanitized_config(cfg)
+    assert data["notifications"]["webhooks"][0]["auth_header_value"] == main.SECRET_PLACEHOLDER
+    assert "top-secret" not in str(data)
 
 
 def test_merge_config_reconciles_nut_password_and_ignores_the_other_type():
@@ -545,12 +636,104 @@ async def test_and_policy_abort_when_feed_recovers():
     assert eng.shutdown_triggered is False
 
 
+# --- re-arming after an episode ---------------------------------------------
+def _fired_engine(monkeypatch, **th):
+    """An engine that has really shut its host down (not a dry run)."""
+    from app import proxmox
+
+    sent: list[str] = []
+
+    async def fake_shutdown(host, timeout=60, **kw):
+        sent.append(host.name)
+        return True, "ok"
+
+    monkeypatch.setattr(proxmox, "shutdown_node", fake_shutdown)
+    cfg = AppConfig(
+        dry_run=False,
+        ups=[SnmpConfig(id="a", name="A", host="10.0.0.1")],
+        hosts=[PveHostConfig(name="pve01", api_url="x", ups_ids=["a"])],
+        thresholds=Thresholds(on_battery_seconds=None, runtime_below_minutes=5,
+                              charge_below_percent=None, on_battery_low=False, **th),
+    )
+    eng = Engine(cfg)
+    _notify_recorder(eng)
+    return eng, sent
+
+
+@pytest.mark.asyncio
+async def test_the_appliance_re_arms_once_mains_have_been_back(monkeypatch):
+    """A sent shutdown latches its host for good — nothing ever cleared that again, so
+    the appliance stayed in SHUTTING_DOWN, the self-test and the "Restore cluster" button
+    stood down for ever, and a second outage shut down nothing at all."""
+    eng, sent = _fired_engine(monkeypatch)
+    eng.host_states["pve:pve01"] = {"credentials_ok": True, "last_test_at": "yesterday"}
+
+    _on_battery_low_runtime(eng, "a")
+    await eng._evaluate()
+    assert sent == ["pve01"] and eng.state == SHUTTING_DOWN
+
+    # Mains are back, but not for long enough yet: a grid that dips twice in a minute
+    # must not re-arm in between.
+    _on_mains(eng, "a")
+    await eng._evaluate()
+    assert eng.shutdown_triggered is True and eng.state == SHUTTING_DOWN
+
+    eng._mains_ok_since = eng._mains_ok_since - timedelta(minutes=6)
+    await eng._evaluate()
+
+    assert eng.host_fired == {} and eng.shutdown_triggered is False
+    assert eng.state == ONLINE
+    # The self-test verdict lives in the same dict and answers a different question.
+    assert eng.host_states["pve:pve01"]["credentials_ok"] is True
+    assert "shutdown_state" not in eng.host_states["pve:pve01"]
+
+    # And the whole point: the next outage is handled like the first.
+    _on_battery_low_runtime(eng, "a")
+    await eng._evaluate()
+    assert sent == ["pve01", "pve01"]
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_ups_does_not_count_as_mains_back(monkeypatch):
+    """Fail safe in the other direction too: we do not know, so we do not re-arm."""
+    eng, _ = _fired_engine(monkeypatch)
+
+    _on_battery_low_runtime(eng, "a")
+    await eng._evaluate()
+
+    eng.ups_rt["a"].state = UpsState(reachable=False, error="timeout")
+    await eng._evaluate()
+    assert eng._mains_ok_since is None
+    assert eng.shutdown_triggered is True
+
+
+@pytest.mark.asyncio
+async def test_re_arming_can_be_switched_off(monkeypatch):
+    """None keeps the pre-4.0 behaviour: the latches come off by hand, or not at all."""
+    eng, _ = _fired_engine(monkeypatch, rearm_after_mains_min=None)
+
+    _on_battery_low_runtime(eng, "a")
+    await eng._evaluate()
+    _on_mains(eng, "a")
+    await eng._evaluate()
+
+    assert eng._mains_ok_since is None       # not even counting
+    assert eng.host_fired.get("pve:pve01") is True
+    assert eng.state == SHUTTING_DOWN
+
+    # The manual reset still works, and now keeps the self-test results.
+    eng.host_states["pve:pve01"]["credentials_ok"] = True
+    eng.reset()
+    assert eng.host_fired == {} and eng.state == ONLINE
+    assert eng.host_states["pve:pve01"] == {"credentials_ok": True}
+
+
 @pytest.mark.asyncio
 async def test_eligible_hosts_shut_down_this_host_last(monkeypatch):
     from app import proxmox
     order: list[str] = []
 
-    async def fake_shutdown(host, timeout=60):
+    async def fake_shutdown(host, timeout=60, **kw):
         order.append(host.name)
         return True, "ok"
 
@@ -733,6 +916,98 @@ async def test_comm_loss_on_battery_alarm_does_not_claim_no_shutdown():
     assert all("NO shutdown" not in b for _, b in events)
 
 
+# --- connection-loss debounce (issue #17) ------------------------------------
+def _notify_recorder(eng):
+    """Record everything _emit() would notify about (the event log is not affected)."""
+    events: list[tuple[str, str, str]] = []
+
+    async def rec(subject, body, severity):
+        events.append((subject, severity, body))
+
+    eng._emit = rec  # type: ignore[assignment]
+    return events
+
+
+async def _poll_reachability(eng, *reachable_states):
+    for ok in reachable_states:
+        eng.ups_rt["u"].state = (
+            UpsState(reachable=True, power_source="mains", battery_charge_pct=100)
+            if ok
+            else UpsState(reachable=False, error="timeout")
+        )
+        await eng._evaluate()
+
+
+@pytest.mark.asyncio
+async def test_single_dropped_poll_does_not_notify():
+    """A blip must stay silent: ok, fail, ok produces no notification at all.
+
+    This is issue #17 — a single lost SNMP packet used to fire a warning-level webhook
+    immediately, ahead of the alarm threshold that was supposed to govern it.
+    """
+    eng = _ups_engine(Thresholds(unreachable_alarm_after_polls=3))
+    events = _notify_recorder(eng)
+    await _poll_reachability(eng, True, False, True)
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_sustained_loss_notifies_exactly_once():
+    eng = _ups_engine(Thresholds(unreachable_alarm_after_polls=3))
+    events = _notify_recorder(eng)
+    await _poll_reachability(eng, True, False, False, False)
+    from app import db
+
+    assert len(events) == 1
+    subject, severity, _ = events[0]
+    assert "unreachable" in subject and severity == db.WARNING
+
+    # Staying unreachable must not repeat it, and the recovery is reported exactly once.
+    await _poll_reachability(eng, False, False)
+    assert len(events) == 1
+    await _poll_reachability(eng, True)
+    assert len(events) == 2
+    assert "restored" in events[1][0]
+
+
+@pytest.mark.asyncio
+async def test_recovery_is_silent_when_the_loss_was_never_notified():
+    """No "restored" out of nowhere: it is only notified if a loss was notified too."""
+    eng = _ups_engine(Thresholds(unreachable_alarm_after_polls=5))
+    events = _notify_recorder(eng)
+    await _poll_reachability(eng, True, False, False, True)
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_debounce_never_delays_a_shutdown():
+    """Regression guard: the debounce covers connectivity notices only.
+
+    A trigger that fires while unreachable must still latch on the very same poll — the
+    battery countdown may not wait for an alarm threshold.
+    """
+    th = Thresholds(unreachable_alarm_after_polls=99,  # alarm would never fire
+                    on_battery_seconds=1, runtime_below_minutes=None,
+                    charge_below_percent=None, on_battery_low=False,
+                    keep_shutdown_on_comm_loss=True)
+    cfg = AppConfig(dry_run=False, ups=[SnmpConfig(id="u", host="10.0.0.9")],
+                    hosts=[PveHostConfig(name="pve01", api_url="x", ups_ids=["u"])],
+                    thresholds=th)
+    eng = Engine(cfg)
+    eng.ups_rt["u"].state = UpsState(reachable=True, power_source="battery")
+    eng.ups_rt["u"].on_battery_since = datetime.now(timezone.utc) - timedelta(seconds=30)
+    fired: list[str] = []
+
+    async def fake_fire(host, reason):
+        fired.append(host.key)
+
+    eng._fire_host = fake_fire  # type: ignore[assignment]
+    # Communication drops on the same poll the countdown expires on.
+    eng.ups_rt["u"].state = UpsState(reachable=False, error="timeout")
+    await eng._evaluate()
+    assert fired == ["pve:pve01"], "a blind, latched trigger must fire without waiting"
+
+
 @pytest.mark.asyncio
 async def test_pure_comm_loss_alarm_still_says_no_shutdown():
     eng = _ups_engine(Thresholds(unreachable_alarm_after_polls=1))
@@ -889,21 +1164,34 @@ def test_config_roundtrip_keep_shutdown_on_comm_loss(tmp_path):
 
 @pytest.mark.asyncio
 async def test_network_transitions_are_logged():
+    """Every transition reaches the EVENT LOG, even the ones that are not notified.
+
+    Since the issue #17 fix a short loss is debounced out of the notification path, so
+    diagnostics depend on the quiet log keeping the full picture. Both directions must
+    appear there regardless of the alarm threshold.
+    """
     eng = _ups_engine(Thresholds(unreachable_alarm_after_polls=99))
-    events: list[str] = []
+    logged: list[str] = []
+    notified: list[str] = []
 
-    async def rec(subject, body, severity):
-        events.append(subject)
+    async def rec_emit(subject, body, severity):
+        notified.append(subject)
 
-    eng._emit = rec  # type: ignore[assignment]
+    def rec_quiet(subject, body, severity):
+        logged.append(subject)
+
+    eng._emit = rec_emit  # type: ignore[assignment]
+    eng._log_quiet = rec_quiet  # type: ignore[assignment]
     eng.ups_rt["u"].state = UpsState(reachable=True, power_source="mains")
     await eng._evaluate()  # first poll: no transition (last is None)
     eng.ups_rt["u"].state = UpsState(reachable=False, error="timeout")
     await eng._evaluate()  # -> lost
     eng.ups_rt["u"].state = UpsState(reachable=True, power_source="mains")
     await eng._evaluate()  # -> restored
-    assert any("connection lost" in s for s in events)
-    assert any("connection restored" in s for s in events)
+    assert any("connection lost" in s for s in logged)
+    assert any("connection restored" in s for s in logged)
+    # ... and below the alarm threshold none of it is worth a notification.
+    assert notified == []
 
 
 # --- SNMP engine lifecycle (v1.8.3): no file-descriptor leak ----------------
@@ -1033,26 +1321,77 @@ def test_agent_drainer_active_never_raises(monkeypatch):
     assert main._agent_drainer_active() is False  # missing unit file -> not active
 
 
-def test_read_package_version_from_tar_and_zip(tmp_path):
+def _write_pkg_tar(path, mode, prefix="pve-usv/"):
+    """A minimal release package, the way `git archive` produces it (with a prefix dir)."""
     import io
     import tarfile
+
+    members = {
+        f"{prefix}pyproject.toml": b"[project]\n",
+        f"{prefix}app/__init__.py": b'__version__ = "9.9.9"\n',
+    }
+    with tarfile.open(path, mode) as t:
+        for name, data in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            t.addfile(info, io.BytesIO(data))
+    return path
+
+
+def test_inspect_package_accepts_targz_plain_tar_and_zip(tmp_path):
+    """Format detection is by content, not by name.
+
+    Safari unpacks .tar.gz on download (issue #24), so the very same release asset can
+    arrive as a plain .tar — it must be accepted just like the compressed original.
+    """
     import zipfile
 
     from app import main
 
-    init = b'__version__ = "9.9.9"\n'
-
-    tgz = tmp_path / "pkg.tar.gz"
-    with tarfile.open(tgz, "w:gz") as t:  # with a prefix dir, like git archive produces
-        info = tarfile.TarInfo("pve-usv/app/__init__.py")
-        info.size = len(init)
-        t.addfile(info, io.BytesIO(init))
-    assert main._read_package_version(tgz) == "9.9.9"
+    assert main._inspect_package(_write_pkg_tar(tmp_path / "pkg.tar.gz", "w:gz")) == ("9.9.9", None)
+    assert main._inspect_package(_write_pkg_tar(tmp_path / "pkg.tar", "w")) == ("9.9.9", None)
+    # A .tar.gz name on plain tar content (and vice versa) must not confuse the check.
+    assert main._inspect_package(_write_pkg_tar(tmp_path / "lying.tar.gz", "w")) == ("9.9.9", None)
 
     z = tmp_path / "pkg.zip"
     with zipfile.ZipFile(z, "w") as zf:
-        zf.writestr("app/__init__.py", init.decode())
-    assert main._read_package_version(z) == "9.9.9"
+        zf.writestr("pyproject.toml", "[project]\n")
+        zf.writestr("app/__init__.py", '__version__ = "9.9.9"\n')
+    assert main._inspect_package(z) == ("9.9.9", None)
+
+
+def test_inspect_package_rejects_unreadable_and_foreign_archives(tmp_path):
+    """A bad upload must be caught here, before it is handed to the privileged agent."""
+    import io
+    import tarfile
+
+    from app import main
+
+    junk = tmp_path / "broken.tar.gz"
+    junk.write_bytes(b"this is not an archive")
+    version, error = main._inspect_package(junk)
+    assert version is None and error and "readable" in error
+
+    foreign = tmp_path / "foreign.tar.gz"
+    with tarfile.open(foreign, "w:gz") as t:
+        data = b"hello\n"
+        info = tarfile.TarInfo("README.md")
+        info.size = len(data)
+        t.addfile(info, io.BytesIO(data))
+    version, error = main._inspect_package(foreign)
+    assert version is None and error and "release package" in error
+
+    # Readable and ours, but without a parsable version: still accepted (the agent copes),
+    # because an unreadable version is cosmetic while a refused update is not.
+    import io as _io
+
+    noversion = tmp_path / "noversion.tar.gz"
+    with tarfile.open(noversion, "w:gz") as t:
+        for name, data in (("pyproject.toml", b"[project]\n"), ("app/__init__.py", b"# empty\n")):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            t.addfile(info, _io.BytesIO(data))
+    assert main._inspect_package(noversion) == (None, None)
 
 
 # --- Docker deployment mode (v3.1.0) -----------------------------------------
@@ -1373,11 +1712,17 @@ def test_every_profile_is_structurally_sound():
 
     state_fields = {f.name for f in fields(ups.UpsState)}
     seen: dict[str, str] = {}
+    # Table columns read at a FIXED index. Everything else must be a ".0" scalar: the
+    # poller does a plain GET and never walks, so an OID without an instance would simply
+    # come back empty. New entries here are a deliberate decision, not an oversight.
+    fixed_index_oids = {
+        ups.OID_OUTPUT_LOAD: "upsOutputPercentLoad on output line 1",
+    }
     for profile in ups.PROFILES.values():
         assert profile.id in {m.value for m in SnmpMib}, profile.id
         assert profile.anchor in profile.oids, profile.id
         for obj in profile.objects:
-            assert obj.oid.endswith(".0"), obj.name  # scalars only; we never walk tables
+            assert obj.oid.endswith(".0") or obj.oid in fixed_index_oids, obj.name
             # OIDs must be globally unique or the flat _OBJECTS registry would lose one.
             assert seen.setdefault(obj.oid, profile.id) == profile.id, obj.oid
             assert obj.field in state_fields, obj.name
@@ -1386,6 +1731,34 @@ def test_every_profile_is_structurally_sound():
                 assert obj.enum, obj.name
         # A profile that cannot feed a threshold would leave it silently dead.
         assert set(profile.trigger_oids.values()) == set(ups.PROBE_TRIGGERS), profile.id
+
+
+def test_output_load_is_read_by_both_profiles_but_triggers_nothing():
+    """Issue #20: the load is informational — it must never gate a shutdown condition."""
+    from app import ups
+
+    for profile in ups.PROFILES.values():
+        loads = [o for o in profile.objects if o.field == "load_pct"]
+        assert len(loads) == 1, profile.id
+        assert loads[0].kind == ups.KIND_PCT
+        # No trigger: a device that omits the load must not make the wizard warn about
+        # an unavailable shutdown condition.
+        assert loads[0].trigger is None
+    assert "load_pct" not in ups.PROBE_TRIGGERS
+
+
+def test_load_reaches_the_status_snapshot():
+    from app.engine import Engine
+    from app.ups import UpsState
+
+    eng = Engine(AppConfig(ups=[SnmpConfig(id="u", host="10.0.0.9")]))
+    eng.ups_rt["u"].state = UpsState(reachable=True, power_source="mains", load_pct=37)
+    snap = eng.snapshot()
+    assert snap["ups"][0]["load_pct"] == 37
+
+    # A device that does not report it shows nothing rather than a wrong zero.
+    eng.ups_rt["u"].state = UpsState(reachable=True, power_source="mains")
+    assert eng.snapshot()["ups"][0]["load_pct"] is None
 
 
 def test_apc_timeticks_are_converted_to_seconds_and_minutes():
@@ -2141,9 +2514,9 @@ async def test_export_import_round_trip_preserves_every_field(_import_target):
     assert restored.hosts[2].this_host is True
     assert restored.thresholds.runtime_below_minutes == 7
     assert restored.thresholds.comm_loss_shutdown_after_min == 15
-    assert restored.notifications.webhook.url == "https://hook/x"
-    assert restored.notifications.webhook.format.value == "teams"
-    assert restored.notifications.webhook.min_severity.value == "critical"
+    assert restored.notifications.webhooks[0].url == "https://hook/x"
+    assert restored.notifications.webhooks[0].format.value == "teams"
+    assert restored.notifications.webhooks[0].min_severity.value == "critical"
     assert restored.dry_run is False
     assert restored.ntp_server == "pool.ntp.org"
     assert restored.timezone == "Europe/Berlin"
@@ -2495,8 +2868,8 @@ async def test_notify_accepts_plain_strings_for_the_enum_settings(monkeypatch):
 
     calls = _fake_httpx(monkeypatch)  # defined below; resolved at call time
     cfg = Notifications(webhook=_hook())
-    cfg.webhook.min_severity = "info"
-    cfg.webhook.format = "text"
+    cfg.webhooks[0].min_severity = "info"
+    cfg.webhooks[0].format = "text"
 
     await notify.notify(cfg, "s", "b", {}, "info")
 
@@ -2565,6 +2938,149 @@ async def test_send_webhook_posts_in_the_configured_format(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_slack_and_discord_carry_subject_body_and_severity(monkeypatch):
+    from app import notify
+
+    calls = _fake_httpx(monkeypatch)
+    await notify.send_webhook(_hook(format="slack"), "Subj", "Body.", "critical", _SNAPSHOT)
+    payload = calls[0][1]["json"]
+    # Slack needs the fallback text for push notifications, and the colour carries severity.
+    assert "Subj" in payload["text"]
+    assert payload["attachments"][0]["color"] == notify._SLACK_COLOR["critical"]
+    assert payload["attachments"][0]["text"] == "Body."
+
+    calls.clear()
+    await notify.send_webhook(_hook(format="discord"), "Subj", "Body.", "warning", _SNAPSHOT)
+    embed = calls[0][1]["json"]["embeds"][0]
+    assert embed["title"] == "Subj" and embed["description"] == "Body."
+    assert embed["color"] == notify._DISCORD_COLOR["warning"]
+    assert len(embed["fields"]) <= 25  # Discord rejects more
+
+
+@pytest.mark.asyncio
+async def test_ntfy_puts_the_metadata_in_headers(monkeypatch):
+    from app import notify
+
+    calls = _fake_httpx(monkeypatch)
+    await notify.send_webhook(_hook(format="ntfy"), "Subj", "Body.", "critical", _SNAPSHOT)
+    headers = calls[0][1]["headers"]
+    assert headers["Title"] == "Subj"
+    assert headers["Priority"] == "urgent"
+    assert headers["Tags"]
+    # Header values must be latin-1 encodable or httpx refuses to send them.
+    for value in headers.values():
+        value.encode("latin-1")
+    # The subject is the Title, so it must not be repeated in the body.
+    assert b"Body." in calls[0][1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_ntfy_title_survives_a_non_ascii_subject(monkeypatch):
+    from app import notify
+
+    calls = _fake_httpx(monkeypatch)
+    await notify.send_webhook(_hook(format="ntfy"), "USV Störung", "b", "warning", _SNAPSHOT)
+    calls[0][1]["headers"]["Title"].encode("latin-1")  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_custom_template_substitutes_and_escapes_for_json(monkeypatch):
+    from app import notify
+
+    calls = _fake_httpx(monkeypatch)
+    hook = _hook(
+        format="custom",
+        template='{"msg": "{{subject}}", "lvl": "{{severity_upper}}", "all": {{facts_json}}}',
+        content_type="application/json",
+    )
+    # A quote in the subject must not be able to break the JSON body.
+    await notify.send_webhook(hook, 'UPS "A" lost', "b", "warning", _SNAPSHOT)
+    import json
+
+    body = json.loads(calls[0][1]["content"].decode("utf-8"))  # must parse
+    assert body["msg"] == 'UPS "A" lost'
+    assert body["lvl"] == "WARNING"
+    assert isinstance(body["all"], dict)
+    assert calls[0][1]["headers"]["Content-Type"] == "application/json"
+
+
+@pytest.mark.asyncio
+async def test_custom_template_leaves_plain_text_unescaped(monkeypatch):
+    from app import notify
+
+    calls = _fake_httpx(monkeypatch)
+    hook = _hook(format="custom", template="{{subject}}", content_type="text/plain")
+    await notify.send_webhook(hook, 'a "quoted" subject', "b", "warning", _SNAPSHOT)
+    assert calls[0][1]["content"].decode("utf-8") == 'a "quoted" subject'
+
+
+@pytest.mark.asyncio
+async def test_custom_without_a_template_falls_back_instead_of_sending_nothing(monkeypatch):
+    from app import notify
+
+    calls = _fake_httpx(monkeypatch)
+    await notify.send_webhook(_hook(format="custom"), "Subj", "b", "warning", _SNAPSHOT)
+    assert b"Subj" in calls[0][1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_auth_header_is_attached_to_any_format(monkeypatch):
+    from app import notify
+
+    calls = _fake_httpx(monkeypatch)
+    hook = _hook(format="ntfy", auth_header_name="Authorization",
+                 auth_header_value="Bearer tk_secret")
+    await notify.send_webhook(hook, "s", "b", "warning", _SNAPSHOT)
+    assert calls[0][1]["headers"]["Authorization"] == "Bearer tk_secret"
+
+    # A name without a value must not produce an empty header.
+    calls.clear()
+    await notify.send_webhook(_hook(format="ntfy", auth_header_name="X-Api-Key"),
+                              "s", "b", "warning", _SNAPSHOT)
+    assert "X-Api-Key" not in calls[0][1]["headers"]
+
+
+@pytest.mark.asyncio
+async def test_every_enabled_webhook_gets_the_notification(monkeypatch):
+    from app import notify
+    from app.config import Notifications
+
+    calls = _fake_httpx(monkeypatch)
+    cfg = Notifications(webhooks=[
+        _hook(id="a", url="https://a/x"),
+        _hook(id="b", url="https://b/x", format="text"),
+        _hook(id="c", url="https://c/x", enabled=False),          # disabled
+        _hook(id="d", url="https://d/x", min_severity="critical"),  # filtered out
+    ])
+    await notify.notify(cfg, "s", "b", _SNAPSHOT, "warning")
+    assert sorted(url for url, _ in calls) == ["https://a/x", "https://b/x"]
+
+
+@pytest.mark.asyncio
+async def test_one_failing_webhook_does_not_stop_the_others(monkeypatch):
+    """A target that hangs or errors must not cost the other targets their notification —
+    nor bring down the poll loop this runs on."""
+    from app import notify
+    from app.config import Notifications
+
+    sent: list[str] = []
+
+    async def flaky(hook, subject, body, severity, payload):
+        if hook.url == "https://bad/x":
+            raise RuntimeError("connection reset")
+        sent.append(hook.url)
+        return "HTTP 200"
+
+    monkeypatch.setattr(notify, "send_webhook", flaky)
+    cfg = Notifications(webhooks=[
+        _hook(id="bad", url="https://bad/x"),
+        _hook(id="good", url="https://good/x"),
+    ])
+    await notify.notify(cfg, "s", "b", _SNAPSHOT, "warning")
+    assert sent == ["https://good/x"]
+
+
+@pytest.mark.asyncio
 async def test_send_webhook_reports_an_http_error(monkeypatch):
     from app import notify
 
@@ -2617,7 +3133,7 @@ def test_unknown_webhook_values_snap_to_the_defaults():
     # A backup from another version must import; a webhook in the wrong shape is fixable.
     from app.config import WebhookConfig
 
-    hook = WebhookConfig.model_validate({"url": "https://hook/x", "format": "slack",
+    hook = WebhookConfig.model_validate({"url": "https://hook/x", "format": "smoke-signal",
                                          "min_severity": "verbose"})
 
     assert hook.format.value == "json"
@@ -2751,11 +3267,11 @@ async def test_targets_dispatch_picks_the_client_per_type(monkeypatch):
 
     seen = []
 
-    async def fake_pve(host, timeout):
+    async def fake_pve(host, timeout, **kw):
         seen.append("pve")
         return True, "pve"
 
-    async def fake_pbs(host, timeout):
+    async def fake_pbs(host, timeout, **kw):
         seen.append("pbs")
         return True, "pbs"
 
@@ -2787,7 +3303,7 @@ async def test_target_calls_give_up_instead_of_hanging(monkeypatch):
 
     from app import targets
 
-    async def never_answers(host, timeout):
+    async def never_answers(host, timeout, **kw):
         await asyncio.sleep(60)
         return True, "too late"
 
@@ -2829,7 +3345,7 @@ async def test_a_hanging_target_does_not_delay_its_stage_peers(monkeypatch):
 
     started, finished, release = [], [], asyncio.Event()
 
-    async def fake_shutdown(host, timeout):
+    async def fake_shutdown(host, timeout, **kw):
         started.append(host.name)
         if host.type == "pbs":
             await release.wait()
@@ -2863,7 +3379,7 @@ async def test_stage_order_is_kept_across_different_order_values(monkeypatch):
 
     fired = []
 
-    async def fake_shutdown(host, timeout):
+    async def fake_shutdown(host, timeout, **kw):
         fired.append(host.name)
         return True, "ok"
 
@@ -2912,7 +3428,7 @@ async def test_a_shutdown_does_not_erase_the_selftest_result(monkeypatch):
     async def fake_test(host, *a, **k):
         return TestResult(True, "ok", has_power_mgmt=True)
 
-    async def fake_shutdown(host, timeout):
+    async def fake_shutdown(host, timeout, **kw):
         return True, "sent"
 
     monkeypatch.setattr(engine_mod.targets, "test_connection", fake_test)
@@ -2981,6 +3497,69 @@ def test_merge_config_reconciles_host_secrets_by_type_and_name():
     assert merged.hosts[1].token_secret.get_secret_value() == "pbs-secret"
 
 
+def test_renaming_a_host_keeps_its_token_secret():
+    """The reported bug: the node name is an EDITED field, so identifying hosts by it made
+    a correction look like a different host — and the masked placeholder then resolved to
+    an empty secret. Sharpened by the host test now suggesting the correct node name."""
+    from app import main
+
+    existing = AppConfig(hosts=[
+        PveHostConfig(id="pve01", name="PVE01", api_url="x", token_secret="kept")])
+    incoming = {"hosts": [
+        {"id": "pve01", "name": "pve01", "type": "pve", "api_url": "x",
+         "token_secret": "**********"}]}
+
+    merged = main._merge_config(incoming, existing)
+    assert merged.hosts[0].name == "pve01"
+    assert merged.hosts[0].token_secret.get_secret_value() == "kept"
+
+
+def test_renaming_a_host_keeps_its_secret_for_the_test_button_too():
+    """Where the user meets it first: accept the suggested node name, press Test, and a
+    valid token would have been reported as "Authentication failed"."""
+    from app import main
+
+    hosts = [PveHostConfig(id="pve01", name="PVE01", api_url="x", token_secret="kept")]
+    incoming = {"id": "pve01", "name": "pve01", "type": "pve", "api_url": "x",
+                "token_secret": "**********"}
+
+    main._reconcile_host_secrets(incoming, main._find_host(incoming, *main._host_lookups(hosts)))
+    assert incoming["token_secret"] == "kept"
+
+
+def test_a_payload_without_ids_still_finds_its_stored_secret():
+    """The upgrade path: the first save after this version arrives carries no ids (a
+    cached older app.js). Without the fallback it would drop every secret exactly once —
+    the very bug the id was introduced to fix."""
+    from app import main
+
+    existing = AppConfig(hosts=[
+        PveHostConfig(id="pve01", name="pve01", api_url="x", token_secret="kept")])
+    incoming = {"hosts": [
+        {"name": "pve01", "type": "pve", "api_url": "x", "token_secret": "**********"}]}
+
+    merged = main._merge_config(incoming, existing)
+    assert merged.hosts[0].token_secret.get_secret_value() == "kept"
+    assert merged.hosts[0].id == "pve01"  # and it gains the id on the way through
+
+
+def test_a_stored_config_without_ids_gains_them_on_load(tmp_path):
+    import yaml
+
+    from app.config import load_config
+
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump({"hosts": [
+        {"name": "pve01", "type": "pve", "api_url": "x"},
+        {"name": "pve01", "type": "pbs", "api_url": "y"},
+    ]}), encoding="utf-8")
+
+    cfg = load_config(path)
+    assert all(h.id for h in cfg.hosts)
+    assert cfg.hosts[0].key != cfg.hosts[1].key
+    assert cfg.hosts[0].name == "pve01"  # nothing else changed
+
+
 def test_repointing_a_host_to_another_product_drops_the_old_secret():
     from app import main
 
@@ -3005,3 +3584,2933 @@ def test_merge_config_accepts_hosts_without_a_type():
     merged = main._merge_config(incoming, existing)
     assert merged.hosts[0].type == "pve"
     assert merged.hosts[0].token_secret.get_secret_value() == "kept"
+
+
+# --- cluster awareness (read-only): Ceph flags + HA arm state ---------------
+# The guest list every cluster fixture serves unless told otherwise: the appliance's own
+# container plus two guests that a cluster-wide stop would have to take down.
+_DEFAULT_GUESTS = (
+    {"vmid": 950, "node": "pve01", "type": "lxc", "name": "pve-usv", "status": "running"},
+    {"vmid": 100, "node": "pve01", "type": "qemu", "name": "web", "status": "running"},
+    {"vmid": 101, "node": "pve02", "type": "lxc", "name": "db", "status": "running"},
+)
+
+
+def _cluster_routes(*, is_cluster=True, quorate=1, permissions=None, flags=None,
+                    armed_state="armed", has_disarm=True, ha_services=1,
+                    shutdown_policy="conditional", has_ceph=True, guests=None,
+                    mons=("pve01", "pve02")):
+    """Canned answers of a PVE cluster member, shaped like the real API."""
+    status = []
+    if is_cluster:
+        status.append({"type": "cluster", "name": "prod", "quorate": quorate, "nodes": 3})
+        status += [{"type": "node", "name": f"pve0{i}", "online": 1, "local": int(i == 1)}
+                   for i in (1, 2, 3)]
+    else:
+        # A standalone node answers with one fake entry and no "cluster" record.
+        status.append({"type": "node", "name": "pve01", "nodeid": 0, "online": 1, "local": 1})
+
+    current = [{"type": "fencing", "armed-state": armed_state}]
+    current += [{"type": "service", "sid": f"vm:{100 + i}", "state": "started"}
+                for i in range(int(ha_services))]
+
+    index = [{"name": "current"}, {"name": "manager_status"}]
+    if has_disarm:
+        index += [{"name": "disarm-ha"}, {"name": "arm-ha"}]
+
+    flag_values = {"noout": False, "nobackfill": False, "norecover": False,
+                   "norebalance": False, **(flags or {})}
+    perms = (permissions if permissions is not None
+             else {"Sys.Audit": 1, "Sys.Modify": 1, "Sys.Console": 1,
+                   "VM.Audit": 1, "VM.PowerMgmt": 1, "Datastore.Audit": 1})
+    guest_list = [dict(g) for g in (_DEFAULT_GUESTS if guests is None else guests)]
+    routes = {
+        "/access/permissions": _FakeJson(200, {"data": {"/": perms}}),
+        "/cluster/status": _FakeJson(200, {"data": status}),
+        "/cluster/ceph/status": _FakeJson(200, {"data": {
+            "health": {"status": "HEALTH_OK"},
+            "monmap": {"mons": [{"name": m} for m in mons]},
+        }}),
+        # Permission-FILTERED, never refused: a token without VM.Audit gets 200 and an
+        # empty list, which is exactly why the code may not read "empty" as "no guests".
+        "/cluster/resources?type=vm": _FakeJson(
+            200, {"data": guest_list if perms.get("VM.Audit") else []}),
+        "/cluster/resources?type=storage": _FakeJson(200, {"data": [
+            {"storage": "local-lvm", "plugintype": "lvmthin"},
+            {"storage": "cephpool", "plugintype": "rbd"},
+        ] if perms.get("Datastore.Audit") else []}),
+        "/cluster/ceph/flags": _FakeJson(200, {"data": [
+            {"name": k, "value": v} for k, v in flag_values.items()]}),
+        # The endpoint index is user => 'all', so it answers without Sys.Audit.
+        "/cluster/ha/status": _FakeJson(200, {"data": index}),
+        "/cluster/ha/status/current": _FakeJson(200, {"data": current}),
+        "/cluster/options": _FakeJson(200, {"data": {"ha": {"shutdown_policy": shutdown_policy}}}),
+    }
+    for g in guest_list:
+        routes[f"/nodes/{g['node']}/{g['type']}/{g['vmid']}/config"] = _FakeJson(
+            200, {"data": {"rootfs": "local-lvm:vm-%s-disk-0,size=4G" % g["vmid"]}})
+    # Realistic 403s: everything except the index is gated on Sys.Audit, and a token
+    # without it gets a refusal rather than a helpful answer.
+    if not perms.get("Sys.Audit"):
+        for path in ("/cluster/status", "/cluster/ceph/status", "/cluster/ceph/flags",
+                     "/cluster/ha/status/current", "/cluster/options"):
+            routes[path] = _FakeJson(403, {})
+    # A cluster without Ceph: pveceph was never initialised, so these endpoints exist in
+    # the schema but die on the missing config — a 500, NOT a 403. Telling those two apart
+    # is the whole point of ClusterInfo.ceph_unavailable.
+    if not has_ceph:
+        for path in ("/cluster/ceph/status", "/cluster/ceph/flags"):
+            routes[path] = _FakeJson(500, {})
+    return routes
+
+
+def _fake_cluster(monkeypatch, **kw):
+    from app import cluster
+
+    calls: list = []
+    monkeypatch.setattr(cluster.httpx, "AsyncClient",
+                        _FakeApiClient(_cluster_routes(**kw), calls))
+    return calls
+
+
+def _pve(**kw):
+    return PveHostConfig(name="pve01", api_url="https://pve:8006",
+                         token_id="ups@pve!x", token_secret="s", cluster=True, **kw)
+
+
+@pytest.mark.asyncio
+async def test_cluster_inspection_reads_membership_ceph_and_ha(monkeypatch):
+    from app import cluster
+
+    _fake_cluster(monkeypatch, flags={"noout": True})
+    info = await cluster.inspect(_pve())
+
+    assert info.reachable and info.is_cluster and info.name == "prod"
+    assert info.quorate and info.nodes_online == 3 and len(info.nodes) == 3
+    assert info.ceph_configured and info.ceph_flags_set == ["noout"]
+    assert info.ha_services == 1 and info.ha_resources and info.ha_armed_state == "armed"
+    assert info.ha_present and not info.ha_disarmed
+    assert info.disarm_supported is True
+    assert info.shutdown_policy == "conditional"
+    assert info.can_audit and info.can_modify and info.can_console
+
+
+@pytest.mark.asyncio
+async def test_standalone_node_is_detected_and_nothing_else_is_queried(monkeypatch):
+    """A standalone node must not look like a one-node cluster, and must not be probed
+    for Ceph/HA it does not have."""
+    from app import cluster
+
+    calls = _fake_cluster(monkeypatch, is_cluster=False)
+    info = await cluster.inspect(_pve())
+
+    assert info.reachable and info.is_cluster is False
+    queried = [c[1] for c in calls if c[0] == "GET"]
+    assert "/cluster/ceph/flags" not in queried
+    assert "/cluster/ha/status/current" not in queried
+
+
+@pytest.mark.asyncio
+async def test_disarm_support_is_detected_from_the_endpoint_index(monkeypatch):
+    """Feature detection reads the index, not GET /version — that also covers backports."""
+    from app import cluster
+
+    _fake_cluster(monkeypatch, has_disarm=False)
+    info = await cluster.inspect(_pve())
+    assert info.disarm_supported is False
+    # Everything else still works: the Ceph flags are not a 9.2 feature.
+    assert info.ceph_configured is True
+
+
+@pytest.mark.asyncio
+async def test_needs_recovery_flags_a_cluster_left_prepared(monkeypatch):
+    from app import cluster
+
+    _fake_cluster(monkeypatch, flags={"noout": True, "norecover": True})
+    info = await cluster.inspect(_pve())
+    assert info.needs_recovery is True
+    assert info.ceph_flags_set == ["noout", "norecover"]
+
+    _fake_cluster(monkeypatch, armed_state="disarmed")
+    info = await cluster.inspect(_pve())
+    assert info.ha_disarmed and info.needs_recovery is True
+
+    _fake_cluster(monkeypatch)  # clean cluster
+    info = await cluster.inspect(_pve())
+    assert info.needs_recovery is False
+
+
+@pytest.mark.asyncio
+async def test_missing_privileges_are_named_individually(monkeypatch):
+    """"403" tells an operator nothing; the missing privilege points at the pveum line."""
+    from app import cluster
+
+    _fake_cluster(monkeypatch, permissions={"Sys.Audit": 1})
+    info = await cluster.inspect(_pve())
+
+    # Each name carries what it buys: "Sys.Console" alone does not tell an operator
+    # whether handing out shell access is worth it.
+    assert cluster.missing_privileges(info, want_ceph=True, want_disarm=True) == [
+        "Sys.Modify (Ceph maintenance flags)", "Sys.Console (HA disarm)"]
+    # Whoever only wants the Ceph flags must not be told to hand out Sys.Console.
+    assert cluster.missing_privileges(info, want_ceph=True, want_disarm=False) == [
+        "Sys.Modify (Ceph maintenance flags)"]
+    assert cluster.missing_privileges(info, want_ceph=False, want_disarm=False) == []
+
+
+@pytest.mark.asyncio
+async def test_no_privilege_is_demanded_for_a_feature_this_cluster_cannot_do(monkeypatch):
+    """Least privilege in both directions: a feature that is switched on but absent here
+    must not send the operator off to widen a token for something that will never run."""
+    from app import cluster
+
+    _fake_cluster(monkeypatch, permissions={"Sys.Audit": 1}, has_ceph=False,
+                  has_disarm=False)
+    info = await cluster.inspect(_pve())
+
+    assert info.ceph_unavailable and info.disarm_unavailable
+    assert cluster.missing_privileges(info, want_ceph=True, want_disarm=True) == []
+
+
+@pytest.mark.asyncio
+async def test_an_unread_feature_still_has_its_privilege_demanded(monkeypatch):
+    """"Denied" is not "absent". While the read was merely refused, the privilege is
+    still reported — otherwise a token that lacks everything would be told about its
+    missing rights one round at a time."""
+    from app import cluster
+
+    # No Sys.Audit at all: every cluster read comes back 403, so nothing is settled.
+    _fake_cluster(monkeypatch, permissions={})
+    info = await cluster.inspect(_pve())
+
+    assert not info.ceph_unavailable, "a 403 must not read as 'no Ceph'"
+    missing = cluster.missing_privileges(info, want_ceph=True, want_disarm=True)
+    assert [m.split(" ")[0] for m in missing] == ["Sys.Audit", "Sys.Modify", "Sys.Console"]
+
+
+@pytest.mark.asyncio
+async def test_cluster_inspection_never_raises_and_stays_bounded(monkeypatch):
+    """Same contract as targets.shutdown(): this runs on the poll loop while the battery
+    drains, so a server that accepts the connection and goes quiet must not stall it."""
+    import asyncio
+
+    from app import cluster
+
+    class _Hanging:
+        def __call__(self, *a, **kw):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, **kw):
+            await asyncio.sleep(30)
+
+    monkeypatch.setattr(cluster.httpx, "AsyncClient", _Hanging())
+    info = await cluster.inspect(_pve(), timeout=0.05)
+    assert info.reachable is False and "gave up" in info.error
+
+
+@pytest.mark.asyncio
+async def test_cluster_inspection_survives_a_broken_answer(monkeypatch):
+    """A changed/garbled payload must degrade the report, never break the poll loop."""
+    from app import cluster
+
+    routes = _cluster_routes()
+    routes["/cluster/status"] = _FakeJson(200, {"data": "not-a-list"})
+    routes["/cluster/ha/status/current"] = _FakeJson(500, {})
+    monkeypatch.setattr(cluster.httpx, "AsyncClient", _FakeApiClient(routes, []))
+
+    info = await cluster.inspect(_pve())
+    assert info.reachable is True
+    assert info.is_cluster is False  # unreadable membership: treated as "not a cluster"
+
+
+def _cluster_engine(monkeypatch, all_nodes=False, host_names=None, disabled=(), **kw):
+    """Engine with cluster-enabled PVE hosts, talking to a canned cluster.
+
+    ``all_nodes`` configures every node of the fake cluster, which silences the
+    (correct) "not every node is a configured target" warning. ``host_names`` overrides
+    the entry names outright, which is how the misnamed-entry cases are built, and
+    ``disabled`` names entries that exist but are switched off.
+    """
+    from app import cluster
+    from app.engine import Engine
+
+    monkeypatch.setattr(cluster.httpx, "AsyncClient", _FakeApiClient(_cluster_routes(**kw), []))
+    names = host_names or (["pve01", "pve02", "pve03"] if all_nodes else ["pve01"])
+    hosts = [PveHostConfig(name=n, api_url="https://pve:8006", token_id="ups@pve!x",
+                           token_secret="s", cluster=True, enabled=n not in disabled)
+             for n in names]
+    return Engine(AppConfig(hosts=hosts))
+
+
+@pytest.mark.asyncio
+async def test_health_check_warns_about_leftovers_from_a_previous_outage(monkeypatch):
+    """The two states an operator would otherwise only discover during the next outage."""
+    eng = _cluster_engine(monkeypatch, flags={"noout": True}, armed_state="disarmed")
+    events = _notify_recorder(eng)
+
+    await eng._check_clusters()
+
+    subjects = " | ".join(s for s, _, _ in events)
+    assert "Ceph maintenance flags still set" in subjects
+    assert "HA is still disarmed" in subjects
+    assert all(sev == "warning" for _, sev, _ in events), "never worse than a warning"
+
+
+@pytest.mark.asyncio
+async def test_health_check_is_quiet_on_a_healthy_cluster(monkeypatch):
+    eng = _cluster_engine(monkeypatch, all_nodes=True, shutdown_policy="freeze")
+    events = _notify_recorder(eng)
+
+    await eng._check_clusters()
+
+    assert events == []
+    snap = eng.cluster_snapshot()
+    assert snap[0]["name"] == "prod" and snap[0]["needs_recovery"] is False
+
+
+@pytest.mark.asyncio
+async def test_health_check_warns_once_about_a_missing_disarm_endpoint(monkeypatch):
+    """A version limitation repeated at every self-test would train the operator to
+    ignore the feed — so it is said once, clearly."""
+    eng = _cluster_engine(monkeypatch, has_disarm=False, shutdown_policy="freeze")
+    events = _notify_recorder(eng)
+
+    await eng._check_clusters()
+    await eng._check_clusters()
+    await eng._check_clusters()
+
+    hits = [s for s, _, _ in events if "HA disarm not available" in s]
+    assert len(hits) == 1
+
+
+@pytest.mark.asyncio
+async def test_health_check_warns_about_a_shutdown_policy_that_fights_the_shutdown(monkeypatch):
+    """'migrate' makes the LRM delay the shutdown while the battery drains, and the
+    default 'conditional' recovers services onto nodes that are shutting down."""
+    eng = _cluster_engine(monkeypatch, has_disarm=False, shutdown_policy="migrate")
+    events = _notify_recorder(eng)
+    await eng._check_clusters()
+    body = " ".join(b for _, _, b in events)
+    assert "shutdown_policy" in " ".join(s for s, _, _ in events)
+    assert "delays the shutdown" in body and "freeze" in body
+
+    # With HA actually being disarmed, the policy no longer matters.
+    eng = _cluster_engine(monkeypatch, shutdown_policy="migrate")
+    events = _notify_recorder(eng)
+    await eng._check_clusters()
+    assert not [s for s, _, _ in events if "shutdown_policy" in s]
+
+
+@pytest.mark.asyncio
+async def test_health_check_reports_missing_quorum_and_unconfigured_nodes(monkeypatch):
+    eng = _cluster_engine(monkeypatch, quorate=0, shutdown_policy="freeze")
+    events = _notify_recorder(eng)
+    await eng._check_clusters()
+    subjects = " | ".join(s for s, _, _ in events)
+    assert "no quorum" in subjects
+    # Three nodes in the cluster, one configured here.
+    assert "not every node is a configured target" in subjects
+    # ... and the body names BOTH sides of the comparison. Counts alone state the
+    # conclusion while withholding everything needed to act on it.
+    body = next(b for s_, _, b in events if "configured target" in s_)
+    assert "pve01, pve02, pve03" in body
+    assert "Configured here: pve01" in body
+    assert "pve02, pve03" in body
+
+
+@pytest.mark.asyncio
+async def test_health_check_names_the_node_an_entry_probably_meant(monkeypatch):
+    """A case difference is invisible to the eye and fatal to /nodes/<name>/status."""
+    eng = _cluster_engine(monkeypatch, host_names=["PVE01"], shutdown_policy="freeze")
+    events = _notify_recorder(eng)
+    await eng._check_clusters()
+
+    body = next(b for s_, _, b in events if "configured target" in s_)
+    # The warning still fires: a near miss is explained, never silently accepted, because
+    # PVE resolves the path segment literally and the shutdown really would fail.
+    assert "Configured here: none" in body
+    assert "'PVE01'" in body and "likely means 'pve01'" in body
+    assert "/nodes/<name>/status" in body
+
+
+@pytest.mark.asyncio
+async def test_health_check_explains_an_fqdn_entry_the_same_way(monkeypatch):
+    eng = _cluster_engine(monkeypatch, host_names=["pve01.example.com"],
+                          shutdown_policy="freeze")
+    events = _notify_recorder(eng)
+    await eng._check_clusters()
+
+    body = next(b for s_, _, b in events if "configured target" in s_)
+    assert "likely means 'pve01'" in body
+
+
+@pytest.mark.asyncio
+async def test_health_check_tells_a_disabled_entry_from_a_misnamed_one(monkeypatch):
+    """Both leave a node running, but the fix is completely different."""
+    eng = _cluster_engine(monkeypatch, host_names=["pve01", "pve02", "pve03"],
+                          disabled=("pve03",), shutdown_policy="freeze")
+    events = _notify_recorder(eng)
+    await eng._check_clusters()
+
+    body = next(b for s_, _, b in events if "configured target" in s_)
+    assert "'pve03' would match, but that entry is disabled." in body
+    assert "matching no node" not in body
+
+
+# --- node name matching -----------------------------------------------------
+def test_node_coverage_separates_covered_missing_and_misnamed():
+    from app.cluster import node_coverage
+
+    cov = node_coverage(["pve01", "pve02"], ["pve01", "PVE02", "backup.lan"])
+    assert cov.covered == ["pve01"]
+    assert cov.missing == ["pve02"]
+    assert cov.unmatched == ["PVE02", "backup.lan"]
+    # Only the entry that plausibly meant a real node gets a suggestion; "backup.lan"
+    # resembles nothing here and must not be paired with an arbitrary node.
+    assert cov.near == [("PVE02", "pve02")]
+
+
+def test_node_coverage_never_matches_loosely():
+    """The loose form explains a mismatch; it must never resolve one."""
+    from app.cluster import node_coverage
+
+    cov = node_coverage(["pve01"], ["PVE01"])
+    assert cov.covered == [] and cov.missing == ["pve01"]
+
+
+@pytest.mark.asyncio
+async def test_list_nodes_only_reports_a_readable_index(monkeypatch):
+    """A token that may not enumerate nodes is not evidence of a wrong node name."""
+    from app import proxmox
+
+    host = PveHostConfig(name="pve01", api_url="https://pve:8006",
+                         token_id="ups@pve!x", token_secret="s")
+
+    async def run(route):
+        monkeypatch.setattr(proxmox.httpx, "AsyncClient",
+                            _FakeApiClient({"/nodes": route}, []))
+        return await proxmox.list_nodes(host)
+
+    ok = await run(_FakeJson(200, {"data": [{"node": "pve01"}, {"node": "pve02"}]}))
+    assert ok.readable and ok.nodes == ["pve01", "pve02"]
+
+    for refused in (_FakeJson(403, {}), _FakeJson(200, {"data": []}),
+                    _FakeJson(200, {"data": None})):
+        res = await run(refused)
+        assert res.readable is False and res.nodes == []
+
+
+async def _node_check(name, known):
+    from app import main
+
+    host = PveHostConfig(name=name, api_url="https://pve:8006",
+                         token_id="ups@pve!x", token_secret="s")
+    return await main._check_node_name(host, known)
+
+
+@pytest.mark.asyncio
+async def test_node_check_stays_silent_when_the_api_will_not_name_its_nodes():
+    from app import proxmox
+
+    data, message = await _node_check("whatever", proxmox.NodeList())
+    assert data["readable"] is False and data["suggestion"] is None
+    # The regression this guards: "could not read" must never be reported as "wrong".
+    assert message == ""
+
+
+@pytest.mark.asyncio
+async def test_node_check_offers_the_node_a_misspelled_entry_meant():
+    from app import proxmox
+
+    data, message = await _node_check(
+        "PVE01", proxmox.NodeList(readable=True, nodes=["pve01", "pve02"]))
+    assert data["match"] is False
+    assert data["suggestion"] == "pve01" and data["reason"] == "near"
+    # The diagnosis belongs to verify_node(), which the credential test already ran, and
+    # the offer is rendered as a clickable link — so there is nothing left to say in words.
+    assert message == ""
+
+
+@pytest.mark.asyncio
+async def test_node_check_does_not_guess_for_an_unrecognisable_name():
+    """Picking one of several nodes at random could shut down the wrong machine."""
+    from app import proxmox
+
+    data, message = await _node_check(
+        "backup", proxmox.NodeList(readable=True, nodes=["pve01", "pve02"]))
+    assert data["suggestion"] is None and data["reason"] is None
+    assert message == ""  # nothing to offer, so nothing is said twice
+
+
+@pytest.mark.asyncio
+async def test_node_check_fills_an_empty_field_from_the_node_that_answered():
+    from app import proxmox
+
+    data, _ = await _node_check("", proxmox.NodeList(
+        readable=True, nodes=["pve01", "pve02"], local="pve02"))
+    assert data["suggestion"] == "pve02" and data["reason"] == "local"
+
+    # Without a local marker a single-node answer is still unambiguous.
+    data, _ = await _node_check("", proxmox.NodeList(readable=True, nodes=["pve01"]))
+    assert data["suggestion"] == "pve01" and data["reason"] == "only"
+
+    # Several nodes and nothing pointing at one of them: no suggestion.
+    data, _ = await _node_check(
+        "", proxmox.NodeList(readable=True, nodes=["pve01", "pve02"]))
+    assert data["suggestion"] is None
+
+
+@pytest.mark.asyncio
+async def test_node_check_offers_the_node_this_api_url_actually_answers_for():
+    """The cluster case: every member is "a node this API knows", so the plain list said
+    "ok" for a name belonging to a different machine. The local marker decides."""
+    from app import proxmox
+
+    data, message = await _node_check("pve02", proxmox.NodeList(
+        readable=True, nodes=["pve01", "pve02"], local="pve01"))
+
+    assert data["match"] is False
+    # Not a guess: the API itself said which node answers here.
+    assert data["suggestion"] == "pve01" and data["reason"] == "local"
+    # The diagnosis is already in the test message (from verify_node), so nothing here.
+    assert message == ""
+
+
+@pytest.mark.asyncio
+async def test_host_test_reports_coverage_and_reuses_the_cluster_node_list(monkeypatch):
+    """The wizard is where this is still cheap to fix, so it says it there too — and
+    /cluster/status already named every member, so no second round trip is made."""
+    from app import cluster, main
+    from app.engine import Engine
+
+    calls: list = []
+    monkeypatch.setattr(cluster.httpx, "AsyncClient",
+                        _FakeApiClient(_cluster_routes(), calls))
+    host = PveHostConfig(name="PVE01", api_url="https://pve:8006", token_id="ups@pve!x",
+                         token_secret="s", cluster=True)
+    monkeypatch.setattr(main, "engine", Engine(AppConfig(hosts=[host])))
+
+    _, message, known = await main._check_host_cluster(host)
+
+    assert known.readable and known.nodes == ["pve01", "pve02", "pve03"]
+    assert known.local == "pve01"  # the member that answered this api_url
+    assert "Not covered by any entry: pve01, pve02, pve03." in message
+    assert not [c for c in calls if c[0] == "GET" and c[1] == "/nodes"]
+
+
+# --- node name verification (the shutdown path) -----------------------------
+def _nodes_client(monkeypatch, nodes=("pve01", "pve02"), status=200):
+    from app import proxmox
+
+    payload = {"data": [{"node": n} for n in nodes]}
+    monkeypatch.setattr(proxmox.httpx, "AsyncClient",
+                        _FakeApiClient({"/nodes": _FakeJson(status, payload)}, []))
+    return PveHostConfig(name="pve01", api_url="https://pve:8006",
+                         token_id="ups@pve!x", token_secret="s")
+
+
+@pytest.mark.asyncio
+async def test_list_nodes_marks_the_node_that_answered(monkeypatch):
+    """/cluster/status is asked first because it is the only listing that says which
+    member is behind this API URL — without it every cluster name looked equally right."""
+    from app import proxmox
+
+    host = PveHostConfig(name="pve01", api_url="https://pve:8006",
+                         token_id="ups@pve!x", token_secret="s")
+    calls: list = []
+    monkeypatch.setattr(proxmox.httpx, "AsyncClient", _FakeApiClient({
+        "/cluster/status": _FakeJson(200, {"data": [
+            {"type": "cluster", "name": "prod"},
+            {"type": "node", "name": "pve01", "local": 1},
+            {"type": "node", "name": "pve02"},
+        ]}),
+    }, calls))
+
+    known = await proxmox.list_nodes(host)
+
+    assert known.readable and known.nodes == ["pve01", "pve02"]
+    assert known.local == "pve01"          # the cluster record is not a node
+    assert not [c for c in calls if c[1] == "/nodes"]   # no second listing needed
+
+
+@pytest.mark.asyncio
+async def test_list_nodes_falls_back_to_the_index_without_sys_audit(monkeypatch):
+    """The node listing must not start demanding Sys.Audit: without it the index still
+    answers, and the verdict simply stops short of "which one is local"."""
+    from app import proxmox
+
+    host = PveHostConfig(name="pve01", api_url="https://pve:8006",
+                         token_id="ups@pve!x", token_secret="s")
+    monkeypatch.setattr(proxmox.httpx, "AsyncClient", _FakeApiClient({
+        "/cluster/status": _FakeJson(403, {}),
+        "/nodes": _FakeJson(200, {"data": [{"node": "pve01"}, {"node": "pve02"}]}),
+    }, []))
+
+    known = await proxmox.list_nodes(host)
+
+    assert known.readable and known.nodes == ["pve01", "pve02"] and known.local is None
+    assert (await proxmox.verify_node(host)).state == "ok"
+
+
+@pytest.mark.asyncio
+async def test_verify_node_confirms_a_name_the_api_lists(monkeypatch):
+    from app import proxmox
+
+    host = _nodes_client(monkeypatch)
+    assert (await proxmox.verify_node(host)).state == "ok"
+
+
+@pytest.mark.asyncio
+async def test_verify_node_rejects_a_name_no_node_carries(monkeypatch):
+    from app import proxmox
+
+    host = _nodes_client(monkeypatch, nodes=("pve02", "pve03"))
+    verdict = await proxmox.verify_node(host)
+    assert verdict.state == "wrong"
+    assert "pve02, pve03" in verdict.detail
+
+
+@pytest.mark.asyncio
+async def test_verify_node_rejects_an_fqdn_without_asking_the_api(monkeypatch):
+    """PVE's own schema forbids dots, so this never even reaches the handler (HTTP 400).
+    Checked locally: it costs no round trip and names the actual reason."""
+    from app import proxmox
+
+    calls: list = []
+    monkeypatch.setattr(proxmox.httpx, "AsyncClient", _FakeApiClient({}, calls))
+    host = PveHostConfig(name="pve01.example.com", api_url="https://pve:8006",
+                         token_id="ups@pve!x", token_secret="s")
+
+    verdict = await proxmox.verify_node(host)
+    assert verdict.state == "invalid"
+    assert not [c for c in calls if c[0] == "GET"]
+
+
+@pytest.mark.asyncio
+async def test_verify_node_gives_no_verdict_when_no_node_was_named(monkeypatch):
+    """The regression guard: "could not read" must never be reported as "wrong"."""
+    from app import proxmox
+
+    host = _nodes_client(monkeypatch, status=403)
+    assert (await proxmox.verify_node(host)).state == "unverified"
+
+
+@pytest.mark.asyncio
+async def test_verify_node_accepts_whatever_the_api_lists_verbatim(monkeypatch):
+    """The evidence beats the string comparison — which is what keeps us out of the
+    question whether PVE matches the path segment case-sensitively."""
+    from app import proxmox
+
+    monkeypatch.setattr(proxmox.httpx, "AsyncClient", _FakeApiClient(
+        {"/nodes": _FakeJson(200, {"data": [{"node": "PVE01"}]})}, []))
+    host = PveHostConfig(name="PVE01", api_url="https://pve:8006",
+                         token_id="ups@pve!x", token_secret="s")
+    assert (await proxmox.verify_node(host)).state == "ok"
+
+
+@pytest.mark.asyncio
+async def test_verify_node_spots_a_real_node_behind_the_wrong_api_url(monkeypatch):
+    """The failure mode no name list can see: the shutdown succeeds by proxy and takes
+    down a different machine, leaving this one running."""
+    from app import proxmox
+
+    host = _nodes_client(monkeypatch)
+    known = proxmox.NodeList(readable=True, nodes=["pve01", "pve02"], local="pve02")
+    verdict = await proxmox.verify_node(host, known=known)
+    assert verdict.state == "proxied"
+    assert "belongs to 'pve02'" in verdict.detail
+
+
+# --- the shutdown path itself ----------------------------------------------
+def _shutdown_probe(monkeypatch, results):
+    """Patch app.proxmox's httpx so each /nodes/<n>/status POST answers from `results`."""
+    from app import proxmox
+
+    calls: list = []
+    routes = {f"/nodes/{n}/status": _FakeJson(code, {}) for n, code in results.items()}
+    monkeypatch.setattr(proxmox.httpx, "AsyncClient", _FakeApiClient(routes, calls))
+    return calls
+
+
+def _pve(name="pve01"):
+    return PveHostConfig(name=name, api_url="https://pve:8006",
+                         token_id="ups@pve!x", token_secret="s")
+
+
+@pytest.mark.asyncio
+async def test_shutdown_addresses_the_node_behind_the_url_by_default(monkeypatch):
+    from app import proxmox
+
+    calls = _shutdown_probe(monkeypatch, {"localhost": 200})
+    ok, msg = await proxmox.shutdown_node(_pve(), use_localhost=True)
+    assert ok and "localhost" in msg
+    assert [c[1] for c in calls if c[0] == "POST"] == ["/nodes/localhost/status"]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_keeps_the_name_when_the_url_is_shared(monkeypatch):
+    from app import proxmox
+
+    calls = _shutdown_probe(monkeypatch, {"pve01": 200})
+    ok, _ = await proxmox.shutdown_node(_pve(), use_localhost=False)
+    assert ok
+    assert [c[1] for c in calls if c[0] == "POST"] == ["/nodes/pve01/status"]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_retries_the_other_form_and_says_so(monkeypatch):
+    """A misspelled name answers 400/500; localhost then still brings the machine down —
+    and the message has to make clear the configuration is still broken."""
+    from app import proxmox
+
+    calls = _shutdown_probe(monkeypatch, {"pve01": 500, "localhost": 200})
+    ok, msg = await proxmox.shutdown_node(_pve(), use_localhost=False)
+    assert ok
+    assert [c[1] for c in calls if c[0] == "POST"] == [
+        "/nodes/pve01/status", "/nodes/localhost/status"]
+    assert "Fix this host entry" in msg
+
+
+@pytest.mark.asyncio
+async def test_shutdown_retries_even_a_refusal(monkeypatch):
+    """A token holding Sys.PowerMgmt on /nodes/<name> rather than /nodes refuses the
+    localhost form. A refused call did nothing, so the retry is free."""
+    from app import proxmox
+
+    calls = _shutdown_probe(monkeypatch, {"localhost": 403, "pve01": 200})
+    ok, _ = await proxmox.shutdown_node(_pve(), use_localhost=True)
+    assert ok
+    assert [c[1] for c in calls if c[0] == "POST"] == [
+        "/nodes/localhost/status", "/nodes/pve01/status"]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_does_not_call_the_same_path_twice(monkeypatch):
+    from app import proxmox
+
+    calls = _shutdown_probe(monkeypatch, {"localhost": 500})
+    ok, msg = await proxmox.shutdown_node(_pve("localhost"), use_localhost=True)
+    assert ok is False
+    assert len([c for c in calls if c[0] == "POST"]) == 1
+    assert "/nodes/localhost" in msg
+
+
+@pytest.mark.asyncio
+async def test_shutdown_failure_names_both_paths(monkeypatch):
+    from app import proxmox
+
+    _shutdown_probe(monkeypatch, {"pve01": 500, "localhost": 500})
+    ok, msg = await proxmox.shutdown_node(_pve(), use_localhost=True)
+    assert ok is False
+    assert "/nodes/localhost" in msg and "/nodes/pve01" in msg
+
+
+# --- duplicate API URLs ------------------------------------------------------
+def test_duplicate_api_urls_ignores_spelling_and_disabled_entries():
+    cfg = AppConfig(hosts=[
+        PveHostConfig(name="pve01", api_url="https://10.0.0.10:8006"),
+        PveHostConfig(name="pve02", api_url="HTTPS://10.0.0.10:8006/"),
+        PveHostConfig(name="pve03", api_url="https://10.0.0.30:8006"),
+        PveHostConfig(name="pve04", api_url="https://10.0.0.30:8006", enabled=False),
+    ])
+    assert cfg.duplicate_api_urls() == ["https://10.0.0.10:8006"]
+    assert cfg.api_url_is_unique(cfg.hosts[0]) is False
+    # A disabled twin does not make the enabled entry ambiguous.
+    assert cfg.api_url_is_unique(cfg.hosts[2]) is True
+
+
+# --- node name: how the engine weighs it ------------------------------------
+def _node_verdict_engine(monkeypatch, node_state, urls=("https://10.0.0.10:8006",)):
+    """Engine whose credential test is fine and whose node verdict is `node_state`."""
+    from app import engine as engine_mod
+    from app.proxmox import TestResult
+
+    monkeypatch.setattr(engine_mod, "_local_now", lambda: datetime(2026, 7, 25, 10, 0))
+    hosts = [PveHostConfig(name=f"pve0{i}", api_url=u) for i, u in enumerate(urls, 1)]
+    eng = Engine(AppConfig(hosts=hosts))
+
+    async def fake_test(host, *a, **k):
+        return TestResult(True, "ok", has_power_mgmt=True, node_state=node_state)
+
+    monkeypatch.setattr(engine_mod.targets, "test_connection", fake_test)
+    monkeypatch.setattr(eng, "_log_quiet", lambda s, b, sev: None)
+    return eng
+
+
+@pytest.mark.asyncio
+async def test_a_wrong_node_name_is_only_a_label_when_the_url_is_the_entrys_own(monkeypatch):
+    """With one API URL per entry the shutdown addresses the node directly, so a wrong
+    name misleads every event but cannot stop the machine from coming down."""
+    eng = _node_verdict_engine(monkeypatch, "wrong")
+    events = _notify_recorder(eng)
+
+    await eng._run_selftest()
+
+    assert eng.host_states[eng.cfg.hosts[0].key]["node_state"] == "wrong"
+    assert eng.last_selftest_ok is True  # not a broken target
+    assert not [s for s, _, _ in events if "FAILED" in s]
+
+
+@pytest.mark.asyncio
+async def test_a_wrong_node_name_fails_the_host_when_entries_share_one_url(monkeypatch):
+    """There PVE's proxying is the only thing telling the entries apart: the name IS the
+    path, and the shutdown will not land."""
+    eng = _node_verdict_engine(
+        monkeypatch, "wrong",
+        urls=("https://10.0.0.10:8006", "https://10.0.0.10:8006"),
+    )
+    events = _notify_recorder(eng)
+
+    await eng._run_selftest()
+
+    assert eng.last_selftest_ok is False
+    assert [s for s, _, _ in events if "FAILED" in s]
+    assert [s for s, _, _ in events if "share one API URL" in s]
+
+
+@pytest.mark.asyncio
+async def test_an_unverified_node_name_is_never_held_against_a_host(monkeypatch):
+    eng = _node_verdict_engine(monkeypatch, "unverified")
+    events = _notify_recorder(eng)
+
+    await eng._run_selftest()
+
+    assert eng.last_selftest_ok is True
+    assert not [s for s, _, _ in events if "FAILED" in s]
+
+
+def _startup_engine(monkeypatch, state, detail="nope", **cfg_kw):
+    from app import engine as engine_mod
+    from app.proxmox import NodeVerdict
+
+    eng = Engine(AppConfig(
+        hosts=[PveHostConfig(name="pve01", api_url="https://10.0.0.10:8006")], **cfg_kw))
+
+    async def fake_verify(host, *a, **k):
+        return NodeVerdict(state=state, detail=detail)
+
+    monkeypatch.setattr(engine_mod.targets, "verify_node", fake_verify)
+    return eng
+
+
+@pytest.mark.asyncio
+async def test_node_names_are_checked_at_startup_not_at_the_next_slot(monkeypatch):
+    """last_selftest_slot is persisted and survives a restart, so after an update the next
+    scheduled run may be a day away. A node name that points at nothing must not wait."""
+    eng = _startup_engine(monkeypatch, "wrong")
+    eng.last_selftest_slot = datetime(2099, 1, 1)  # nothing is due for a long time
+    events = _notify_recorder(eng)
+
+    await eng._maybe_node_startup_check()
+
+    assert eng.host_states[eng.cfg.hosts[0].key]["node_state"] == "wrong"
+    assert [s for s, _, _ in events if "node name does not match" in s]
+    # Runs once per process start, not on every poll iteration.
+    events.clear()
+    await eng._maybe_node_startup_check()
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_the_startup_check_yields_to_an_outage_without_latching(monkeypatch):
+    eng = _startup_engine(monkeypatch, "wrong")
+    eng.shutdown_triggered = True
+    events = _notify_recorder(eng)
+
+    await eng._maybe_node_startup_check()
+    assert events == [] and eng._node_startup_done is False
+
+    # Once mains are back, the next iteration still catches it.
+    eng.shutdown_triggered = False
+    await eng._maybe_node_startup_check()
+    assert [s for s, _, _ in events if "node name does not match" in s]
+
+
+@pytest.mark.asyncio
+async def test_saving_the_config_re_arms_the_node_check_but_not_the_selftest(monkeypatch):
+    """One GET /nodes is cheap enough to repeat on save; the credential test (up to 10 s
+    per host) deliberately is not."""
+    eng = _startup_engine(monkeypatch, "ok")
+    await eng._maybe_node_startup_check()
+    assert eng._node_startup_done is True
+
+    slot = eng.last_selftest_slot = datetime(2026, 7, 25, 10, 0)
+    eng.update_config(eng.cfg)
+
+    assert eng._node_startup_done is False
+    assert eng.last_selftest_slot == slot
+
+
+@pytest.mark.asyncio
+async def test_the_startup_check_is_quiet_about_a_name_it_could_not_read(monkeypatch):
+    eng = _startup_engine(monkeypatch, "unverified")
+    events = _notify_recorder(eng)
+
+    await eng._maybe_node_startup_check()
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_node_check_is_quiet_when_the_name_matches():
+    from app import proxmox
+
+    data, message = await _node_check(
+        "pve01", proxmox.NodeList(readable=True, nodes=["pve01", "pve02"]))
+    assert data["match"] is True and message == ""
+
+
+@pytest.mark.asyncio
+async def test_health_check_never_touches_the_engine_state(monkeypatch):
+    """Cluster problems are about the NEXT outage; they must not make a running
+    appliance look triggered or degraded."""
+    from app.engine import ONLINE
+
+    eng = _cluster_engine(monkeypatch, flags={"noout": True}, armed_state="disarmed")
+    eng._emit = _notify_recorder(eng) and eng._emit  # keep real _emit out of the db
+    events = _notify_recorder(eng)
+    await eng._check_clusters()
+
+    assert eng.state == ONLINE
+    assert eng.shutdown_triggered is False
+    assert eng.alarm_active is False
+    assert events  # ... it did warn, it just changed nothing
+
+
+# --- cluster preparation (writing) -----------------------------------------
+class _CephServer:
+    """A cluster whose Ceph flags actually change, so verification can be exercised.
+
+    ``bulk_supported=False`` models a release that only has the per-flag endpoint;
+    ``async_delay`` models the bulk PUT being a worker task whose effect shows up late.
+    """
+
+    def __init__(self, *, bulk_supported=True, async_delay=0, armed="armed",
+                 disarm_works=True, has_disarm=True, has_ceph=True, guests=None,
+                 guest_ignores_shutdown=(), guest_stop_fails=(), shutdown_delay=0,
+                 vm_audit=True, vm_power=True, ds_audit=True, mons=("pve01", "pve02"),
+                 self_on_ceph=False, ha_services=1, nodes=("pve01", "pve02")):
+        self.flags = {f: False for f in
+                      ("noout", "nobackfill", "norecover", "norebalance")}
+        self.bulk_supported = bulk_supported
+        self.async_delay = async_delay
+        self._pending = None
+        self.armed = armed
+        self.disarm_works = disarm_works
+        self.has_disarm = has_disarm
+        self.has_ceph = has_ceph
+        # Guests are stateful, like the flags: "stopped" is only ever concluded from a
+        # re-read, so the fake has to actually change.
+        self.guests = {
+            g["vmid"]: dict(g)
+            for g in (list(_DEFAULT_GUESTS) if guests is None else guests)
+        }
+        self.guest_ignores_shutdown = set(guest_ignores_shutdown)
+        self.guest_stop_fails = set(guest_stop_fails)
+        self.shutdown_delay = shutdown_delay
+        self._pending_stop: dict[int, int] = {}
+        self.vm_audit = vm_audit
+        self.vm_power = vm_power
+        self.ds_audit = ds_audit
+        self.mons = list(mons)
+        self.nodes = list(nodes)
+        self.self_on_ceph = self_on_ceph
+        self.ha_services = ha_services
+        self.inflight = 0
+        self.max_inflight = 0
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, *a, **kw):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, url, **kw):
+        self.calls.append(("GET", url))
+        # Enough of a cluster for _inspect_clusters() to recognise one; the flag/HA
+        # endpoints below are the parts these tests actually exercise.
+        if url == "/access/permissions":
+            root = {"Sys.PowerMgmt": 1, "Sys.Audit": 1, "Sys.Modify": 1, "Sys.Console": 1}
+            if self.vm_audit:
+                root["VM.Audit"] = 1
+            if self.vm_power:
+                root["VM.PowerMgmt"] = 1
+            if self.ds_audit:
+                root["Datastore.Audit"] = 1
+            return _FakeJson(200, {"data": {"/": root}})
+        if url == "/cluster/resources?type=vm":
+            # Filtered, not refused (see _cluster_routes).
+            if not self.vm_audit:
+                return _FakeJson(200, {"data": []})
+            for vmid, left in list(self._pending_stop.items()):
+                if left <= 0:
+                    self.guests[vmid]["status"] = "stopped"
+                    self._pending_stop.pop(vmid)
+                else:
+                    self._pending_stop[vmid] = left - 1
+            return _FakeJson(200, {"data": list(self.guests.values())})
+        if url == "/cluster/resources?type=storage":
+            if not self.ds_audit:
+                return _FakeJson(200, {"data": []})
+            return _FakeJson(200, {"data": [
+                {"storage": "local-lvm", "plugintype": "lvmthin"},
+                {"storage": "cephpool", "plugintype": "rbd"},
+            ]})
+        if url.endswith("/config") and url.startswith("/nodes/"):
+            store = "cephpool" if self.self_on_ceph else "local-lvm"
+            return _FakeJson(200, {"data": {"rootfs": f"{store}:vm-disk-0,size=4G"}})
+        if url == "/cluster/status":
+            return _FakeJson(200, {"data": [
+                {"type": "cluster", "name": "prod", "quorate": 1,
+                 "nodes": len(self.nodes)},
+            ] + [{"type": "node", "name": n, "online": 1} for n in self.nodes]})
+        if url == "/cluster/options":
+            return _FakeJson(200, {"data": {"ha": {"shutdown_policy": "freeze"}}})
+        if url.startswith("/cluster/ceph/") and not self.has_ceph:
+            # pveceph never initialised: the endpoint dies on the missing config (500),
+            # which is what distinguishes "no Ceph" from "not permitted" (403).
+            return _FakeJson(500, {})
+        if url == "/cluster/ceph/flags":
+            if self._pending is not None:
+                if self.async_delay > 0:
+                    self.async_delay -= 1          # still "in flight"
+                else:
+                    self.flags.update(self._pending)
+                    self._pending = None
+            return _FakeJson(200, {"data": [{"name": k, "value": v}
+                                            for k, v in self.flags.items()]})
+        if url == "/cluster/ceph/status":
+            return _FakeJson(200, {"data": {
+                "health": {"status": "HEALTH_OK"},
+                "monmap": {"mons": [{"name": m} for m in self.mons]},
+            }})
+        if url == "/cluster/ha/status/current":
+            data = [{"type": "fencing", "armed-state": self.armed}]
+            data += [{"type": "service", "sid": f"vm:{100 + i}"}
+                     for i in range(int(self.ha_services))]
+            return _FakeJson(200, {"data": data})
+        if url == "/cluster/ha/status":
+            index = [{"name": "current"}]
+            if self.has_disarm:
+                index += [{"name": "disarm-ha"}, {"name": "arm-ha"}]
+            return _FakeJson(200, {"data": index})
+        return _FakeJson(404, {})
+
+    async def put(self, url, **kw):
+        self.calls.append(("PUT", url))
+        data = kw.get("data", {})
+        if url.startswith("/cluster/ceph/") and not self.has_ceph:
+            return _FakeJson(500, {})
+        if url == "/cluster/ceph/flags":
+            if not self.bulk_supported:
+                return _FakeJson(501, {})
+            self._pending = {k: bool(int(v)) for k, v in data.items()}
+            return _FakeJson(200, {"data": "UPID:pve01:..."})   # worker task, async
+        if url.startswith("/cluster/ceph/flags/"):
+            self.flags[url.rsplit("/", 1)[1]] = bool(int(data.get("value", 0)))
+            return _FakeJson(200, {"data": None})
+        return _FakeJson(404, {})
+
+    async def post(self, url, **kw):
+        self.calls.append(("POST", url))
+        if "/status/shutdown" in url or "/status/stop" in url:
+            return await self._guest_power(url)
+        if url == "/cluster/ha/status/disarm-ha":
+            if not self.disarm_works:
+                return _FakeJson(500, {})
+            assert kw.get("data", {}).get("resource-mode") == "ignore"
+            self.armed = "disarmed"
+            return _FakeJson(200, {"data": None})
+        if url == "/cluster/ha/status/arm-ha":
+            self.armed = "armed"
+            return _FakeJson(200, {"data": None})
+        return _FakeJson(404, {})
+
+    async def _guest_power(self, url):
+        """Guest shutdown/stop, with the concurrency actually observed."""
+        import asyncio
+
+        if not self.vm_power:
+            return _FakeJson(403, {})
+        self.inflight += 1
+        self.max_inflight = max(self.max_inflight, self.inflight)
+        try:
+            await asyncio.sleep(0)
+            vmid = int(url.split("/status/")[0].rsplit("/", 1)[1])
+            hard = url.endswith("/status/stop")
+            if vmid not in self.guests:
+                return _FakeJson(404, {})
+            if hard:
+                if vmid in self.guest_stop_fails:
+                    return _FakeJson(500, {})
+                self.guests[vmid]["status"] = "stopped"
+            elif vmid not in self.guest_ignores_shutdown:
+                self._pending_stop[vmid] = self.shutdown_delay
+            return _FakeJson(200, {"data": "UPID:pve01:..."})
+        finally:
+            self.inflight -= 1
+
+
+@pytest.mark.asyncio
+async def test_prepare_sets_ceph_flags_and_disarms_ha_with_ignore(monkeypatch):
+    from app import cluster
+
+    srv = _CephServer()
+    monkeypatch.setattr(cluster.httpx, "AsyncClient", srv)
+
+    result = await cluster.prepare(_pve(), want_ceph=True, want_disarm=True, timeout=30)
+
+    assert result.ok, result.message
+    assert all(srv.flags.values())
+    assert srv.armed == "disarmed"
+    # resource-mode "ignore" is asserted inside the fake: under "freeze" the guests stay
+    # HA-managed, pve-guests skips them and the disarmed LRM no longer stops them.
+    assert ("POST", "/cluster/ha/status/disarm-ha") in srv.calls
+
+
+@pytest.mark.asyncio
+async def test_prepare_verifies_the_async_bulk_put_by_reading_back(monkeypatch):
+    """PUT /cluster/ceph/flags only returns a worker UPID — success must come from a GET."""
+    from app import cluster
+
+    srv = _CephServer(async_delay=2)
+    monkeypatch.setattr(cluster.httpx, "AsyncClient", srv)
+    monkeypatch.setattr(cluster, "_VERIFY_INTERVAL_S", 0.01)
+
+    result = await cluster.prepare(_pve(), want_ceph=True, want_disarm=False, timeout=30)
+
+    assert result.ok and all(srv.flags.values())
+    assert len([c for c in srv.calls if c == ("GET", "/cluster/ceph/flags")]) > 1
+
+
+@pytest.mark.asyncio
+async def test_prepare_falls_back_to_single_flags_when_the_bulk_put_is_absent(monkeypatch):
+    """On releases without the bulk endpoint the per-flag path is simply the normal one."""
+    from app import cluster
+
+    srv = _CephServer(bulk_supported=False)
+    monkeypatch.setattr(cluster.httpx, "AsyncClient", srv)
+    monkeypatch.setattr(cluster, "_VERIFY_INTERVAL_S", 0.01)
+
+    result = await cluster.prepare(_pve(), want_ceph=True, want_disarm=False, timeout=30)
+
+    assert result.ok and all(srv.flags.values())
+    assert ("PUT", "/cluster/ceph/flags/noout") in srv.calls
+
+
+@pytest.mark.asyncio
+async def test_prepare_reports_a_refused_disarm_instead_of_claiming_success(monkeypatch):
+    from app import cluster
+
+    srv = _CephServer(disarm_works=False)
+    monkeypatch.setattr(cluster.httpx, "AsyncClient", srv)
+    monkeypatch.setattr(cluster, "_VERIFY_INTERVAL_S", 0.01)
+
+    result = await cluster.prepare(_pve(), want_ceph=False, want_disarm=True, timeout=30)
+
+    assert result.ok is False
+    assert "disarm" in result.message.lower()
+    assert srv.armed == "armed"  # unchanged, so the LRM still stops the guests itself
+
+
+class _SlowDisarmServer(_CephServer):
+    """A stack that passes through 'disarming' first, the way a real one does.
+
+    Every LRM has to release its watchdog, in rounds of ten seconds — which is why the
+    verification cannot live on a fixed few seconds.
+    """
+
+    def __init__(self, *, rounds, **kw):
+        super().__init__(**kw)
+        self._rounds = rounds
+
+    async def get(self, url, **kw):
+        if url == "/cluster/ha/status/current" and self.armed == "disarming":
+            if self._rounds > 0:
+                self._rounds -= 1
+            else:
+                self.armed = "disarmed"
+        return await super().get(url, **kw)
+
+    async def post(self, url, **kw):
+        if url == "/cluster/ha/status/disarm-ha":
+            self.calls.append(("POST", url))
+            self.armed = "disarming"
+            return _FakeJson(200, {"data": None})
+        return await super().post(url, **kw)
+
+
+@pytest.mark.asyncio
+async def test_the_disarm_waits_out_the_configured_budget(monkeypatch):
+    """The regression this guards: the wait was a module constant (15 s), so raising the
+    configured timeout changed nothing — the shutdown ran on regardless while the stack
+    was still disarming, which is the one state in which nobody stops the guests."""
+    import asyncio
+
+    from app import cluster
+
+    monkeypatch.setattr(cluster, "_VERIFY_INTERVAL_S", 0.01)
+
+    async def run(timeout):
+        srv = _SlowDisarmServer(rounds=10 ** 6)   # never gets there
+        monkeypatch.setattr(cluster.httpx, "AsyncClient", srv)
+        started = asyncio.get_running_loop().time()
+        result = await cluster.prepare(
+            _pve(), want_ceph=False, want_disarm=True, timeout=timeout)
+        return result, asyncio.get_running_loop().time() - started
+
+    short, waited_short = await run(2)
+    long, waited_long = await run(5)
+
+    assert short.ok is False and long.ok is False
+    # Named, not just "not in time": still disarming means "give it more budget", while
+    # a stack that never moved is a different problem entirely.
+    assert "stopped at 'disarming'" in short.message
+    # Each run spends its own budget, so the longer one waits measurably longer.
+    assert waited_short >= 0.5 and waited_short < 3
+    assert waited_long > waited_short + 1.5
+
+
+@pytest.mark.asyncio
+async def test_a_slow_disarm_is_confirmed_once_it_arrives(monkeypatch):
+    from app import cluster
+
+    srv = _SlowDisarmServer(rounds=25)
+    monkeypatch.setattr(cluster.httpx, "AsyncClient", srv)
+    monkeypatch.setattr(cluster, "_VERIFY_INTERVAL_S", 0.01)
+
+    result = await cluster.prepare(
+        _pve(), want_ceph=False, want_disarm=True, timeout=10)
+
+    assert result.ok and srv.armed == "disarmed"
+    assert "HA disarmed" in result.message
+
+
+@pytest.mark.asyncio
+async def test_an_already_disarmed_stack_is_not_disarmed_again(monkeypatch):
+    """A cluster stays prepared until someone restores it, so a second outage arrives at
+    a disarmed stack. Reading before writing keeps that out of the write path."""
+    from app import cluster
+
+    srv = _CephServer(armed="disarmed")
+    monkeypatch.setattr(cluster.httpx, "AsyncClient", srv)
+
+    result = await cluster.prepare(
+        _pve(), want_ceph=False, want_disarm=True, timeout=5)
+
+    assert result.ok and "already disarmed" in result.message
+    assert ("POST", "/cluster/ha/status/disarm-ha") not in srv.calls
+
+
+@pytest.mark.asyncio
+async def test_prepare_never_exceeds_its_budget(monkeypatch):
+    """It runs inside the poll loop while the battery drains — the ceiling is hard."""
+    import asyncio
+
+    from app import cluster
+
+    class _Hanging(_CephServer):
+        async def get(self, url, **kw):
+            await asyncio.sleep(30)
+
+    monkeypatch.setattr(cluster.httpx, "AsyncClient", _Hanging())
+    result = await cluster.prepare(_pve(), want_ceph=True, want_disarm=True, timeout=0.05)
+
+    assert result.ok is False and "gave up" in result.message
+
+
+@pytest.mark.asyncio
+async def test_restore_arms_ha_and_clears_the_flags(monkeypatch):
+    from app import cluster
+
+    srv = _CephServer(armed="disarmed")
+    srv.flags.update({f: True for f in srv.flags})
+    monkeypatch.setattr(cluster.httpx, "AsyncClient", srv)
+    monkeypatch.setattr(cluster, "_VERIFY_INTERVAL_S", 0.01)
+
+    result = await cluster.restore(_pve())
+
+    assert result.ok, result.message
+    assert srv.armed == "armed"
+    assert not any(srv.flags.values())
+
+
+@pytest.mark.asyncio
+async def test_restore_does_nothing_on_a_healthy_cluster(monkeypatch):
+    from app import cluster
+
+    srv = _CephServer()  # armed, flags clear
+    monkeypatch.setattr(cluster.httpx, "AsyncClient", srv)
+
+    result = await cluster.restore(_pve())
+
+    assert result.ok and "nothing to restore" in result.message
+    assert not [c for c in srv.calls if c[0] in ("PUT", "POST")]
+
+
+def _outage_cluster_engine(monkeypatch, srv, *, dry_run=False, abort=False, nodes=2,
+                           self_vmid=950):
+    """Engine with a triggered UPS feeding N cluster nodes, talking to ``srv``."""
+    from app import cluster
+    from app.engine import Engine
+    from app.config import ApplianceConfig, Thresholds
+
+    monkeypatch.setattr(cluster.httpx, "AsyncClient", srv)
+    monkeypatch.setattr(cluster, "_VERIFY_INTERVAL_S", 0.01)
+    monkeypatch.setattr(cluster, "_GUEST_POLL_INTERVAL_S", 0.01)
+    # cluster_ceph is pinned rather than defaulted: it ships OFF (Ceph is the exception,
+    # not the rule), and these tests are about the Ceph path. It is also the ONLY switch
+    # for the cluster-wide guest stop -- that step has none of its own.
+    hosts = [PveHostConfig(name=f"pve0{i}", api_url="https://pve:8006",
+                           token_id="ups@pve!x", token_secret="s",
+                           cluster=True, cluster_ceph=True, ups_ids=["u"], order=i)
+             for i in range(1, nodes + 1)]
+    cfg = AppConfig(
+        dry_run=dry_run,
+        ups=[SnmpConfig(id="u", host="10.0.0.9")],
+        hosts=hosts,
+        # The appliance's own container, picked the way the UI picks it. Without this the
+        # guest stop refuses outright, which is its own (separately tested) behaviour.
+        appliance=ApplianceConfig(self_vmid=self_vmid, self_node="pve01"),
+        thresholds=Thresholds(on_battery_low=True, on_battery_seconds=None,
+                              runtime_below_minutes=None, charge_below_percent=None,
+                              cluster_prep_timeout_s=5,
+                              cluster_guest_shutdown_timeout_s=5,
+                              cluster_abort_on_prep_failure=abort),
+    )
+    eng = Engine(cfg)
+    # Pretend the self-test already discovered the cluster.
+    for h in hosts:
+        eng.host_states[h.key] = {"cluster_name": "prod"}
+    eng.ups_rt["u"].state = UpsState(reachable=True, power_source="battery",
+                                     battery_status="low")
+    return eng
+
+
+def _noop_fire(eng):
+    """Latch the host the way _fire_host would, without shutting anything down."""
+
+    async def fake_fire(host, reason):
+        eng.host_fired[host.key] = True
+        eng.shutdown_triggered = True
+
+    return fake_fire
+
+
+@pytest.mark.asyncio
+async def test_cluster_is_prepared_once_before_any_node_goes_down(monkeypatch):
+    srv = _CephServer()
+    eng = _outage_cluster_engine(monkeypatch, srv, nodes=3)
+    fired: list[str] = []
+
+    async def fake_fire(host, reason):
+        fired.append(host.name)
+        eng.host_fired[host.key] = True
+
+    eng._fire_host = fake_fire  # type: ignore[assignment]
+    await eng._evaluate()
+
+    assert fired == ["pve01", "pve02", "pve03"]
+    # Exactly one preparation for the whole cluster, not one per node.
+    assert len([c for c in srv.calls if c == ("POST", "/cluster/ha/status/disarm-ha")]) == 1
+    assert all(srv.flags.values()) and srv.armed == "disarmed"
+
+    # A second poll must not prepare again.
+    before = len(srv.calls)
+    await eng._evaluate()
+    assert [c for c in srv.calls[before:] if c[0] in ("PUT", "POST")] == []
+
+
+@pytest.mark.asyncio
+async def test_the_preparation_says_that_it_started(monkeypatch):
+    """It is the one step that deliberately delays the shutdown. Without a line before
+    the work, the event log jumped from "power outage" straight to a result a minute
+    later, and nothing said the nodes were waiting on purpose."""
+    srv = _CephServer()
+    eng = _outage_cluster_engine(monkeypatch, srv)
+    events = _notify_recorder(eng)
+    eng._fire_host = _noop_fire(eng)  # type: ignore[assignment]
+
+    await eng._evaluate()
+
+    subjects = [s for s, _, _ in events]
+    assert "Cluster prod: preparing for shutdown" in subjects
+    assert subjects.index("Cluster prod: preparing for shutdown") < subjects.index(
+        "Cluster prod: preparation done")
+    body = next(b for s, _, b in events if s.endswith("preparing for shutdown"))
+    # Both budgets, added up: the preparation now holds the nodes for the HA disarm AND
+    # the cluster-wide guest stop, and quoting only the first would understate the wait
+    # by exactly the step that takes the longest.
+    assert "wait up to 10s" in body
+    # Says WHICH guests, and which one it will not touch.
+    assert "guest shutdown: yes (2 guests, sparing CT 950 'pve-usv' on pve01)" in body
+
+    # Once per cluster and episode, like the preparation itself.
+    before = len(events)
+    await eng._evaluate()
+    assert not [s for s, _, _ in events[before:] if "preparing" in s]
+
+
+@pytest.mark.asyncio
+async def test_dry_run_logs_the_preparation_but_changes_nothing(monkeypatch):
+    srv = _CephServer()
+    eng = _outage_cluster_engine(monkeypatch, srv, dry_run=True)
+    events = _notify_recorder(eng)
+
+    await eng._evaluate()
+
+    assert any("would be prepared" in s for s, _, _ in events)
+    assert not any(srv.flags.values())
+    assert srv.armed == "armed"
+    assert not [c for c in srv.calls if c[0] in ("PUT", "POST")]
+
+
+@pytest.mark.asyncio
+async def test_failed_preparation_still_shuts_the_nodes_down_by_default(monkeypatch):
+    """The default is deliberate: a failed disarm leaves the LRM armed, and an armed LRM
+    still stops the guests. Aborting would mean losing power uncontrolled instead."""
+    srv = _CephServer(disarm_works=False)
+    eng = _outage_cluster_engine(monkeypatch, srv, abort=False)
+    events = _notify_recorder(eng)
+    fired: list[str] = []
+
+    async def fake_fire(host, reason):
+        fired.append(host.name)
+        eng.host_fired[host.key] = True
+
+    eng._fire_host = fake_fire  # type: ignore[assignment]
+    await eng._evaluate()
+
+    assert fired == ["pve01", "pve02"], "the shutdown must go ahead"
+    failed = [(s, sev) for s, sev, _ in events if "preparation FAILED" in s]
+    assert failed and failed[0][1] == "critical"
+
+
+@pytest.mark.asyncio
+async def test_abort_on_prep_failure_holds_the_cluster_back(monkeypatch):
+    srv = _CephServer(disarm_works=False)
+    eng = _outage_cluster_engine(monkeypatch, srv, abort=True)
+    events = _notify_recorder(eng)
+    fired: list[str] = []
+
+    async def fake_fire(host, reason):
+        fired.append(host.name)
+
+    eng._fire_host = fake_fire  # type: ignore[assignment]
+    await eng._evaluate()
+
+    assert fired == [], "opting in to abort must stop every node of that cluster"
+    assert any("shutdown aborted" in s for s, _, _ in events)
+
+
+@pytest.mark.asyncio
+async def test_a_held_back_cluster_is_not_prepared_again_every_poll(monkeypatch):
+    """The abort must cost one preparation and one pair of events, not one per poll.
+
+    A blocked cluster fires no host, so nothing is latched — which used to read as
+    "the episode is over" at the end of _evaluate_hosts() and cleared the preparation
+    latch. The whole failing sequence then ran again on the very next iteration: in an
+    outage that is every 8 s, each round writing to the cluster again and sending two
+    CRITICAL notifications.
+    """
+    srv = _CephServer(disarm_works=False)
+    eng = _outage_cluster_engine(monkeypatch, srv, abort=True)
+    events = _notify_recorder(eng)
+    fired: list[str] = []
+
+    async def fake_fire(host, reason):
+        fired.append(host.name)
+
+    eng._fire_host = fake_fire  # type: ignore[assignment]
+    for _ in range(3):
+        await eng._evaluate()
+
+    assert fired == [], "the abort has to hold on every poll, not only the first"
+    assert len([c for c in srv.calls if c == ("POST", "/cluster/ha/status/disarm-ha")]) == 1
+    assert len([s for s, _, _ in events if "preparation FAILED" in s]) == 1
+    assert len([s for s, _, _ in events if "shutdown aborted" in s]) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_abort_survives_the_poll_that_no_longer_prepares(monkeypatch):
+    """Whether the nodes may go down comes from the latched OUTCOME, not from this round.
+
+    Deriving it from the work of a single iteration meant the filter was empty as soon as
+    the preparation was latched as done — so the second poll shut the cluster down anyway,
+    silently undoing the opt-in.
+    """
+    srv = _CephServer(disarm_works=False)
+    eng = _outage_cluster_engine(monkeypatch, srv, abort=True)
+    _notify_recorder(eng)
+    fired: list[str] = []
+
+    async def fake_fire(host, reason):
+        fired.append(host.name)
+
+    eng._fire_host = fake_fire  # type: ignore[assignment]
+    await eng._evaluate()
+    assert eng.cluster_prepared.get("prod") is True
+    assert eng.cluster_prep_failed.get("prod") is True
+
+    await eng._evaluate()
+    assert fired == []
+
+
+@pytest.mark.asyncio
+async def test_mains_return_clears_the_failed_preparation_too(monkeypatch):
+    """Both latches belong to the episode: the next outage prepares, and may proceed."""
+    srv = _CephServer(disarm_works=False)
+    eng = _outage_cluster_engine(monkeypatch, srv, abort=True)
+    _notify_recorder(eng)
+
+    async def fake_fire(host, reason):
+        eng.host_fired[host.key] = True
+
+    eng._fire_host = fake_fire  # type: ignore[assignment]
+    await eng._evaluate()
+    assert eng.cluster_prep_failed.get("prod") is True
+
+    eng.ups_rt["u"].state = UpsState(reachable=True, power_source="mains",
+                                     battery_status="normal")
+    await eng._evaluate()
+    assert eng.cluster_prepared == {} and eng.cluster_prep_failed == {}
+
+    eng.reset()
+    assert eng.cluster_prep_failed == {}
+
+
+@pytest.mark.asyncio
+async def test_a_cluster_without_ceph_is_not_asked_to_set_ceph_flags(monkeypatch):
+    """The step is skipped, not attempted and failed.
+
+    Attempting it produced a CRITICAL "preparation FAILED" on every single outage for a
+    component that is simply not installed — and, with abort-on-failure, held every node
+    of the cluster back over it.
+    """
+    srv = _CephServer(has_ceph=False)
+    eng = _outage_cluster_engine(monkeypatch, srv, abort=True)
+    events = _notify_recorder(eng)
+    fired: list[str] = []
+
+    async def fake_fire(host, reason):
+        fired.append(host.name)
+        eng.host_fired[host.key] = True
+
+    eng._fire_host = fake_fire  # type: ignore[assignment]
+    await eng._evaluate()
+
+    assert not [c for c in srv.calls if c[0] == "PUT"], "no writes at a cluster without Ceph"
+    assert srv.armed == "disarmed", "the HA disarm is unaffected and still runs"
+    assert fired == ["pve01", "pve02"], "abort-on-failure must not trigger on this"
+    assert not [s for s, sev, _ in events if sev == "critical"]
+
+
+@pytest.mark.asyncio
+async def test_nothing_to_prepare_is_logged_quietly_not_as_a_failure(monkeypatch):
+    """Both features on, neither available: that is a note, not a failed shutdown."""
+    srv = _CephServer(has_ceph=False, has_disarm=False)
+    eng = _outage_cluster_engine(monkeypatch, srv)
+    events = _notify_recorder(eng)
+    logged: list[tuple[str, str]] = []
+    eng._log_quiet = lambda s, b, sev: logged.append((s, b))  # type: ignore[assignment]
+
+    async def fake_fire(host, reason):
+        eng.host_fired[host.key] = True
+
+    eng._fire_host = fake_fire  # type: ignore[assignment]
+    await eng._evaluate()
+
+    assert any("nothing to prepare" in s for s, _ in logged)
+    # The body says WHY each step was dropped, so the tick can be corrected.
+    body = " ".join(b for _, b in logged)
+    assert "no Ceph" in body and "PVE 9.2" in body
+    assert not [c for c in srv.calls if c[0] in ("PUT", "POST")]
+    assert not [s for s, _, _ in events if "preparation" in s]
+
+
+@pytest.mark.asyncio
+async def test_cold_start_uses_the_inspection_it_just_made(monkeypatch):
+    """Without a self-test yet, the feature detection must come from the fresh read.
+
+    Re-fetching from cluster_states (empty at this point) and defaulting to "supported"
+    meant a blind disarm-ha POST on PVE 8.x — a CRITICAL mid-outage, and with
+    abort-on-failure a cluster that stayed up over a missing endpoint.
+    """
+    srv = _CephServer(has_disarm=False)
+    eng = _outage_cluster_engine(monkeypatch, srv, abort=True)
+    eng.host_states = {}          # no self-test has run
+    eng.cluster_states = {}
+    events = _notify_recorder(eng)
+    fired: list[str] = []
+
+    async def fake_fire(host, reason):
+        fired.append(host.name)
+        eng.host_fired[host.key] = True
+
+    eng._fire_host = fake_fire  # type: ignore[assignment]
+    await eng._evaluate()
+
+    assert ("POST", "/cluster/ha/status/disarm-ha") not in srv.calls
+    assert all(srv.flags.values()), "the Ceph flags are not a 9.2 feature"
+    assert fired == ["pve01", "pve02"]
+    # Exactly one CRITICAL, and it is the honest one: HA manages guests here and cannot
+    # be disarmed, so stopping them would only feed the HA manager. Saying so beats
+    # doing it, and the nodes still go down the way they did before 4.0.
+    assert [s for s, sev, _ in events if sev == "critical"] == [
+        "Cluster prod: guest shutdown skipped"
+    ]
+    assert not any("/status/shutdown" in url for _m, url in srv.calls)
+    # The reading is kept, so the next cluster of this episode does not re-probe.
+    assert "prod" in eng.cluster_states
+
+
+@pytest.mark.asyncio
+async def test_disarm_is_skipped_where_the_endpoint_does_not_exist(monkeypatch):
+    """No blind POST that comes back 501 in the middle of an outage — but the Ceph flags
+    are not a 9.2 feature and must still be set."""
+    from app import cluster
+
+    srv = _CephServer(has_disarm=False)
+    eng = _outage_cluster_engine(monkeypatch, srv)
+    # ha_index_read: we DID read the index and it had no disarm-ha — that is what makes
+    # the absence settled rather than merely unknown.
+    eng.cluster_states = {"prod": cluster.ClusterInfo(
+        reachable=True, is_cluster=True, name="prod", ceph_configured=True,
+        ha_index_read=True, disarm_supported=False)}
+
+    async def fake_fire(host, reason):
+        eng.host_fired[host.key] = True
+
+    eng._fire_host = fake_fire  # type: ignore[assignment]
+    await eng._evaluate()
+
+    assert ("POST", "/cluster/ha/status/disarm-ha") not in srv.calls
+    assert all(srv.flags.values()), "Ceph flags still get set on older releases"
+
+
+@pytest.mark.asyncio
+async def test_preparation_latch_is_cleared_when_mains_return(monkeypatch):
+    srv = _CephServer()
+    eng = _outage_cluster_engine(monkeypatch, srv)
+
+    async def fake_fire(host, reason):
+        eng.host_fired[host.key] = True
+
+    eng._fire_host = fake_fire  # type: ignore[assignment]
+    await eng._evaluate()
+    assert eng.cluster_prepared.get("prod") is True
+
+    # Mains back: the latch clears, so the next outage prepares afresh.
+    eng.ups_rt["u"].state = UpsState(reachable=True, power_source="mains",
+                                     battery_status="normal")
+    eng.host_fired = {}
+    await eng._evaluate()
+    assert eng.cluster_prepared == {}
+
+    eng.reset()
+    assert eng.cluster_prepared == {}
+
+
+# --- host connection test: cluster privileges (follow-up to 4.0.0) -----------
+def _fake_host_and_cluster(monkeypatch, **kw):
+    """Patch BOTH clients the host test now uses: proxmox (credentials) and cluster.
+
+    Returns the shared call log, so a test can assert that the cluster endpoints were
+    (or were not) queried at all.
+    """
+    from app import cluster, proxmox
+
+    perms = kw.pop("permissions", {"Sys.PowerMgmt": 1, "Sys.Audit": 1,
+                                   "Sys.Modify": 1, "Sys.Console": 1,
+                                   "VM.Audit": 1, "VM.PowerMgmt": 1,
+                                   "Datastore.Audit": 1})
+    routes = _cluster_routes(permissions=perms, **kw)
+    routes["/version"] = _FakeJson(200, {"data": {"version": "9.2.1"}})
+    calls: list = []
+    client = _FakeApiClient(routes, calls)
+    monkeypatch.setattr(proxmox.httpx, "AsyncClient", client)
+    monkeypatch.setattr(cluster.httpx, "AsyncClient", client)
+    return calls
+
+
+def _host_payload(**kw):
+    return {"name": "pve01", "type": "pve", "api_url": "https://pve:8006",
+            "method": "api_token", "token_id": "ups@pve!x", "token_secret": "s", **kw}
+
+
+@pytest.mark.asyncio
+async def test_host_test_skips_the_cluster_checks_when_not_a_member(_import_target, monkeypatch):
+    """Without the cluster switch, no cluster FEATURE may be queried — otherwise every host
+    test would cost six additional API calls for nothing."""
+    main, _ = _import_target
+    calls = _fake_host_and_cluster(monkeypatch)
+
+    result = await main.api_test_host(_host_payload(cluster=False))
+
+    assert result["ok"] is True and result["cluster"] is None
+    # /cluster/status is the node listing (it marks the node that answered, which is
+    # what tells a wrong name from a proxied one) — the feature endpoints stay untouched.
+    assert not [
+        c for c in calls
+        if c[0] == "GET" and c[1].startswith("/cluster/") and c[1] != "/cluster/status"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_host_test_reports_the_cluster_it_found(_import_target, monkeypatch):
+    main, _ = _import_target
+    _fake_host_and_cluster(monkeypatch)
+
+    result = await main.api_test_host(_host_payload(cluster=True))
+
+    assert result["ok"] is True
+    assert result["cluster"]["missing_privileges"] == []
+    assert result["cluster"]["name"] == "prod" and result["cluster"]["nodes"] == 3
+    # The plan's own acceptance criterion: name, node count, Ceph and HA must be visible.
+    assert "prod" in result["message"] and "3 nodes" in result["message"]
+    assert "Ceph detected" in result["message"]
+    assert "HA armed (1 HA guests)" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_host_test_names_every_missing_cluster_privilege(_import_target, monkeypatch):
+    """"403" tells an operator nothing; the privilege name points at the pveum command."""
+    main, _ = _import_target
+    _fake_host_and_cluster(monkeypatch,
+                           permissions={"Sys.PowerMgmt": 1, "Sys.Audit": 1})
+
+    result = await main.api_test_host(_host_payload(cluster=True, cluster_ceph=True))
+
+    # The Ceph tick also buys the cluster-wide guest stop, so its two privileges are
+    # demanded by the same tick and named in the same list.
+    assert result["cluster"]["missing_privileges"] == [
+        "Sys.Modify (Ceph maintenance flags)", "Sys.Console (HA disarm)",
+        "VM.Audit (list the cluster's guests)",
+        "VM.PowerMgmt (stop the guests before the shutdown)"]
+    assert "Sys.Modify" in result["message"] and "Sys.Console" in result["message"]
+    assert "manual" in result["message"]
+    # The connection itself works, so this stays a warning — same convention as the
+    # unconfirmed Sys.PowerMgmt message from proxmox.test_connection().
+    assert result["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_host_test_does_not_demand_sys_console_for_ceph_only(_import_target, monkeypatch):
+    """Whoever leaves HA disarm off must not be told to hand out shell access."""
+    main, _ = _import_target
+    _fake_host_and_cluster(monkeypatch,
+                           permissions={"Sys.PowerMgmt": 1, "Sys.Audit": 1, "Sys.Modify": 1,
+                                        "VM.Audit": 1, "VM.PowerMgmt": 1})
+
+    result = await main.api_test_host(
+        _host_payload(cluster=True, cluster_ceph=True, cluster_ha_disarm=False))
+
+    assert result["cluster"]["missing_privileges"] == []
+    assert "Sys.Console" not in result["message"]
+    # Datastore.Audit only buys a better diagnosis, so it never appears as "missing".
+    assert result["cluster"]["advisory_privileges"] == [
+        "Datastore.Audit (detect Ceph-backed storage)"]
+
+
+@pytest.mark.asyncio
+async def test_host_test_flags_the_switch_on_a_standalone_node(_import_target, monkeypatch):
+    main, _ = _import_target
+    _fake_host_and_cluster(monkeypatch, is_cluster=False)
+
+    result = await main.api_test_host(_host_payload(cluster=True))
+
+    assert result["cluster"]["is_cluster"] is False
+    assert "not part of a cluster" in result["message"]
+    assert result["ok"] is True  # a misconfiguration, not a broken connection
+
+
+@pytest.mark.asyncio
+async def test_host_test_points_out_a_missing_disarm_endpoint(_import_target, monkeypatch):
+    main, _ = _import_target
+    _fake_host_and_cluster(monkeypatch, has_disarm=False)
+
+    result = await main.api_test_host(_host_payload(cluster=True))
+
+    assert result["cluster"]["disarm_supported"] is False
+    assert "9.2" in result["message"]
+    assert "Ceph flags still work" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_host_test_reports_a_missing_quorum(_import_target, monkeypatch):
+    main, _ = _import_target
+    _fake_host_and_cluster(monkeypatch, quorate=0)
+
+    result = await main.api_test_host(_host_payload(cluster=True))
+
+    assert result["cluster"]["quorate"] is False
+    assert "no quorum" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_host_test_degrades_when_the_cluster_does_not_answer(_import_target, monkeypatch):
+    """An unreachable cluster must produce a readable message, not an exception.
+
+    cluster.inspect() is already proven bounded elsewhere; what matters here is that the
+    endpoint turns its failure result into something the user can act on.
+    """
+    from app import cluster, proxmox
+
+    main, _ = _import_target
+    routes = {"/version": _FakeJson(200, {"data": {"version": "9.2.1"}}),
+              "/access/permissions": _FakeJson(200, {"data": {"/": {"Sys.PowerMgmt": 1}}})}
+    monkeypatch.setattr(proxmox.httpx, "AsyncClient", _FakeApiClient(routes, []))
+
+    async def unreachable(host, timeout=8.0, **kw):
+        return cluster.ClusterInfo(reachable=False, error="No response within 13s — gave up")
+
+    monkeypatch.setattr(cluster, "inspect", unreachable)
+
+    result = await main.api_test_host(_host_payload(cluster=True))
+
+    assert "Cluster check failed" in result["message"]
+    assert "gave up" in result["message"]
+    assert result["cluster"]["reachable"] is False
+    # The credential test itself succeeded, so the host is not reported as broken.
+    assert result["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_host_test_does_not_chase_the_cluster_on_an_unreachable_host(
+    _import_target, monkeypatch
+):
+    """An API that cannot be reached cannot answer the cluster questions either.
+
+    Running the inspection anyway would add its own timeout to an already failed test
+    (~23 s in total against a dead address) and append a second, redundant error.
+    """
+    from app import cluster, proxmox
+
+    main, _ = _import_target
+
+    class _Dead:
+        def __call__(self, *a, **kw):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, **kw):
+            raise OSError("connection refused")
+
+    monkeypatch.setattr(proxmox.httpx, "AsyncClient", _Dead())
+    inspected: list = []
+
+    async def record(host, timeout=8.0):
+        inspected.append(host.name)
+        return cluster.ClusterInfo(reachable=False)
+
+    monkeypatch.setattr(cluster, "inspect", record)
+
+    result = await main.api_test_host(_host_payload(cluster=True))
+
+    assert result["ok"] is False
+    assert inspected == [], "the cluster must not be probed after a failed connection"
+    assert result["cluster"] is None
+    assert "Cluster check failed" not in result["message"]
+
+
+# --- on-demand self-test + visible "checked and fine" ------------------------
+@pytest.mark.asyncio
+async def test_healthy_cluster_says_so_instead_of_staying_silent(monkeypatch):
+    """Warnings alone leave "checked and fine" indistinguishable from "never checked" —
+    which is exactly how a working self-test looked like a broken one."""
+    eng = _cluster_engine(monkeypatch, all_nodes=True, shutdown_policy="freeze")
+    notified = _notify_recorder(eng)
+    quiet: list[tuple[str, str]] = []
+    eng._log_quiet = lambda s, b, sev: quiet.append((s, b))  # type: ignore[assignment]
+
+    await eng._check_clusters(log_ok=True)
+
+    assert notified == [], "a healthy cluster still must not raise a warning"
+    assert [s for s, _ in quiet] == ["Cluster prod: ok"]
+    body = quiet[0][1]
+    assert "3 nodes" in body and "quorum ok" in body and "armed" in body
+
+
+@pytest.mark.asyncio
+async def test_a_cluster_with_findings_gets_no_ok_line(monkeypatch):
+    eng = _cluster_engine(monkeypatch, all_nodes=True, armed_state="disarmed",
+                          shutdown_policy="freeze")
+    _notify_recorder(eng)
+    quiet: list[str] = []
+    eng._log_quiet = lambda s, b, sev: quiet.append(s)  # type: ignore[assignment]
+
+    await eng._check_clusters(log_ok=True)
+
+    assert not [s for s in quiet if s.endswith(": ok")]
+
+
+@pytest.mark.asyncio
+async def test_cluster_checks_do_nothing_without_the_cluster_flag(monkeypatch):
+    """The gate that made the self-test look broken: no flag, no cluster inspection.
+
+    Worth pinning down — it is correct (no unasked API calls), but it means the checks
+    are invisible until the host is actually marked as a cluster member.
+    """
+    from app import cluster
+    from app.engine import Engine
+
+    calls: list = []
+    monkeypatch.setattr(cluster.httpx, "AsyncClient",
+                        _FakeApiClient(_cluster_routes(), calls))
+    eng = Engine(AppConfig(hosts=[PveHostConfig(
+        name="pve01", api_url="https://pve:8006", token_id="ups@pve!x",
+        token_secret="s", cluster=False)]))
+    events = _notify_recorder(eng)
+
+    await eng._check_clusters(log_ok=True)
+
+    assert events == [] and calls == []
+    assert eng.cluster_snapshot() == []
+
+
+@pytest.mark.asyncio
+async def test_manual_selftest_runs_immediately_and_always_logs(monkeypatch):
+    """Saving settings deliberately does not fire a self-test, so the button must."""
+    from app import cluster, targets
+    from app.engine import Engine
+    from app.proxmox import TestResult
+
+    monkeypatch.setattr(cluster.httpx, "AsyncClient",
+                        _FakeApiClient(_cluster_routes(), []))
+
+    async def ok_test(host, timeout=10.0):
+        return TestResult(True, "Connection and 'Sys.PowerMgmt' privilege ok.",
+                          has_power_mgmt=True)
+
+    monkeypatch.setattr(targets, "test_connection", ok_test)
+    eng = Engine(AppConfig(hosts=[PveHostConfig(
+        name="pve01", api_url="https://pve:8006", token_id="ups@pve!x",
+        token_secret="s", cluster=True)]))
+    quiet: list[str] = []
+    eng._log_quiet = lambda s, b, sev: quiet.append(s)  # type: ignore[assignment]
+    _notify_recorder(eng)
+
+    ok, message = await eng.run_selftest_now()
+    assert ok and "1 of 1 hosts ok" in message and "1 cluster(s) checked" in message
+    assert "Self-test pve01: ok" in quiet
+
+    # Run again straight away: the daily throttle must NOT swallow an explicit request.
+    quiet.clear()
+    await eng.run_selftest_now()
+    assert "Self-test pve01: ok" in quiet
+
+
+@pytest.mark.asyncio
+async def test_manual_selftest_is_refused_during_an_outage(monkeypatch):
+    """Every host costs up to 10 s; the battery countdown has priority."""
+    from app.engine import Engine
+
+    eng = Engine(AppConfig(
+        ups=[SnmpConfig(id="u", host="10.0.0.9")],
+        hosts=[PveHostConfig(name="pve01", api_url="x", token_secret="s")]))
+    eng.ups_rt["u"].state = UpsState(reachable=True, power_source="battery")
+
+    ok, message = await eng.run_selftest_now()
+
+    assert ok is False and "power outage" in message
+
+
+@pytest.mark.asyncio
+async def test_selftest_endpoint_reports_the_result(_import_target, monkeypatch):
+    main, _ = _import_target
+
+    async def fake(self=None):
+        return True, "2 of 2 hosts ok."
+
+    monkeypatch.setattr(main.engine, "run_selftest_now", fake)
+    assert await main.api_selftest_run() == {"ok": True, "message": "2 of 2 hosts ok."}
+
+
+# --- a disarmed HA stack without HA guests (reported from real hardware) -----
+@pytest.mark.asyncio
+async def test_disarmed_ha_is_reported_even_without_ha_guests(monkeypatch):
+    """The bug this fixes: a 2-node cluster with HA disarmed but no HA resources.
+
+    "the stack is disarmed" and "HA manages guests" are independent — tying the warning
+    to the resource count silently swallowed a cluster-wide loss of fencing.
+    """
+    eng = _cluster_engine(monkeypatch, all_nodes=True, armed_state="disarmed",
+                          ha_services=0, shutdown_policy="freeze")
+    events = _notify_recorder(eng)
+
+    await eng._check_clusters(log_ok=True)
+
+    assert [s for s, _, _ in events if "HA is still disarmed" in s]
+    snap = eng.cluster_snapshot()[0]
+    assert snap["needs_recovery"] is True, "'Restore cluster' has to be offered"
+    assert snap["ha_services"] == 0 and snap["ha_armed_state"] == "disarmed"
+
+
+@pytest.mark.asyncio
+async def test_armed_cluster_without_ha_guests_stays_quiet(monkeypatch):
+    """The counterpart: nothing disarmed, nothing to complain about."""
+    eng = _cluster_engine(monkeypatch, all_nodes=True, ha_services=0,
+                          shutdown_policy="freeze")
+    events = _notify_recorder(eng)
+    quiet: list[tuple[str, str]] = []
+    eng._log_quiet = lambda s, b, sev: quiet.append((s, b))  # type: ignore[assignment]
+
+    await eng._check_clusters(log_ok=True)
+
+    assert events == []
+    assert quiet and "HA armed (0 HA guests)" in quiet[0][1]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_policy_warning_stays_tied_to_ha_resources(monkeypatch):
+    """Without HA guests there is nothing that could be recovered onto a dying node."""
+    eng = _cluster_engine(monkeypatch, all_nodes=True, ha_services=0, has_disarm=False,
+                          shutdown_policy="migrate")
+    events = _notify_recorder(eng)
+    await eng._check_clusters()
+    assert not [s for s, _, _ in events if "shutdown_policy" in s]
+
+    # With HA guests the warning is due again.
+    eng = _cluster_engine(monkeypatch, all_nodes=True, ha_services=2, has_disarm=False,
+                          shutdown_policy="migrate")
+    events = _notify_recorder(eng)
+    await eng._check_clusters()
+    assert [s for s, _, _ in events if "shutdown_policy" in s]
+
+
+@pytest.mark.asyncio
+async def test_startup_inspects_the_clusters_without_waiting_for_a_selftest_slot(monkeypatch):
+    """After the appliance's own shutdown, the leftovers must be visible immediately.
+
+    The self-test latch survives a restart, so the next scheduled run can be a day away —
+    and until then cluster_states was empty, which hid both the dashboard line and the
+    "Restore cluster" button. That button is the only prompt the operator gets.
+    """
+    eng = _cluster_engine(monkeypatch, all_nodes=True, flags={"noout": True},
+                          armed_state="disarmed")
+    eng.last_selftest_slot = datetime.now()   # today's slot already ran
+    events = _notify_recorder(eng)
+
+    await eng._maybe_cluster_startup_check()
+
+    assert eng.cluster_states["prod"].needs_recovery
+    assert [c for c in eng.cluster_snapshot() if c["needs_recovery"]]
+    assert any("still prepared for shutdown" in s for s, _, _ in events)
+
+    # Exactly once per process start.
+    before = len(eng.cluster_states)
+    await eng._maybe_cluster_startup_check()
+    assert len(eng.cluster_states) == before and eng._cluster_startup_done
+
+
+@pytest.mark.asyncio
+async def test_startup_inspection_is_skipped_while_a_ups_is_on_battery(monkeypatch):
+    """Same reason the self-test is: the countdown has to stay responsive. No latch, so
+    it still runs once mains are back."""
+    eng = _cluster_engine(monkeypatch, all_nodes=True)
+    eng.shutdown_triggered = True
+
+    await eng._maybe_cluster_startup_check()
+
+    assert eng.cluster_states == {} and not eng._cluster_startup_done
+
+
+@pytest.mark.asyncio
+async def test_restore_is_refused_while_the_shutdown_is_running(monkeypatch):
+    """The button appears the moment the preparation lands — which is mid-shutdown.
+    Arming HA there would undo the preparation at the one moment it is doing its job."""
+    srv = _CephServer(armed="disarmed")
+    eng = _outage_cluster_engine(monkeypatch, srv)
+    eng.shutdown_triggered = True
+    before = len(srv.calls)
+
+    allowed, results = await eng.restore_clusters()
+
+    assert allowed is False and results == []
+    assert srv.calls[before:] == [], "not even a read is worth the poll budget here"
+
+
+@pytest.mark.asyncio
+async def test_node_count_warning_counts_every_target_not_only_the_ticked_ones(monkeypatch):
+    """The tick governs the preparation (once per cluster anyway); this warning is about
+    nodes nobody will shut down. Counting ticks accused a complete setup of leaving nodes
+    running."""
+    from app.engine import Engine
+
+    eng = _cluster_engine(monkeypatch, all_nodes=True)
+    # Every node is a target, but only the first carries the cluster tick.
+    for h in eng.cfg.hosts[1:]:
+        h.cluster = False
+    events = _notify_recorder(eng)
+
+    await eng._check_clusters()
+
+    assert not [s for s, _, _ in events if "not every node" in s]
+
+    # A genuinely incomplete setup is still reported.
+    eng2 = _cluster_engine(monkeypatch)          # only pve01 of three configured
+    events2 = _notify_recorder(eng2)
+    await eng2._check_clusters()
+    assert [s for s, _, _ in events2 if "not every node" in s]
+    assert isinstance(eng2, Engine)
+
+
+@pytest.mark.asyncio
+async def test_host_snapshot_carries_cluster_membership_and_name(monkeypatch):
+    """The UI marks a cluster member on the collapsed host card the way it marks the
+    appliance with a star — which needs both the flag and the discovered name."""
+    eng = _cluster_engine(monkeypatch, all_nodes=True)
+    await eng._check_clusters()
+
+    hosts = {h["name"]: h for h in eng.snapshot()["hosts"]}
+    assert hosts["pve01"]["cluster"] is True
+    assert hosts["pve01"]["cluster_name"] == "prod"
+
+    # A host that is not a member reports the flag as False and no name at all.
+    eng.cfg.hosts[1].cluster = False
+    assert eng.snapshot()["hosts"][1]["cluster"] is False
+
+
+def test_ceph_flags_are_off_by_default_but_ha_disarm_is_not():
+    """Ceph is the exception (ZFS, NFS/iSCSI); writing to a storage layer is opted into.
+    HA disarm is the reason one ticks "cluster member" in the first place."""
+    h = PveHostConfig(name="pve01", api_url="https://pve:8006",
+                      token_id="ups@pve!x", token_secret="s", cluster=True)
+    assert h.cluster_ceph is False
+    assert h.cluster_ha_disarm is True
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_preparation_reports_what_it_managed(monkeypatch):
+    """"Gave up" alone cannot be told apart from "never touched it" — and half prepared
+    is exactly the state the operator has to know about afterwards."""
+    import asyncio
+
+    from app import cluster
+
+    class _DisarmOkThenHangingFlags(_CephServer):
+        """The disarm succeeds, then the flags never land.
+
+        Written against the real order (disarm, guests, flags), so the step that runs out
+        of budget is the last one — which is exactly when "gave up" on its own would hide
+        that HA is already disarmed and needs re-arming.
+        """
+
+        async def put(self, url, **kw):
+            if url.startswith("/cluster/ceph/flags"):
+                await asyncio.sleep(30)
+            return await super().put(url, **kw)
+
+    srv = _DisarmOkThenHangingFlags()
+    monkeypatch.setattr(cluster.httpx, "AsyncClient", srv)
+    monkeypatch.setattr(cluster, "_VERIFY_INTERVAL_S", 0.01)
+
+    result = await cluster.prepare(_pve(), want_ceph=True, want_disarm=True, timeout=0.3)
+
+    assert result.ok is False
+    assert "gave up" in result.message
+    assert result.steps, "the partial state must survive the cancellation"
+    # Names what DID happen, so the operator knows HA is disarmed and needs restoring.
+    assert "HA disarmed" in result.message and "done so far" in result.message
+    assert srv.armed == "disarmed"
+
+
+@pytest.mark.asyncio
+async def test_restore_rearms_a_cluster_that_has_no_ha_guests(monkeypatch):
+    """Previously skipped, because needs_recovery required HA resources."""
+    from app import cluster
+    from app.engine import Engine
+
+    srv = _CephServer(armed="disarmed")
+    monkeypatch.setattr(cluster.httpx, "AsyncClient", srv)
+    monkeypatch.setattr(cluster, "_VERIFY_INTERVAL_S", 0.01)
+    eng = Engine(AppConfig(hosts=[PveHostConfig(
+        name="pve01", api_url="https://pve:8006", token_id="ups@pve!x",
+        token_secret="s", cluster=True)]))
+    _notify_recorder(eng)
+
+    allowed, results = await eng.restore_clusters()
+
+    assert allowed
+    assert results and results[0]["ok"], results
+    assert srv.armed == "armed"
+
+
+@pytest.mark.asyncio
+async def test_host_test_reports_a_disarmed_stack_and_points_at_the_button(
+    _import_target, monkeypatch
+):
+    main, _ = _import_target
+    _fake_host_and_cluster(monkeypatch, armed_state="disarmed", ha_services=0)
+
+    result = await main.api_test_host(_host_payload(cluster=True))
+
+    assert result["cluster"]["ha_disarmed"] is True
+    assert result["cluster"]["ha_services"] == 0
+    assert "HA disarmed" in result["message"]
+    assert "Restore cluster" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_cluster_probe_records_every_query_with_its_outcome(_import_target, monkeypatch):
+    """The diagnostics panel: one entry per endpoint, so a failing check is debuggable."""
+    from app.cluster import CLUSTER_PROBE_STATUSES
+
+    main, _ = _import_target
+    _fake_host_and_cluster(monkeypatch, armed_state="disarmed", ha_services=0)
+
+    result = await main.api_test_host(_host_payload(cluster=True))
+    entries = {e["name"]: e for e in result["cluster"]["entries"]}
+
+    assert set(entries) == {
+        "/access/permissions", "/cluster/status", "/cluster/ceph/status",
+        "/cluster/resources?type=vm", "/cluster/resources?type=storage",
+        "appliance guest",
+        "/cluster/ceph/flags", "/cluster/ha/status", "/cluster/ha/status/current",
+        "/cluster/options",
+    }
+    assert {e["status"] for e in entries.values()} <= set(CLUSTER_PROBE_STATUSES)
+    # The one line that would have answered the question on real hardware.
+    assert "armed-state=disarmed" in entries["/cluster/ha/status/current"]["value"]
+    assert "0 HA services" in entries["/cluster/ha/status/current"]["value"]
+    assert "Sys.Console" in entries["/access/permissions"]["value"]
+    assert "quorate" in entries["/cluster/status"]["value"]
+    # The guest list and the appliance's own guest are the two facts the new step needs,
+    # so the panel has to show both rather than only their conclusion.
+    assert "3 guests, 3 running" in entries["/cluster/resources?type=vm"]["value"]
+    assert entries["appliance guest"]["status"] == "absent"
+    assert "cephpool" in entries["/cluster/resources?type=storage"]["value"]
+
+
+@pytest.mark.asyncio
+async def test_cluster_probe_classifies_denied_and_absent(_import_target, monkeypatch):
+    main, _ = _import_target
+    # No Sys.Audit at all: every gated endpoint refuses.
+    _fake_host_and_cluster(monkeypatch, permissions={"Sys.PowerMgmt": 1}, has_disarm=False)
+
+    result = await main.api_test_host(_host_payload(cluster=True))
+    entries = {e["name"]: e for e in result["cluster"]["entries"]}
+
+    # A 403 is actionable and must not be filed as a generic error.
+    assert entries["/cluster/status"]["status"] == "denied"
+    # The summary must not mistake "not allowed to look" for "standalone node".
+    assert "lacks Sys.Audit" in result["message"]
+    assert "not part of a cluster" not in result["message"]
+    # Membership is unreadable here, so the HA/Ceph endpoints are deliberately not
+    # queried at all — no point piling up six more refusals.
+    assert "/cluster/ha/status/current" not in entries
+
+
+@pytest.mark.asyncio
+async def test_cluster_probe_marks_a_missing_endpoint_as_absent(_import_target, monkeypatch):
+    """A release without disarm-ha is a fact about the version, not a failure."""
+    main, _ = _import_target
+    _fake_host_and_cluster(monkeypatch, has_disarm=False)
+
+    result = await main.api_test_host(_host_payload(cluster=True))
+    entries = {e["name"]: e for e in result["cluster"]["entries"]}
+
+    assert entries["/cluster/ha/status"]["status"] == "absent"
+    assert "9.2" in entries["/cluster/ha/status"]["value"]
+    assert entries["/cluster/status"]["status"] == "ok"
+
+
+def test_ceph_error_separates_no_ceph_from_unreadable():
+    """"not configured" and "not permitted" must not look the same to the operator."""
+    from app.cluster import ClusterInfo
+
+    no_ceph = ClusterInfo(ceph_error="/cluster/ceph/flags: HTTP 500")
+    denied = ClusterInfo(ceph_error="/cluster/ceph/flags: not permitted (missing privilege)")
+
+    assert "not permitted" not in (no_ceph.ceph_error or "")
+    assert "not permitted" in (denied.ceph_error or "")
+
+
+# --- cluster-wide guest shutdown (hyper-converged Ceph) ----------------------
+# The step that makes a Ceph cluster survivable: every guest has to stop BEFORE the first
+# node loses power. Stopping them node by node drops the pool below min_size while guests
+# are still running on the survivors, their IO blocks, and their shutdown never finishes.
+
+
+def _guest_calls(srv, kind="shutdown"):
+    return [u for m, u in srv.calls if m == "POST" and u.endswith(f"/status/{kind}")]
+
+
+@pytest.mark.asyncio
+async def test_guests_are_stopped_after_the_disarm_and_before_the_ceph_flags(monkeypatch):
+    """The whole point of the feature is the ORDER, so that is what is pinned.
+
+    Disarming after the guests would let the HA manager restart them as fast as they are
+    stopped; setting the flags first would leave them on if the stop then fails.
+    """
+    srv = _CephServer()
+    eng = _outage_cluster_engine(monkeypatch, srv)
+    eng._fire_host = _noop_fire(eng)  # type: ignore[assignment]
+
+    await eng._evaluate()
+
+    order = [u for m, u in srv.calls if m in ("POST", "PUT")]
+    disarm = order.index("/cluster/ha/status/disarm-ha")
+    first_guest = min(order.index(u) for u in _guest_calls(srv))
+    flags = order.index("/cluster/ceph/flags")
+    assert disarm < first_guest < flags
+
+
+@pytest.mark.asyncio
+async def test_the_appliances_own_guest_is_never_stopped(monkeypatch):
+    """Stopping every guest would stop the appliance halfway through the outage."""
+    srv = _CephServer()
+    eng = _outage_cluster_engine(monkeypatch, srv)
+    eng._fire_host = _noop_fire(eng)  # type: ignore[assignment]
+
+    await eng._evaluate()
+
+    assert not [u for u in _guest_calls(srv) if "/lxc/950/" in u]
+    assert not [u for u in _guest_calls(srv, "stop") if "/lxc/950/" in u]
+    assert srv.guests[950]["status"] == "running"
+    # The others did go down.
+    assert {srv.guests[100]["status"], srv.guests[101]["status"]} == {"stopped"}
+
+
+@pytest.mark.asyncio
+async def test_a_guest_carrying_our_hostname_is_spared_even_with_a_wrong_pick(monkeypatch):
+    """Belt and braces against a mis-selected vmid, which is the one mistake that would
+    switch this appliance off in the middle of an outage."""
+    from app import cluster
+
+    srv = _CephServer()
+    monkeypatch.setattr(cluster.httpx, "AsyncClient", srv)
+    monkeypatch.setattr(cluster, "_VERIFY_INTERVAL_S", 0.01)
+    monkeypatch.setattr(cluster, "_GUEST_POLL_INTERVAL_S", 0.01)
+    info = await cluster.inspect(_pve(), self_vmid=100, self_node="pve01")
+
+    result = await cluster.prepare(
+        _pve(), want_ceph=True, want_disarm=True, want_guests=True,
+        guests=info.guests, self_guest=info.self_guest, guest_needs_disarm=False,
+        hostname="pve-usv", timeout=5, guest_timeout=5, force_after_s=1,
+    )
+
+    assert result.ok
+    assert srv.guests[950]["status"] == "running", "matched by hostname, not by the pick"
+    assert srv.guests[100]["status"] == "running", "the (wrong) pick is spared too"
+    assert srv.guests[101]["status"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_a_guest_that_ignores_the_shutdown_is_force_stopped(monkeypatch):
+    srv = _CephServer(guest_ignores_shutdown=(101,))
+    eng = _outage_cluster_engine(monkeypatch, srv)
+    eng._fire_host = _noop_fire(eng)  # type: ignore[assignment]
+
+    await eng._evaluate()
+
+    assert any("/lxc/101/status/stop" in u for u in _guest_calls(srv, "stop"))
+    assert srv.guests[101]["status"] == "stopped"
+    assert eng.cluster_prep_failed["prod"] is False
+
+
+@pytest.mark.asyncio
+async def test_without_force_a_hung_guest_fails_the_preparation_by_name(monkeypatch):
+    """"Never force" has to mean it — and then say which guest is still up, because that
+    is the machine someone has to go and look at."""
+    from app import cluster
+
+    srv = _CephServer(guest_ignores_shutdown=(101,))
+    monkeypatch.setattr(cluster.httpx, "AsyncClient", srv)
+    monkeypatch.setattr(cluster, "_VERIFY_INTERVAL_S", 0.01)
+    monkeypatch.setattr(cluster, "_GUEST_POLL_INTERVAL_S", 0.01)
+    info = await cluster.inspect(_pve(), self_vmid=950, self_node="pve01")
+
+    result = await cluster.prepare(
+        _pve(), want_ceph=True, want_disarm=True, want_guests=True,
+        guests=info.guests, self_guest=info.self_guest, guest_needs_disarm=False,
+        timeout=3, guest_timeout=1, force_after_s=None,
+    )
+
+    assert result.ok is False
+    assert not _guest_calls(srv, "stop"), "force-stop is off, so nothing may be killed"
+    assert "CT 101 'db' on pve02" in result.message
+    # The flags are still set: they cost nothing, they still stop the rebalancing, and
+    # leaving them off would give the worst of both worlds.
+    assert all(srv.flags.values())
+
+
+@pytest.mark.asyncio
+async def test_a_cluster_without_ceph_never_touches_the_guests(monkeypatch):
+    """The whole special procedure exists for Ceph. A plain cluster keeps its old
+    behaviour, node by node, exactly as before."""
+    srv = _CephServer(has_ceph=True)
+    eng = _outage_cluster_engine(monkeypatch, srv)
+    for h in eng.cfg.hosts:
+        h.cluster_ceph = False
+    eng._fire_host = _noop_fire(eng)  # type: ignore[assignment]
+
+    await eng._evaluate()
+
+    assert not _guest_calls(srv)
+    assert ("POST", "/cluster/ha/status/disarm-ha") in srv.calls
+    assert not any(srv.flags.values())
+
+
+@pytest.mark.asyncio
+async def test_no_disarm_means_no_guest_stop(monkeypatch):
+    """Chosen behaviour: without a verified disarm the guests are left alone. Stopping
+    them while the HA manager is live and holding resources only feeds it work."""
+    srv = _CephServer(has_disarm=False, ha_services=2)
+    eng = _outage_cluster_engine(monkeypatch, srv)
+    events = _notify_recorder(eng)
+    eng._fire_host = _noop_fire(eng)  # type: ignore[assignment]
+
+    await eng._evaluate()
+
+    assert not _guest_calls(srv)
+    assert "Cluster prod: guest shutdown skipped" in [s for s, _, _ in events]
+    body = next(b for s, _, b in events if s.endswith("guest shutdown skipped"))
+    assert "9.2" in body
+    # Everything that DOES work still happens.
+    assert all(srv.flags.values())
+
+
+@pytest.mark.asyncio
+async def test_without_ha_resources_the_guests_stop_even_without_disarm_ha(monkeypatch):
+    """The one carve-out: with zero HA resources there is no HA manager to restart
+    anything, so the precondition simply does not apply."""
+    srv = _CephServer(has_disarm=False, ha_services=0)
+    eng = _outage_cluster_engine(monkeypatch, srv)
+    eng._fire_host = _noop_fire(eng)  # type: ignore[assignment]
+
+    await eng._evaluate()
+
+    assert len(_guest_calls(srv)) == 2
+    assert srv.guests[950]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_an_unidentifiable_own_guest_refuses_the_step_but_not_the_shutdown(monkeypatch):
+    srv = _CephServer()
+    eng = _outage_cluster_engine(monkeypatch, srv, self_vmid=None)
+    eng.cfg.appliance.self_node = ""
+    events = _notify_recorder(eng)
+    fired: list = []
+
+    async def fake_fire(host, reason):
+        fired.append(host.name)
+        eng.host_fired[host.key] = True
+
+    eng._fire_host = fake_fire  # type: ignore[assignment]
+    await eng._evaluate()
+
+    assert not _guest_calls(srv)
+    assert "Cluster prod: guest shutdown skipped" in [s for s, _, _ in events]
+    # Refusing the guest stop must never refuse the shutdown: that would be worse than
+    # the 4.0 behaviour, not better.
+    assert fired == ["pve01", "pve02"]
+    assert all(srv.flags.values())
+
+
+@pytest.mark.asyncio
+async def test_a_permission_filtered_empty_guest_list_is_not_no_guests(monkeypatch):
+    """/cluster/resources answers 200 with an empty list when the token lacks VM.Audit.
+    Reading that as "nothing to stop" would report success while forty guests keep
+    writing to Ceph — the most dangerous failure this feature can have."""
+    srv = _CephServer(vm_audit=False)
+    eng = _outage_cluster_engine(monkeypatch, srv)
+    events = _notify_recorder(eng)
+    eng._fire_host = _noop_fire(eng)  # type: ignore[assignment]
+
+    await eng._evaluate()
+
+    body = next(b for s, _, b in events if s.endswith("guest shutdown skipped"))
+    assert "VM.Audit" in body
+    assert not _guest_calls(srv)
+
+
+@pytest.mark.asyncio
+async def test_guest_shutdowns_stay_within_the_concurrency_limit(monkeypatch):
+    """Sequential is hopeless (a connect timeout per guest), unbounded opens a socket per
+    guest at the worst possible moment."""
+    from app import cluster
+
+    guests = [{"vmid": 950, "node": "pve01", "type": "lxc", "name": "pve-usv",
+               "status": "running"}]
+    guests += [{"vmid": 200 + i, "node": "pve01", "type": "qemu", "name": f"vm{i}",
+                "status": "running"} for i in range(30)]
+    srv = _CephServer(guests=guests)
+    eng = _outage_cluster_engine(monkeypatch, srv)
+    eng._fire_host = _noop_fire(eng)  # type: ignore[assignment]
+
+    await eng._evaluate()
+
+    assert len(_guest_calls(srv)) == 30
+    assert 1 < srv.max_inflight <= cluster._GUEST_CONCURRENCY
+
+
+@pytest.mark.asyncio
+async def test_the_preview_describes_the_four_steps_without_touching_anything(monkeypatch):
+    """A POST the operator clicks: it must be instant and free of side effects, so it is
+    built from the last inspection rather than from fresh calls."""
+    srv = _CephServer()
+    eng = _outage_cluster_engine(monkeypatch, srv)
+    await eng._check_clusters()
+    before = len(srv.calls)
+
+    msg = await eng.simulate_shutdown()
+
+    assert len(srv.calls) == before, "the preview may not talk to the cluster"
+    assert "HA disarm -> stop 2 of 3 running guests" in msg
+    assert "sparing CT 950 'pve-usv' on pve01" in msg
+    assert "Ceph flags noout,nobackfill,norecover,norebalance" in msg
+    assert "NOTHING was shut down." in msg
+
+
+# --- the appliance's own guest: resolution and storage -----------------------
+
+
+def _g(vmid, node="pve01", kind="lxc", name="pve-usv"):
+    from app.cluster import GuestInfo
+
+    return GuestInfo(vmid=vmid, node=node, kind=kind, name=name, status="running")
+
+
+def test_find_self_guest_prefers_the_explicit_pick_and_never_guesses_past_it():
+    from app.cluster import find_self_guest
+
+    guests = [_g(950), _g(100, "pve02", "qemu", "web")]
+
+    assert find_self_guest(guests, 950, "", "")[1] == "config"
+    # The decisive one: a pick that is not there must NOT fall back to the hostname.
+    # Guessing after an explicit choice is how a renumbered appliance stops itself.
+    assert find_self_guest(guests, 999, "", "pve-usv") == (None, "missing")
+    assert find_self_guest(guests, 950, "pve02", "") == (None, "missing")
+
+
+def test_find_self_guest_matches_the_hostname_only_when_it_is_unambiguous():
+    from app.cluster import find_self_guest
+
+    guests = [_g(950), _g(100, "pve02", "qemu", "web")]
+    assert find_self_guest(guests, None, "", "PVE-USV.lan.example")[0].vmid == 950
+    assert find_self_guest(guests, None, "", "nothing-like-this") == (None, "none")
+    assert find_self_guest(guests, None, "", "") == (None, "none")
+
+    # A container is preferred over a VM of the same name (that is what the installer
+    # creates); two containers of one name stay unresolved rather than being picked from.
+    both = [_g(950), _g(951, "pve02", "qemu", "pve-usv")]
+    assert find_self_guest(both, None, "", "pve-usv")[0].vmid == 950
+    twins = [_g(950), _g(951, "pve02", "lxc", "pve-usv")]
+    assert find_self_guest(twins, None, "", "pve-usv") == (None, "ambiguous")
+
+
+def test_storages_of_config_finds_every_volume_reference():
+    from app.cluster import storages_of_config
+
+    cfg = {
+        "rootfs": "local-lvm:vm-950-disk-0,size=4G",
+        "mp0": "cephpool:vm-950-disk-1,mp=/data",
+        "scsi0": "local-zfs:vm-100-disk-0",
+        "unused0": "cephpool:vm-100-disk-9",   # detached still pins the storage
+        "scsi1": "/dev/sdb",                   # a path has no storage in front of it
+        "net0": "name=eth0,bridge=vmbr0",
+    }
+    assert storages_of_config(cfg) == ["local-lvm", "cephpool", "local-zfs"]
+
+
+def test_mon_ordering_is_reported_but_never_enforced():
+    from app.cluster import mon_order_report, mon_ordering_ok
+
+    assert mon_ordering_ok(["pve03", "pve01", "pve02"], ["pve01", "pve02"])
+    assert not mon_ordering_ok(["pve01", "pve03"], ["pve01"])
+    assert mon_ordering_ok(["pve01", "pve02"], []) is True
+
+    report = mon_order_report(["pve01", "pve02", "pve03"], ["pve01"], "pve03")
+    assert "pve01" in report and "raise 'order'" in report
+    # The appliance's node is forced last by the sort key, so suggesting a number for it
+    # would be advice that cannot work.
+    assert "always shut down last" in report
+    assert mon_order_report(["pve03", "pve01"], ["pve01"], "") == ""
+
+
+@pytest.mark.asyncio
+async def test_the_selftest_warns_about_an_appliance_on_ceph_storage(monkeypatch):
+    """The deployment mistake that only shows up when it is far too late to fix it."""
+    srv = _CephServer(self_on_ceph=True)
+    eng = _outage_cluster_engine(monkeypatch, srv)
+    events = _notify_recorder(eng)
+
+    await eng._check_clusters()
+
+    subjects = [s for s, _, _ in events]
+    assert "Cluster prod: this appliance runs on Ceph storage" in subjects
+    body = next(b for s, _, b in events if s.endswith("on Ceph storage"))
+    assert "cephpool" in body and "min_size" in body
+
+
+@pytest.mark.asyncio
+async def test_the_selftest_warns_when_the_appliances_node_is_not_marked_this_host(monkeypatch):
+    srv = _CephServer()
+    eng = _outage_cluster_engine(monkeypatch, srv)
+    events = _notify_recorder(eng)
+
+    await eng._check_clusters()
+
+    assert "Cluster prod: this appliance's node is not marked 'this host'" in [
+        s for s, _, _ in events]
+
+
+@pytest.mark.asyncio
+async def test_the_selftest_warns_when_the_battery_reserve_is_shorter_than_the_sequence(
+        monkeypatch):
+    """Warned about, never acted on: lowering someone's trigger for them is not this
+    appliance's decision."""
+    srv = _CephServer()
+    eng = _outage_cluster_engine(monkeypatch, srv)
+    eng.cfg.thresholds.runtime_below_minutes = 1
+    eng.cfg.thresholds.cluster_guest_shutdown_timeout_s = 300
+    events = _notify_recorder(eng)
+
+    await eng._check_clusters()
+
+    body = next((b for s, _, b in events if "battery reserve" in s), "")
+    assert "60s" in body and "365s" in body
+
+
+@pytest.mark.asyncio
+async def test_the_guest_list_endpoint_serves_the_picker(_import_target, monkeypatch):
+    """Picked from a list, never typed — so the list has to be reachable without first
+    running a credential test."""
+    main, _ = _import_target
+    _fake_host_and_cluster(monkeypatch)
+
+    result = await main.api_cluster_guests(_host_payload(cluster=True))
+
+    assert result["ok"] is True
+    assert [g["vmid"] for g in result["guests"]] == [100, 101, 950]
+    assert result["guests"][2]["label"] == "CT 950 'pve-usv' on pve01"
+
+
+@pytest.mark.asyncio
+async def test_the_guest_list_endpoint_says_when_it_may_not_look(_import_target, monkeypatch):
+    """An empty list and "not allowed to look" arrive identically on the wire; they must
+    not read identically here."""
+    main, _ = _import_target
+    _fake_host_and_cluster(monkeypatch,
+                           permissions={"Sys.PowerMgmt": 1, "Sys.Audit": 1})
+
+    result = await main.api_cluster_guests(_host_payload(cluster=True))
+
+    assert result["ok"] is False and result["guests"] == []
+    assert "VM.Audit" in result["message"]
+
+
+# --- a re-arm asks for a self-test -------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_re_arm_runs_a_self_test(monkeypatch):
+    """Right after a re-arm is when a leftover problem shows up — an expired token, a
+    cluster still prepared, a node that never came back. Waiting hours for the next
+    scheduled slot to find that out is the wrong trade."""
+    eng, _sent = _fired_engine(monkeypatch)
+    runs: list = []
+
+    async def fake_selftest(force_log=False):
+        runs.append(force_log)
+
+    eng._run_selftest = fake_selftest  # type: ignore[assignment]
+    # Pin the schedule to "already done for this slot", so what the test observes is the
+    # re-arm run and not the ordinary first-run-of-the-process one.
+    from app.engine import selftest_slot
+    eng.last_selftest_slot = selftest_slot(
+        datetime.now(), eng.cfg.selftest_hour, eng.cfg.selftest_interval_min)
+    slot_before = eng.last_selftest_slot
+
+    _on_battery_low_runtime(eng, "a")
+    await eng._evaluate()
+    _on_mains(eng, "a")
+    await eng._evaluate()
+    eng._mains_ok_since = eng._mains_ok_since - timedelta(minutes=6)
+    await eng._evaluate()
+    await eng._maybe_selftest()
+
+    assert runs == [True], "once, and logged even when everything is fine"
+    assert eng.last_selftest_slot == slot_before, "the regular schedule is untouched"
+
+    # And not again on the next iteration.
+    await eng._maybe_selftest()
+    assert runs == [True]
+
+
+@pytest.mark.asyncio
+async def test_a_re_arm_selftest_waits_out_a_new_outage_instead_of_being_lost(monkeypatch):
+    """The flag is cleared when the test RUNS, not when it is set: a self-test costs up
+    to ten seconds per host, which the next outage cannot spare."""
+    eng, _sent = _fired_engine(monkeypatch)
+    runs: list = []
+
+    async def fake_selftest(force_log=False):
+        runs.append(force_log)
+
+    eng._run_selftest = fake_selftest  # type: ignore[assignment]
+
+    _on_battery_low_runtime(eng, "a")
+    await eng._evaluate()
+    _on_mains(eng, "a")
+    await eng._evaluate()
+    eng._mains_ok_since = eng._mains_ok_since - timedelta(minutes=6)
+    await eng._evaluate()
+
+    # The grid dips again before the test got its turn.
+    _on_battery_low_runtime(eng, "a")
+    await eng._maybe_selftest()
+    assert runs == [] and eng._rearm_selftest_pending is True
+
+    _on_mains(eng, "a")
+    eng.shutdown_triggered = False
+    eng.ups_rt["a"].on_battery_since = None
+    await eng._maybe_selftest()
+    assert runs == [True]
+
+
+# --- the cluster goes down as a unit -----------------------------------------
+# The preparation is cluster-wide (HA disarmed, with Ceph every guest stopped) while the
+# shutdown is per host. When only some nodes' UPS devices trigger, those two disagree and
+# the cluster is left in halves -- observed in the field on a four-node cluster, where two
+# of three Ceph monitors went down with it.
+
+
+def _split_feed_engine(monkeypatch, srv, *, unit=True, ceph=True, nodes=4, dry_run=False):
+    """Four cluster nodes on two UPS devices; only the first one is on battery."""
+    from app import cluster
+    from app.engine import Engine
+    from app.config import ApplianceConfig, Thresholds
+
+    monkeypatch.setattr(cluster.httpx, "AsyncClient", srv)
+    monkeypatch.setattr(cluster, "_VERIFY_INTERVAL_S", 0.01)
+    monkeypatch.setattr(cluster, "_GUEST_POLL_INTERVAL_S", 0.01)
+    names = [f"pve0{i}" for i in range(1, nodes + 1)]
+    half = len(names) // 2
+    hosts = [
+        PveHostConfig(name=n, api_url=f"https://{n}:8006", token_id="ups@pve!x",
+                      token_secret="s", cluster=True, cluster_ceph=ceph,
+                      cluster_shutdown_all=unit,
+                      ups_ids=["a" if i < half else "b"], order=i)
+        for i, n in enumerate(names)
+    ]
+    cfg = AppConfig(
+        dry_run=dry_run,
+        # ``label`` is a read-only property derived from ``name`` (UpsBase.label).
+        ups=[SnmpConfig(id="a", host="10.0.0.9", name="UPS-A"),
+             SnmpConfig(id="b", host="10.0.0.8", name="UPS-B")],
+        hosts=hosts,
+        appliance=ApplianceConfig(self_vmid=950, self_node="pve01"),
+        thresholds=Thresholds(on_battery_low=True, on_battery_seconds=None,
+                              runtime_below_minutes=None, charge_below_percent=None,
+                              cluster_prep_timeout_s=5,
+                              cluster_guest_shutdown_timeout_s=5),
+    )
+    eng = Engine(cfg)
+    for h in hosts:
+        eng.host_states[h.key] = {"cluster_name": "prod"}
+    # Only the first UPS fails. The second stays on mains, exactly as in the field report.
+    eng.ups_rt["a"].state = UpsState(reachable=True, power_source="battery",
+                                     battery_status="low")
+    eng.ups_rt["b"].state = UpsState(reachable=True, power_source="mains")
+    return eng
+
+
+def _fire_recorder(eng):
+    fired: list = []
+
+    async def fake_fire(host, reason):
+        fired.append((host.name, reason))
+        eng.host_fired[host.key] = True
+
+    eng._fire_host = fake_fire  # type: ignore[assignment]
+    return fired
+
+
+def _srv4(**kw):
+    nodes = ("pve01", "pve02", "pve03", "pve04")
+    guests = [
+        {"vmid": 950, "node": "pve01", "type": "lxc", "name": "pve-usv", "status": "running"},
+        {"vmid": 100, "node": "pve02", "type": "qemu", "name": "web", "status": "running"},
+        {"vmid": 101, "node": "pve04", "type": "lxc", "name": "db", "status": "running"},
+    ]
+    kw.setdefault("nodes", nodes)
+    kw.setdefault("guests", guests)
+    kw.setdefault("mons", ("pve01", "pve02", "pve03"))
+    return _CephServer(**kw)
+
+
+@pytest.mark.asyncio
+async def test_one_ups_takes_the_whole_cluster_down(monkeypatch):
+    """The field case: only UPS-A failed, so only two of four nodes were due -- while the
+    preparation had already stopped every guest and disarmed HA for all four."""
+    eng = _split_feed_engine(monkeypatch, _srv4())
+    fired = _fire_recorder(eng)
+
+    await eng._evaluate()
+
+    assert [n for n, _ in fired] == ["pve01", "pve02", "pve03", "pve04"]
+    # The two that asked for it name their UPS; the two taken along say so.
+    assert "UPS-A" in dict(fired)["pve01"]
+    assert "shut down as a unit" in dict(fired)["pve03"]
+    assert "shut down as a unit" in dict(fired)["pve04"]
+
+
+@pytest.mark.asyncio
+async def test_the_unit_shutdown_keeps_the_configured_order(monkeypatch):
+    """The added hosts are merged through ordered_hosts(), not appended: _evaluate_hosts
+    groups by (this_host, order) and needs the list sorted for the groups to be
+    contiguous."""
+    eng = _split_feed_engine(monkeypatch, _srv4())
+    # pve03 goes first, and the appliance's node is forced last whatever its order says.
+    for h in eng.cfg.hosts:
+        h.order = {"pve03": 0, "pve02": 1, "pve04": 2, "pve01": 3}[h.name]
+        h.this_host = h.name == "pve01"
+    fired = _fire_recorder(eng)
+
+    await eng._evaluate()
+
+    assert [n for n, _ in fired] == ["pve03", "pve02", "pve04", "pve01"]
+
+
+@pytest.mark.asyncio
+async def test_without_the_switch_only_the_triggered_nodes_go_and_it_is_said(monkeypatch):
+    """The old behaviour stays available, but it no longer happens quietly."""
+    srv = _srv4()
+    eng = _split_feed_engine(monkeypatch, srv, unit=False)
+    events = _notify_recorder(eng)
+    fired = _fire_recorder(eng)
+
+    await eng._evaluate()
+
+    assert [n for n, _ in fired] == ["pve01", "pve02"]
+    subjects = [s for s, _, _ in events]
+    assert "Cluster prod: only part of the cluster is shut down" in subjects
+    body = next(b for s, _, b in events if s.endswith("only part of the cluster is shut down"))
+    assert "2 of 4 nodes triggered" in body
+    assert "pve03" in body and "pve04" in body
+    # The guests were stopped for all of them regardless -- that is the point.
+    assert srv.guests[101]["status"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_the_announcement_names_how_many_nodes_triggered(monkeypatch):
+    eng = _split_feed_engine(monkeypatch, _srv4())
+    events = _notify_recorder(eng)
+    _fire_recorder(eng)
+
+    await eng._evaluate()
+
+    body = next(b for s, _, b in events if s.endswith("preparing for shutdown"))
+    assert "2 of 4 nodes triggered" in body
+    assert "the rest are shut down with them" in body
+
+
+@pytest.mark.asyncio
+async def test_members_are_found_without_a_previous_self_test(monkeypatch):
+    """Cold start: nothing has filled cluster_name yet, so membership has to come from
+    the node list the API just returned."""
+    eng = _split_feed_engine(monkeypatch, _srv4())
+    eng.host_states = {}
+    fired = _fire_recorder(eng)
+
+    await eng._evaluate()
+
+    assert sorted(n for n, _ in fired) == ["pve01", "pve02", "pve03", "pve04"]
+
+
+@pytest.mark.asyncio
+async def test_disabled_hosts_are_not_taken_along(monkeypatch):
+    eng = _split_feed_engine(monkeypatch, _srv4())
+    next(h for h in eng.cfg.hosts if h.name == "pve04").enabled = False
+    fired = _fire_recorder(eng)
+
+    await eng._evaluate()
+
+    assert [n for n, _ in fired] == ["pve01", "pve02", "pve03"]
+
+
+@pytest.mark.asyncio
+async def test_a_host_taken_along_is_not_reported_as_aborted(monkeypatch):
+    """It never had a reason of its own, so "no reason now" says nothing about it.
+    Without the unit latch the dry-run released it again on the very next poll, with a
+    misleading "shutdown aborted" -- and it could never fire again."""
+    eng = _split_feed_engine(monkeypatch, _srv4(), dry_run=True)
+    events = _notify_recorder(eng)
+
+    await eng._evaluate()
+    before = len(events)
+    await eng._evaluate()
+
+    assert not [s for s, _, _ in events[before:] if "aborted" in s]
+    assert eng.host_fired[next(h.key for h in eng.cfg.hosts if h.name == "pve03")]
+
+
+@pytest.mark.asyncio
+async def test_the_selftest_warns_about_independent_ups_branches(monkeypatch):
+    eng = _split_feed_engine(monkeypatch, _srv4())
+    events = _notify_recorder(eng)
+
+    await eng._check_clusters()
+
+    body = next((b for s, _, b in events if "different UPS devices" in s), "")
+    assert "UPS-A" in body and "UPS-B" in body
+    assert "shut down the whole cluster" in body
+    # The other half of the field case: a UPS that goes silent triggers nothing at all.
+    assert "communication loss" in body
+
+
+@pytest.mark.asyncio
+async def test_the_feed_warning_changes_with_the_switch(monkeypatch):
+    eng = _split_feed_engine(monkeypatch, _srv4(), unit=False)
+    events = _notify_recorder(eng)
+
+    await eng._check_clusters()
+
+    body = next((b for s, _, b in events if "different UPS devices" in s), "")
+    assert "stopped every guest in the cluster" in body
+    assert "Switch 'shut the whole cluster down as a unit' on" in body
+
+
+@pytest.mark.asyncio
+async def test_no_feed_warning_when_every_node_hangs_on_the_same_ups(monkeypatch):
+    srv = _CephServer()
+    eng = _outage_cluster_engine(monkeypatch, srv)
+    events = _notify_recorder(eng)
+
+    await eng._check_clusters()
+
+    assert not [s for s, _, _ in events if "different UPS devices" in s]
+
+
+@pytest.mark.asyncio
+async def test_abort_on_failure_also_holds_back_the_taken_along_nodes(monkeypatch):
+    """The abort filter keys on host_states["cluster_name"]. On a cold start the
+    taken-along nodes were matched through the API's node list instead, so without
+    recording that membership they would have gone down despite the abort."""
+    srv = _srv4(bulk_supported=False, guest_ignores_shutdown=(100, 101))
+    eng = _split_feed_engine(monkeypatch, srv)
+    eng.cfg.thresholds.cluster_abort_on_prep_failure = True
+    eng.cfg.thresholds.cluster_guest_force_after_s = None
+    eng.host_states = {}          # cold start: nothing knows the cluster name yet
+    fired = _fire_recorder(eng)
+
+    await eng._evaluate()
+
+    assert eng.cluster_prep_failed["prod"] is True
+    assert fired == [], "a held-back cluster shuts down no node of it, taken-along or not"

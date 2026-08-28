@@ -52,7 +52,9 @@ KIND_ENUM = "enum"          # integer -> normalised string via MibObject.enum
 class MibObject:
     """One scalar object of a MIB profile."""
 
-    oid: str                        # always ".0"-suffixed; we never walk tables
+    # Scalars are ".0"-suffixed. A table column may be addressed with a FIXED index
+    # (e.g. upsOutputPercentLoad on output line 1) — what we never do is walk a table.
+    oid: str
     name: str                       # as spelled in the MIB, shown by the manual probe
     field: Optional[str] = None     # UpsState attribute this fills (None = not stored)
     kind: str = KIND_INT
@@ -88,6 +90,10 @@ OID_BATTERY_STATUS = "1.3.6.1.2.1.33.1.2.1.0"         # upsBatteryStatus
 OID_SECONDS_ON_BATTERY = "1.3.6.1.2.1.33.1.2.2.0"     # upsSecondsOnBattery
 OID_MINUTES_REMAINING = "1.3.6.1.2.1.33.1.2.3.0"      # upsEstimatedMinutesRemaining
 OID_CHARGE_REMAINING = "1.3.6.1.2.1.33.1.2.4.0"       # upsEstimatedChargeRemaining (%)
+# upsOutputPercentLoad lives in upsOutputTable, indexed by output line. We read line 1 —
+# the only line on a single-phase UPS, and the representative one otherwise. A fixed
+# index, not a walk.
+OID_OUTPUT_LOAD = "1.3.6.1.2.1.33.1.4.4.1.5.1"        # upsOutputPercentLoad.1
 
 # upsOutputSource enum -> normalised power source string
 _OUTPUT_SOURCE = {
@@ -125,6 +131,9 @@ RFC1628 = MibProfile(
                   "runtime_remaining_min", KIND_INT, trigger="runtime"),
         MibObject(OID_CHARGE_REMAINING, "upsEstimatedChargeRemaining", "battery_charge_pct",
                   KIND_PCT, trigger="charge"),
+        # Informational only (no trigger): a device without it must not make the wizard
+        # warn about an unavailable shutdown condition.
+        MibObject(OID_OUTPUT_LOAD, "upsOutputPercentLoad", "load_pct", KIND_PCT),
     ),
 )
 
@@ -138,6 +147,7 @@ OID_APC_OUTPUT_STATUS = "1.3.6.1.4.1.318.1.1.1.4.1.1.0"   # upsBasicOutputStatus
 OID_APC_BATTERY_STATUS = "1.3.6.1.4.1.318.1.1.1.2.1.1.0"  # upsBasicBatteryStatus
 OID_APC_TIME_ON_BATTERY = "1.3.6.1.4.1.318.1.1.1.2.1.2.0"  # upsBasicBatteryTimeOnBattery
 OID_APC_CAPACITY = "1.3.6.1.4.1.318.1.1.1.2.2.1.0"        # upsAdvBatteryCapacity
+OID_APC_LOAD = "1.3.6.1.4.1.318.1.1.1.4.2.3.0"            # upsAdvOutputLoad (% of rated)
 OID_APC_RUNTIME = "1.3.6.1.4.1.318.1.1.1.2.2.3.0"         # upsAdvBatteryRunTimeRemaining
 
 # upsBasicOutputStatus enum -> normalised power source string.
@@ -199,6 +209,7 @@ APC = MibProfile(
                   KIND_TICKS_MIN, trigger="runtime"),
         MibObject(OID_APC_CAPACITY, "upsAdvBatteryCapacity", "battery_charge_pct", KIND_PCT,
                   trigger="charge"),
+        MibObject(OID_APC_LOAD, "upsAdvOutputLoad", "load_pct", KIND_PCT),
     ),
 )
 
@@ -257,6 +268,9 @@ class UpsState:
     seconds_on_battery: Optional[int] = None
     runtime_remaining_min: Optional[int] = None
     battery_charge_pct: Optional[int] = None
+    # Output load in percent of the UPS's rated capacity. Informational only: no trigger
+    # reads it, so a device that does not report it simply shows nothing.
+    load_pct: Optional[int] = None
     error: Optional[str] = None
     raw: dict = field(default_factory=dict)
     # Which MIB profile produced this state ("" for sources without one, e.g. NUT).

@@ -1,7 +1,9 @@
-"""Optional notifications: generic webhook.
+"""Optional notifications: any number of webhooks.
 
 Notifications are best-effort: a failure to notify must never affect the shutdown
-logic, so every send is wrapped and only logged on error.
+logic, so every send is wrapped and only logged on error. The webhooks are sent
+concurrently and reported one by one, so a target that accepts the connection and then
+goes quiet cannot delay its peers — or the poll loop this runs on.
 
 The payload shape is selectable (see config.WebhookFormat). Every format is one entry in
 FORMATTERS, rendering a notification into keyword arguments for ``httpx.post`` — a new
@@ -12,6 +14,8 @@ Copyright 2026 Florian Finder
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Callable
@@ -28,6 +32,12 @@ _RANK = {db.INFO: 0, db.WARNING: 1, db.CRITICAL: 2}
 
 # Adaptive card colours per severity (Teams renders these as green/amber/red).
 _CARD_COLOR = {db.INFO: "Good", db.WARNING: "Warning", db.CRITICAL: "Attention"}
+
+# The same three states in the notations the other targets want.
+_SLACK_COLOR = {db.INFO: "#2eb886", db.WARNING: "#daa038", db.CRITICAL: "#d40e0d"}
+_DISCORD_COLOR = {db.INFO: 0x2EB886, db.WARNING: 0xDAA038, db.CRITICAL: 0xD40E0D}
+_NTFY_PRIORITY = {db.INFO: "default", db.WARNING: "high", db.CRITICAL: "urgent"}
+_NTFY_TAGS = {db.INFO: "information_source", db.WARNING: "warning", db.CRITICAL: "rotating_light"}
 
 
 def _value(setting) -> str:
@@ -127,16 +137,118 @@ def _render_teams(subject: str, body: str, severity: str, payload: dict) -> dict
     }
 
 
-def _render_text(subject: str, body: str, severity: str, payload: dict) -> dict:
-    """Human-readable short status as text/plain."""
+def _plain_lines(subject: str, body: str, severity: str, payload: dict) -> list[str]:
+    """The plain-text rendering, shared by the text and ntfy formats."""
     lines = [f"[{severity.upper()}] {subject}"]
     if body:
         lines.append(body)
     lines.extend(f"{k}: {v}" for k, v in _facts(payload))
+    return lines
+
+
+def _render_text(subject: str, body: str, severity: str, payload: dict) -> dict:
+    """Human-readable short status as text/plain."""
     return {
-        "content": "\n".join(lines).encode("utf-8"),
+        "content": "\n".join(_plain_lines(subject, body, severity, payload)).encode("utf-8"),
         "headers": {"Content-Type": "text/plain; charset=utf-8"},
     }
+
+
+def _render_slack(subject: str, body: str, severity: str, payload: dict) -> dict:
+    """Slack incoming webhook: an attachment, so the severity shows as a colour bar.
+
+    ``text`` stays filled as the notification/fallback line — Slack uses it for the push
+    notification and for clients that do not render attachments.
+    """
+    fields = [
+        {"title": k, "value": v, "short": False} for k, v in _facts(payload)
+    ]
+    attachment: dict = {"color": _SLACK_COLOR.get(severity, "#6b7890"), "fallback": subject}
+    if fields:
+        attachment["fields"] = fields
+    attachment["title"] = subject
+    if body:
+        attachment["text"] = body
+    return {"json": {"text": f"[{severity.upper()}] {subject}", "attachments": [attachment]}}
+
+
+def _render_discord(subject: str, body: str, severity: str, payload: dict) -> dict:
+    """Discord webhook: an embed with the facts as fields, colour by severity."""
+    embed: dict = {"title": subject[:256], "color": _DISCORD_COLOR.get(severity, 0x6B7890)}
+    if body:
+        embed["description"] = body[:4096]
+    fields = [{"name": k, "value": v, "inline": False} for k, v in _facts(payload)]
+    if fields:
+        embed["fields"] = fields[:25]  # Discord rejects an embed with more than 25 fields
+    return {"json": {"content": f"[{severity.upper()}] {subject}"[:2000], "embeds": [embed]}}
+
+
+def _render_ntfy(subject: str, body: str, severity: str, payload: dict) -> dict:
+    """ntfy: the plain body, with the metadata ntfy expects in headers.
+
+    Title/Priority/Tags are how ntfy renders a message; the body itself is plain text.
+    """
+    lines = _plain_lines(subject, body, severity, payload)[1:]  # subject goes in the Title
+    return {
+        "content": "\n".join(lines).encode("utf-8"),
+        "headers": {
+            "Content-Type": "text/plain; charset=utf-8",
+            # Header values must be latin-1 encodable; ntfy decodes RFC 2047, but keeping
+            # the title ASCII-safe avoids depending on that.
+            "Title": subject.encode("ascii", "replace").decode("ascii"),
+            "Priority": _NTFY_PRIORITY.get(severity, "default"),
+            "Tags": _NTFY_TAGS.get(severity, "bell"),
+        },
+    }
+
+
+def _json_escape(value: str) -> str:
+    """Escape a value for embedding inside a JSON string literal (without the quotes)."""
+    return json.dumps(str(value))[1:-1]
+
+
+def _placeholders(subject: str, body: str, severity: str, payload: dict) -> dict[str, str]:
+    """The substitution table for the ``custom`` format."""
+    facts = _facts(payload)
+    return {
+        "subject": subject,
+        "body": body,
+        "severity": severity,
+        "severity_upper": severity.upper(),
+        "facts": "\n".join(f"{k}: {v}" for k, v in facts),
+        "facts_json": json.dumps(dict(facts)),
+        "status_json": json.dumps(payload, default=str),
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "version": str(payload.get("appliance", {}).get("version") or __version__),
+    }
+
+
+def render_custom(template: str, content_type: str, subject: str, body: str,
+                  severity: str, payload: dict) -> dict:
+    """Substitute {{placeholders}} in a user-supplied body. NOT an expression language.
+
+    Deliberately plain replacement: an actual template engine on the notification path
+    would be new attack surface (SSTI) for no gain — the placeholders below cover the
+    target systems. Values are JSON-escaped when the body is JSON, so a quote in an event
+    text cannot produce a malformed payload.
+    """
+    ctype = content_type or "application/json"
+    is_json = "json" in ctype.lower()
+    values = _placeholders(subject, body, severity, payload)
+    out = template
+    for key, value in values.items():
+        # The pre-rendered JSON blobs are already valid JSON and must not be escaped again.
+        raw = key in ("facts_json", "status_json")
+        replacement = value if (raw or not is_json) else _json_escape(value)
+        out = out.replace("{{" + key + "}}", replacement)
+    return {"content": out.encode("utf-8"), "headers": {"Content-Type": ctype}}
+
+
+def _render_custom(subject: str, body: str, severity: str, payload: dict) -> dict:
+    """Table entry for the custom format; the real work needs the hook's own settings,
+    so send_webhook() calls render_custom() directly. This is the safe fallback when a
+    hook says "custom" but has no template."""
+    return _render_text(subject, body, severity, payload)
 
 
 # The extension point: one entry per selectable format (see config.WebhookFormat).
@@ -144,6 +256,10 @@ FORMATTERS: dict[str, Callable[[str, str, str, dict], dict]] = {
     WebhookFormat.json.value: _render_json,
     WebhookFormat.teams.value: _render_teams,
     WebhookFormat.text.value: _render_text,
+    WebhookFormat.slack.value: _render_slack,
+    WebhookFormat.discord.value: _render_discord,
+    WebhookFormat.ntfy.value: _render_ntfy,
+    WebhookFormat.custom.value: _render_custom,
 }
 
 
@@ -156,9 +272,23 @@ async def send_webhook(
     Deliberately ignores ``enabled`` and ``min_severity``: the filter belongs to the
     event path in :func:`notify`, so the UI's test button can send unconditionally.
     """
-    render = FORMATTERS.get(_value(hook.format), _render_json)
+    fmt = _value(hook.format)
+    if fmt == WebhookFormat.custom.value and (hook.template or "").strip():
+        kwargs = render_custom(
+            hook.template, hook.content_type, subject, body, severity, payload
+        )
+    else:
+        kwargs = FORMATTERS.get(fmt, _render_json)(subject, body, severity, payload)
+
+    # An optional auth header rides along with whatever the formatter produced.
+    name = (hook.auth_header_name or "").strip()
+    if name:
+        value = hook.auth_header_value.get_secret_value()
+        if value:
+            kwargs["headers"] = {**kwargs.get("headers", {}), name: value}
+
     async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(hook.url, **render(subject, body, severity, payload))
+        resp = await client.post(hook.url, **kwargs)
     resp.raise_for_status()
     return f"HTTP {resp.status_code}"
 
@@ -170,15 +300,27 @@ async def notify(
     payload: dict,
     severity: str = db.INFO,
 ) -> None:
-    """Fire the webhook notification, swallowing all errors.
+    """Fire every configured webhook, swallowing all errors.
 
     Everything is inside the guard, filter included: this runs on the engine's poll loop,
-    which must never be brought down by a notification.
+    which must never be brought down by a notification. The sends run concurrently and
+    each is reported on its own, so one target that accepts the connection and then goes
+    quiet cannot hold up the others — or the poll loop behind them.
     """
     try:
-        hook = notifications.webhook
-        if not (hook.enabled and hook.url) or not _passes(hook, severity):
+        hooks = [
+            h
+            for h in (notifications.webhooks or [])
+            if h.enabled and h.url and _passes(h, severity)
+        ]
+        if not hooks:
             return
-        await send_webhook(hook, subject, body, severity, payload)
+        results = await asyncio.gather(
+            *(send_webhook(h, subject, body, severity, payload) for h in hooks),
+            return_exceptions=True,
+        )
+        for hook, result in zip(hooks, results):
+            if isinstance(result, BaseException):
+                log.warning("Webhook '%s' failed: %s", hook.label, result)
     except Exception as exc:  # noqa: BLE001
         log.warning("Webhook notification failed: %s", exc)

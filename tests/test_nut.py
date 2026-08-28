@@ -213,7 +213,7 @@ async def test_probe_lists_every_variable():
     async with FakeUpsd(SCENARIOS["mains"]) as srv:
         result = await nut.probe(_cfg(srv.port))
     assert result.reachable
-    assert result.ok_count == result.total == 5
+    assert result.ok_count == result.total == 6
     assert not result.missing_triggers
     assert {e.status for e in result.entries} == {"ok"}
     status = next(e for e in result.entries if e.name == "ups.status")

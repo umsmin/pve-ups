@@ -83,6 +83,12 @@ curl -fsSL https://github.com/ffind-dev/pve-ups/releases/latest/download/install
   --ctid 950 --ip 10.0.0.50/24 --gateway 10.0.0.1 --hostname pve-usv
 ```
 
+Auf einem **Ceph-Cluster** lehnt der Installer einen Ceph-gestützten rootfs-Storage ab
+(und überspringt ihn bei der automatischen Auswahl): Dieser Container muss weiterlaufen,
+während der Cluster verschwindet, den er herunterfährt — auf Ceph kann er das nicht, denn
+sobald der Pool `min_size` verliert, antwortet seine eigene Platte nicht mehr. Lokalen
+Storage wählen oder mit `--allow-ceph-storage` erzwingen.
+
 PVE-UPS ist außerdem auf [community-scripts.org](https://community-scripts.org/) gelistet
 (dort nach „PVE-UPS" suchen) — einer community-gepflegten Sammlung von
 Proxmox-Helper-Skripten. Der Einzeiler oben bleibt der Referenzweg.
@@ -95,7 +101,9 @@ Danach das Webinterface auf **`http://<container-ip>:8080`** öffnen:
 
 > Der LXC läuft typischerweise auf einem der zu schützenden Hosts. Diesen in der
 > Host-Liste als **„Dieser Host"** markieren — er wird dann garantiert zuletzt
-> heruntergefahren.
+> heruntergefahren. Auf einem Ceph-Cluster stattdessen diesen Container unter
+> *Auslöser → Diese Appliance* auswählen: Die Markierung folgt dann dieser Auswahl, und
+> das clusterweite Herunterfahren der Gäste weiß, welchen Gast es nie stoppen darf.
 
 ## Docker (alternative Bereitstellung)
 
@@ -147,11 +155,19 @@ nutzen unterschiedliche Token-Schemata und Rechtenamen:
 | API-Port | 8006 | 8007 |
 | Recht | `Sys.PowerMgmt` | `Sys.PowerManagement` |
 | Vergeben auf | `/nodes` | `/system/status` |
-| Feld „Node" | der echte Node-Name | freie Bezeichnung (PBS ignoriert es) |
+| Feld „Node" | Bezeichnung; muss zu einem Node-Namen passen | freie Bezeichnung (PBS ignoriert es) |
+| API-URL | eine pro Knoten — sie entscheidet, welche Maschine heruntergefahren wird | eine pro Server |
 
 Der falsch gewählte Typ ist die häufigste Ursache für einen fehlschlagenden Test: ein als
 „Proxmox VE" eingetragener Backup Server weist die Anfrage rundweg ab und meldet
 *„Authentication failed (token invalid?)"* — egal wie gültig das Token ist.
+
+**Jedem Host-Eintrag seine eigene API-URL geben.** Der Shutdown geht an den Knoten hinter
+der eingetragenen URL — sie entscheidet also, welche Maschine heruntergefahren wird, und
+ein bereits ausgeschalteter Knoten kann den Shutdown für die übrigen nicht weiterreichen.
+Der Name unter „Node" wird gegen die API geprüft und beschriftet den Host überall im UI,
+steuert den Shutdown aber nicht mehr. Zwei Einträge mit derselben URL sind die Ausnahme —
+davor warnt PVE-UPS.
 
 ### Proxmox VE
 
@@ -251,8 +267,33 @@ unterscheiden sich von Proxmox VE und erklären die Befehle oben:
 - **Zweisprachige Oberfläche**: Englisch (Standard) und Deutsch, automatisch passend
   zur Browsersprache; eingebautes Benutzerhandbuch (beide Sprachen).
 - **Schwellen-Overrides je USV** zusätzlich zu den globalen Standardwerten.
-- **Webhook-Benachrichtigungen** bei wichtigen Ereignissen — als vollständiges Status-JSON,
-  als **Microsoft-Teams**-Karte oder als Klartext, mit Stufenfilter und Testversand.
+- **Cluster-Vorbereitung für Proxmox VE** (**Beta**, setzt Proxmox VE **9.2+** voraus):
+  einmal je Cluster, bevor dessen erster Knoten heruntergefahren wird, wird der HA-Manager
+  disarmt, damit keine Dienste auf Knoten verschoben werden, die selbst gerade
+  herunterfahren. Überprüft statt angenommen, unter einem harten Zeitlimit, und die
+  Schaltfläche **„Cluster wiederherstellen"** macht es danach rückgängig. Weil diese
+  Vorbereitung clusterweit wirkt, der Shutdown aber hostweise, fährt
+  **„Gesamten Cluster als Einheit herunterfahren"** (standardmäßig an) alle Knoten des
+  Clusters herunter, sobald einer davon fällig ist — sonst bleibt bei einer einzelnen
+  ausfallenden USV ein halbierter Cluster zurück. Als Beta gekennzeichnet, solange
+  Praxiserfahrung gesammelt wird; durchgehend opt-in, Rückmeldungen gern über
+  [Issues](https://github.com/ffind-dev/pve-ups/issues).
+- **Hyperkonvergente Cluster (Ceph)** (**Beta**): Mit eingeschalteter Ceph-Option folgt
+  PVE-UPS der offiziellen Proxmox-Reihenfolge — HA disarmen, dann **alle Gäste des Clusters
+  stoppen**, dann die Wartungsflags (`noout,nobackfill,norecover,norebalance`) setzen. Dass
+  die Gäste zuerst gestoppt werden, macht einen solchen Cluster überhaupt erst
+  überlebensfähig: Knoten für Knoten fällt der Pool unter `min_size`, während noch Gäste
+  laufen, deren IO blockiert und der letzte Knoten nie ausgeht. **Standardmäßig aus** und auf
+  Clustern ohne Ceph vollständig übersprungen. Es braucht drei weitere Rechte, der eigene
+  Gast der Appliance wird aus einer Liste ausgewählt, damit er nie gestoppt wird, und dieser
+  Gast darf nicht auf Ceph-Storage liegen — der Installer lehnt das ab. „Als Einheit" hier
+  an lassen: Ein halb heruntergefahrener hyperkonvergenter Cluster verliert sein
+  Monitor-Quorum und hat dann auch keinen funktionierenden Storage mehr.
+- **Webhook-Benachrichtigungen** bei wichtigen Ereignissen — beliebig viele Ziele, jedes
+  mit eigenem Format (vollständiges Status-JSON, **Microsoft Teams**, **Slack**,
+  **Discord**, **ntfy**, Klartext oder eine **eigene Vorlage** mit Platzhalter-Ersetzung),
+  Stufenfilter, optionalem Authentifizierungs-Header und Testversand. Der Versand läuft
+  parallel; ein nicht erreichbares Ziel kostet den anderen also nicht ihre Meldung.
 - **REST-Status** (`/api/status`, `/api/health`) — lesend, ohne Auth, ohne Secrets;
   Ereignisprotokoll der letzten 48 h inklusive. `/api/health` zählt zusätzlich, wie viele
   Shutdown-Ziele ihren letzten Selbsttest bestanden haben. Ereignis-/Webhook-Texte sind
@@ -274,6 +315,12 @@ unterscheiden sich von Proxmox VE und erklären die Befehle oben:
   tun würde. Ein **Test-Shutdown** simuliert die Abschaltreihenfolge ohne Wirkung.
 - Ein ausgelöster Trigger und der Akkubetrieb-Countdown werden **auf Platte persistiert**
   und überstehen einen Dienst-Neustart.
+- **Von selbst bereit für den nächsten Ausfall:** Ein tatsächlich gesendeter Shutdown bleibt
+  gesperrt, damit eine herunterfahrende Maschine den Befehl nie zweimal bekommt. Die Sperre
+  löst sich, sobald jede USV fünf Minuten lang erreichbar und am Netz war (einstellbar,
+  oder aus zugunsten des Knopfes „Zustand zurücksetzen") — ein Netz, das binnen einer Minute
+  zweimal einbricht, darf dazwischen nicht wieder scharf werden, und eine nicht erreichbare
+  USV gilt nie als zurückgekehrtes Netz.
 - **„Eigener Host zuletzt":** der Host, der die Appliance trägt, fährt immer zuletzt
   herunter.
 - **Ziele blockieren sich nicht gegenseitig:** Hosts mit gleicher Abschaltreihenfolge
@@ -335,10 +382,17 @@ PVE_USV_CONFIG=./dev-config.yaml PVE_USV_DB=./dev-events.db python -m app.main
 
 ## Grenzen / Annahmen
 
-- Hosts werden **einzeln** über ihre jeweils eigene API heruntergefahren. Knoten eines
-  Clusters funktionieren als Ziel (ein datacenter-weites Token deckt alle ab), aber PVE-UPS
-  fasst **HA-Manager und Quorum nicht an** und löst keine Abhängigkeiten zwischen Knoten
-  auf — mögliche spätere Erweiterung.
+- Hosts werden **einzeln** über ihre jeweils eigene API heruntergefahren. Für einen
+  **Proxmox-VE-Cluster** lässt sich der Shutdown vorab einmal je Cluster vorbereiten
+  (HA-Disarm, clusterweites Herunterfahren der Gäste und die Ceph-Wartungsflags, siehe
+  Funktionsliste); darüber hinaus löst PVE-UPS keine Abhängigkeiten zwischen Knoten auf und
+  verwaltet kein Quorum. Die Knoten-Reihenfolge bleibt manuell — ein MON-Knoten, der zuletzt
+  gehen sollte, wird gemeldet, nicht umsortiert —, und die Gäste werden parallel gestoppt,
+  nicht in ihrer `startup`-Reihenfolge. Die Vorbereitung beginnt, sobald der *erste* Knoten
+  eines Clusters fällig ist — genau dafür gibt es „Gesamten Cluster als Einheit
+  herunterfahren": Es hält Shutdown und Vorbereitung bei derselben Menge Maschinen. Diese
+  Vorbereitung ist in 4.0.0 **Beta**: Der Mechanismus überprüft jeden Schritt und wählt im
+  Zweifel die sichere Variante, hat bisher aber wenige echte Cluster gesehen.
 - Shutdown-Ziele sind **Proxmox VE und Proxmox Backup Server**. Proxmox Mail Gateway und
   Datacenter Manager sind nicht umgesetzt: beide sprechen ihr eigenes Token-Schema, und
   ungetesteter Support wäre schlechter als keiner.

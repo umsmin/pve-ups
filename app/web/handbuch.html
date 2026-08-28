@@ -167,7 +167,7 @@
   <header class="topbar">
     <span class="brand">
       <svg class="mark icon-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 5v6c0 5 3.4 8.5 8 11 4.6-2.5 8-6 8-11V5l-8-3z"/></svg>
-      PVE-UPS <span class="sub">Benutzerhandbuch · v3.5.0</span>
+      PVE-UPS <span class="sub">Benutzerhandbuch · v4.0.0</span>
     </span>
     <span class="spacer"></span>
     <a class="btn" href="https://github.com/ffind-dev/pve-ups" target="_blank"
@@ -363,6 +363,27 @@ pveum user token add ups@pve shutdown --privsep 0</code></pre>
         (<code>https://&lt;ip-dieses-knotens&gt;:8006</code>). Die Proxmox-API würde eine
         Anfrage zwar an einen anderen Knoten weiterreichen, aber ein bereits
         heruntergefahrener Knoten kann das für die nachfolgenden nicht mehr tun.</p>
+        <div class="callout warn">
+          <span><b>Jedem Host-Eintrag seine eigene API-URL geben — sie entscheidet, wo der
+          Shutdown landet.</b> PVE-USV spricht den Knoten hinter der eingetragenen URL direkt
+          an (<code>/nodes/localhost/status</code>); heruntergefahren wird also die Maschine,
+          die antwortet. Proxmox behandelt diese Form lokal, statt den Knoten über den
+          Cluster aufzulösen — genau richtig, während Knoten wegbrechen und das Quorum
+          wackelt. Die Folge: Ein vertippter „Node“ kann den Shutdown nicht mehr
+          fehlleiten — zwei Einträge mit derselben URL aber schon, weshalb PVE-USV davor
+          sowohl beim Bearbeiten als auch im Selbsttest warnt.</span>
+        </div>
+        <div class="callout info">
+          <span><b>Geprüft wird „Node“ trotzdem — er beschriftet alles andere.</b> Der Name
+          benennt den Host im Dashboard und in jedem Ereignis; passt er zu keinem Knoten,
+          ist all das irreführend. „Testen“ vergleicht ihn mit der Knotenliste der API,
+          bietet den passenden per Klick zur Übernahme an und füllt ein leeres Feld. Es
+          gelten die Regeln von Proxmox: nur Buchstaben, Ziffern und <code>-</code> — keine
+          Punkte, ein FQDN wie <code>pve01.example.com</code> wird also rundheraus abgelehnt
+          — und Groß-/Kleinschreibung zählt, <code>PVE01</code> ist nicht <code>pve01</code>.
+          Teilen sich Einträge eine API-URL, wandert der Name zurück in den Shutdown-Pfad;
+          eine Abweichung gilt dann als Fehler statt als Warnung.</span>
+        </div>
 
         <h3 id="token-pbs">Proxmox Backup Server</h3>
         <p>Diese Befehle in der Shell des Backup Servers ausführen. Zu beachten: die ACL
@@ -553,6 +574,369 @@ proxmox-backup-manager acl update /system/status Admin --auth-id 'ups@pbs!shutdo
         sicherer.</p>
         <p>Erholt sich eine erforderliche USV (Netz kehrt zurück), wird ein noch nicht
         ausgeführter Shutdown wieder <b>abgebrochen</b> und der Zustand zurückgesetzt.</p>
+        <p>Ein bereits <i>gesendeter</i> Shutdown bleibt dagegen gesperrt — eine Maschine, die
+        gerade herunterfährt, darf nicht ein zweites Mal den Befehl bekommen. Diese Sperre
+        löst sich wieder, sobald <b>jede</b> USV so lange erreichbar und am Netz war, wie
+        unter „Wieder scharf nach Netzrückkehr (min)" eingestellt ist (Vorgabe 5, leer =
+        nie). Erst dann ist die Appliance für den nächsten Ausfall bereit: Solange die Sperre
+        steht, fände ein zweiter Ausfall jeden Host als „bereits ausgelöst" vor, und auch der
+        geplante Selbsttest sowie „Cluster wiederherstellen" bleiben ausgesetzt. Die Wartezeit
+        gibt es, weil zurückgekehrtes Netz nicht dasselbe ist wie bleibendes Netz — ein Netz,
+        das binnen einer Minute zweimal einbricht, darf dazwischen nicht wieder scharf werden.
+        Eine nicht erreichbare USV gilt nie als „Netz ist zurück". Das Wiederherstellen eines
+        vorbereiteten Clusters bleibt so oder so manuell; die Re-Armierung macht diesen Knopf
+        nur wieder verfügbar, und das Ereignis sagt es dazu, wenn ein Cluster noch vorbereitet
+        ist. Der Knopf „Zustand zurücksetzen" tut jederzeit dasselbe sofort.</p>
+
+        <h3 id="cluster">Proxmox-VE-Cluster <span class="pill warn">Beta</span></h3>
+        <div class="callout warn">
+          <span><b>Die Cluster-Vorbereitung setzt Proxmox VE 9.2 oder neuer voraus.</b>
+          Alles in diesem und im nächsten Abschnitt hängt an <code>disarm-ha</code>, das mit
+          9.2 kam. Auf älteren Versionen setzt PVE-UPS nur die Ceph-Wartungsflags und sonst
+          nichts: HA wird nicht disarmt, und deshalb werden auch die Gäste nicht gestoppt.
+          PVE-UPS erkennt das an der API selbst, nie an einer Versionsnummer, sodass auch ein
+          Backport funktioniert.</span>
+        </div>
+        <div class="callout warn">
+          <span><b>Neu in 4.0.0 und bewusst als Beta gekennzeichnet.</b> Der Mechanismus
+          selbst ist zurückhaltend gebaut: Jeder Schritt wird <i>überprüft</i> statt
+          angenommen, der Ablauf steht unter harten Zeitlimits, und die Voreinstellungen sind
+          die sicheren. Wenig Erfahrung gibt es bislang mit der Vielfalt echter Cluster. Ohne
+          Ihren Haken passiert hier nichts. Wenn Sie es einsetzen: Rückmeldungen sind
+          willkommen über
+          <a href="https://github.com/ffind-dev/pve-ups/issues" target="_blank"
+             rel="noopener">GitHub-Issues</a>.</span>
+        </div>
+        <p>Dieser Abschnitt behandelt einen <b>einfachen Proxmox-VE-Cluster</b>. Läuft auf dem
+        Cluster zusätzlich Ceph auf den eigenen Knoten, lesen Sie danach
+        <a href="#cluster-ceph">Hyperkonvergente Cluster (Ceph)</a> — dieser Teil ist ein
+        erheblich größerer Eingriff, mit eigenen Rechten.</p>
+        <p>Auf der Host-Karte im Kasten <i>Proxmox-VE-Cluster</i> „Cluster-Mitglied"
+        ankreuzen. Die Zuordnung erfolgt automatisch über den per API gelesenen
+        Cluster-Namen — ein zweites Token oder ein eigener Konfigurationsabschnitt ist nicht
+        nötig. Weil die Zuordnung automatisch geschieht, spielt es keine Rolle, ob Sie den
+        Haken bei einem Mitglied oder bei allen setzen: Die Vorbereitung läuft trotzdem genau
+        einmal je Cluster, bevor dessen erster Knoten heruntergefahren wird.</p>
+        <p>Auf einem einfachen Cluster erledigt sie das eine, was ein Shutdown je Knoten nicht
+        leisten kann:</p>
+        <ul>
+          <li><b>HA-Disarm</b> — ohne ihn verschiebt der HA-Manager Dienste auf Knoten, die
+          selbst gerade abgeschaltet werden. PVE-UPS disarmt mit
+          <code>resource-mode=ignore</code>; die Gäste verlassen damit die HA-Verwaltung und
+          <code>pve-guests</code> fährt sie in ihrer konfigurierten Reihenfolge herunter. Das
+          ist <i>nicht</i> einstellbar, und zwar bewusst: Unter <code>freeze</code> bleiben
+          die Gäste HA-verwaltet, <code>pve-guests</code> überspringt sie und der disarmte
+          LRM stoppt sie nicht mehr — sie würden vom Poweroff hart beendet.</li>
+        </ul>
+        <p>Der Schritt wird <b>überprüft, nicht angenommen</b>: Der Disarm wird abgefragt, bis
+        der HA-Status tatsächlich <code>disarmed</code> meldet. Er steht unter einem harten
+        Zeitlimit, denn er läuft, während der Akku leerläuft.</p>
+        <p>Dieses Zeitlimit („Zeitlimit HA-Disarm / Ceph-Flags", unter <i>Auslöser</i>) ist
+        <b>die Zeit, die der Disarm tatsächlich bekommt</b> — nicht bloß eine äußere
+        Notbremse: Das Budget wird von Schritt zu Schritt weitergereicht, ein höherer Wert
+        kauft also wirklich mehr Geduld. Die Voreinstellung ist <b>60 s</b>. Der langsame Teil
+        ist der Disarm, denn der HA-Stack arbeitet in Runden von zehn Sekunden und jeder
+        Knoten muss seinen Watchdog freigeben, bevor der Zustand von <code>disarming</code>
+        auf <code>disarmed</code> wechselt. Unter etwa einer halben Minute lässt er sich meist
+        gar nicht bestätigen. Jede Sekunde hier fehlt dem Shutdown, also erhöhen Sie den Wert
+        bewusst — die Knoten dieses Clusters warten darauf. Läuft das Budget ab, nennt das
+        Ereignis den Zustand, bei dem es aufgehört hat („noch beim Disarmen" heißt: mehr Zeit
+        geben; ein Stack, der sich nie bewegt hat, ist ein anderes Problem) und was bereits
+        erledigt war. Ein <i>bereits</i> disarmter Cluster — ein zweiter Ausfall, bevor Sie
+        wiederhergestellt haben — wird in Ruhe gelassen statt erneut disarmt. Im Dry-Run wird
+        nur protokolliert; es wird nichts geändert.</p>
+        <p>Die Vorbereitung <b>sagt, wann sie beginnt</b>, nicht nur, wie sie ausging: Ein
+        Ereignis nennt, was sie vorhat, wie viele Knoten des Clusters ausgelöst haben und wie
+        lange die Knoten darauf warten dürfen. Zwischen dieser Zeile und dem Ergebnis wartet
+        der Shutdown der Cluster-Knoten mit Absicht.</p>
+        <p><b>Schlägt die Vorbereitung fehl, läuft der Shutdown standardmäßig weiter.</b> Das
+        ist die sicherere Einstellung: Ein fehlgeschlagener Disarm lässt den HA-Manager
+        armiert, und ein armierter HA-Manager stoppt die Gäste selbst — unruhiger, aber die
+        Maschinen fahren herunter. Die Gegenoption („Shutdown abbrechen, wenn die
+        Cluster-Vorbereitung fehlschlägt", unter <i>Auslöser</i>) bedeutet, dass eine
+        fehlgeschlagene Vorbereitung den ganzen Cluster laufen lässt, bis der Akku leer
+        ist.</p>
+
+        <h4 id="cluster-unit">Der Cluster fährt als Einheit herunter</h4>
+        <p>Die Vorbereitung wirkt naturgemäß clusterweit — sie disarmt HA für den gesamten
+        Cluster und stoppt mit der Ceph-Option jeden Gast darin. Der Shutdown selbst ist
+        dagegen hostweise: Ein Knoten ist fällig, wenn <i>seine</i> USVs das sagen. Beides muss
+        nicht übereinstimmen, und wenn es das nicht tut, bleibt ein halbierter Cluster
+        zurück.</p>
+        <p>Dafür gibt es <b>„Gesamten Cluster als Einheit herunterfahren"</b> (standardmäßig
+        an): Sobald ein Knoten des Clusters fällig ist, wird jeder Knoten davon
+        heruntergefahren — auch die, deren eigene USV nicht ausgelöst hat. Sie gehen in der
+        üblichen <code>order</code>-Reihenfolge, der Host der Appliance zuletzt, und das
+        Eventlog nennt zu jedem, warum er mitgenommen wurde.</p>
+        <p>Schalten Sie es nur bei einem einfachen Cluster aus, bei dem HA die Gäste eines
+        einzelnen ausfallenden Knotens lieber auf die übrigen verschieben soll; dort ist ein
+        Teil-Shutdown ein gutes Ergebnis. Bei Ceph sollte es an bleiben — was ein halb
+        heruntergefahrener hyperkonvergenter Cluster bedeutet, steht
+        <a href="#cluster-ceph">im nächsten Abschnitt</a>.</p>
+        <div class="callout warn">
+          <span><b>Eine USV, die verstummt, löst nichts aus.</b> Stirbt das Management-Netz
+          einer USV mit dem Ausfall — ein sehr häufiger Aufbau, bei dem der Switch an der
+          ausfallenden USV selbst hängt —, sieht PVE-UPS ein unerreichbares Gerät, keinen
+          Stromausfall, und der Fail-safe verweigert dafür bewusst jeden Shutdown („NO
+          shutdown will be triggered"). Knoten, die nur von dieser USV gespeist werden,
+          bleiben also stehen. Zwei Abhilfen, die sich kombinieren lassen: <i>„Gesamten
+          Cluster als Einheit herunterfahren"</i> an lassen, damit diese Knoten trotzdem mit
+          den übrigen heruntergefahren werden, und unter <i>Auslöser</i> <b>„Shutdown bei
+          reinem Kommunikationsverlust nach (min)"</b> setzen, wenn eine verstummte USV für
+          sich genommen als Ausfall gelten soll. Der Selbsttest warnt, wenn die Knoten eines
+          Clusters an USVs hängen, die unabhängig voneinander auslösen können.</span>
+        </div>
+        <p><b>Jeder Knoten braucht einen eigenen Host-Eintrag mit eigener API-URL.</b> Der
+        Shutdown erreicht den Knoten hinter der jeweiligen API-URL (siehe
+        <a href="#token-pve">Abschnitt 4.1</a>) — ein Knoten ohne Eintrag ist also ein Knoten,
+        den niemand herunterfährt, ganz gleich, was die Namen sagen, und außerdem einer, den
+        die „als Einheit"-Regel nicht mitnehmen kann. Der Selbsttest vergleicht deshalb die
+        Knotennamen des Clusters mit den Host-Einträgen und warnt vor jedem Knoten, den
+        niemand herunterfahren würde, unter Nennung <i>beider</i> Listen. Unterscheidet sich
+        nur Groß-/Kleinschreibung oder ein Domain-Anhang, nennt die Warnung den vermutlich
+        gemeinten Knoten; ein bloß deaktivierter Eintrag wird als deaktiviert gemeldet und
+        nicht als falsch benannt.</p>
+
+        <h4 id="cluster-privs">Rechte für einen einfachen Cluster</h4>
+        <p>Vergeben Sie nur, was Sie eingeschaltet haben: Jeder Haken bringt sein eigenes
+        Recht mit, und ein Haken, den Sie auslassen, kostet Sie nichts. Die Tabelle liest sich
+        kumulativ, von der Grundeinrichtung in <a href="#token">Abschnitt 4</a> abwärts. Der
+        Ceph-Teil hat <a href="#cluster-ceph-privs">eine eigene Tabelle</a>.</p>
+        <table>
+          <thead><tr><th>Angehakt</th><th>Zusätzlich nötig</th><th>ACL-Pfad</th></tr></thead>
+          <tbody>
+            <tr><td>nichts (reiner Shutdown)</td><td><code>Sys.PowerMgmt</code></td><td><code>/nodes</code></td></tr>
+            <tr><td>Cluster-Mitglied</td><td><code>Sys.Audit</code></td><td><code>/</code></td></tr>
+            <tr><td>+ HA-Manager disarmen</td><td><code>Sys.Console</code></td><td><code>/</code></td></tr>
+          </tbody>
+        </table>
+        <p>Die zu Ihren Haken passende Zeile <b>einmal je Datacenter</b> in der Shell eines
+        beliebigen Knotens ausführen. <code>Sys.PowerMgmt</code> steht hier bewusst nicht — es
+        sitzt aus der Grundeinrichtung bereits auf <code>/nodes</code>, und es gibt keinen
+        Grund, es auf das ganze Datacenter auszuweiten:</p>
+<pre><code># Cluster-Mitglied ohne Unteroptionen — nur lesende Statusprüfungen:
+pveum role add UpsCluster -privs "Sys.Audit"
+
+# ... zusätzlich HA-Disarm (gewährt Shell-Zugriff, siehe Warnung unten):
+pveum role add UpsCluster -privs "Sys.Audit Sys.Console"</code></pre>
+        <p>Anschließend die Rolle zuweisen — <b>beide</b> Zeilen, siehe den Hinweis zur
+        Privilege Separation weiter unten:</p>
+<pre><code>pveum acl modify / -user ups@pve -role UpsCluster
+pveum acl modify / -token 'ups@pve!shutdown' -role UpsCluster</code></pre>
+        <p>Der Selbsttest hält sich an dieselbe Regel: Er verlangt ein Recht nur dort, wo die
+        Funktion eingeschaltet ist <i>und</i> dieser Cluster sie überhaupt ausführen kann. Bei
+        einer Version ohne <code>disarm-ha</code> wird nie <code>Sys.Console</code>
+        eingefordert — eine Warnung über ein fehlendes Recht bedeutet also immer etwas, das
+        Sie wirklich brauchen.</p>
+        <p>Die Schaltfläche <b>„Testen"</b> auf der Host-Karte prüft diese Rechte mit, sobald
+        die Cluster-Option angehakt ist: Sie benennt jedes fehlende Recht, meldet den
+        gefundenen Cluster (Name, Knotenanzahl, Ceph und HA-Armierungszustand) und weist
+        darauf hin, wenn der Knoten gar kein Cluster-Mitglied ist. Ein fehlendes Cluster-Recht
+        wird als Warnung gemeldet, nicht als Fehler — die Verbindung selbst funktioniert ja.
+        Zu jedem Namen steht dabei, wofür er gebraucht wird („<code>Sys.Console</code> (HA
+        disarm)"), sodass die Entscheidung über die Vergabe ohne diese Seite fällt. Darunter
+        listet ein <b>Detail-Ausklapper</b> jede Abfrage mit ihrem Ergebnis auf (er öffnet
+        sich von selbst, wenn etwas nicht stimmt), sodass sichtbar wird, was die einzelnen
+        Endpunkte tatsächlich geantwortet haben — statt nur der Zusammenfassungszeile.</p>
+        <div class="callout warn">
+          <span><b><code>Sys.Console</code> gewährt faktisch Shell-Zugriff auf die
+          Knoten.</b> Deshalb ist der HA-Disarm ein eigener Schalter: Wer ihn nicht vergeben
+          möchte, lässt den Schalter aus und nimmt die <code>Sys.Audit</code>-Zeile oben. Zu
+          beachten ist außerdem, dass API-Tokens standardmäßig <b>Privilege Separation</b>
+          aktiv haben und einen eigenen ACL-Eintrag benötigen — die Rechte des Benutzers
+          genügen nicht, weshalb die beiden <code>acl modify</code>-Befehle oben beide
+          erforderlich sind.</span>
+        </div>
+        <div class="callout info">
+          <span>Ein <b>disarmter HA-Stack wird auch dann gemeldet, wenn kein Gast
+          HA-verwaltet ist</b>. Beides ist unabhängig voneinander: Das Disarmen setzt das
+          Fencing clusterweit aus, und dabei bleibt es, bis jemand wieder armiert — deshalb
+          richten sich Selbsttest und „Cluster wiederherstellen" nach dem
+          Armierungszustand, nicht danach, ob HA gerade etwas verwaltet.</span>
+        </div>
+        <div class="callout info">
+          <span>Auf <b>Proxmox VE älter als 9.2</b> gibt es kein <code>disarm-ha</code>.
+          Setzen Sie stattdessen die Datacenter-Option <code>shutdown_policy=freeze</code>;
+          die Voreinstellung <code>conditional</code> verschiebt HA-Dienste auf Knoten, die
+          gerade herunterfahren, und <code>migrate</code> ist noch ungünstiger, weil der LRM
+          den Shutdown dann <i>verzögert</i>, bis alles wegmigriert ist. Der Selbsttest warnt
+          vor beidem.</span>
+        </div>
+        <p><b>Danach bleibt der Cluster vorbereitet.</b> Ein automatisches Wiederarmieren gibt
+        es nicht: HA zurückzuholen, während Knoten noch hochfahren, ist eine
+        Ermessensentscheidung. Der Selbsttest weist weiterhin darauf hin, dass HA disarmt ist
+        (und die Flags gesetzt sind, wo sie es waren), und im Dashboard erscheint die
+        Schaltfläche <b>„Cluster wiederherstellen"</b> — sie armiert HA wieder und löscht die
+        Flags, jeweils überprüft, und erscheint nur, solange es tatsächlich etwas rückgängig
+        zu machen gibt. Da die Appliance zuletzt heruntergefahren wird und mit dem Rest
+        zurückkommt, prüft sie die Cluster <b>einmal beim Start</b> — die Rückstände stehen
+        dadurch sofort im Dashboard statt erst beim nächsten planmäßigen Selbsttest. Während
+        eines laufenden Shutdowns ist die Schaltfläche ausgeblendet, und die API lehnt die
+        Anfrage ab: HA dort wieder zu armieren würde die Vorbereitung genau in dem Moment
+        rückgängig machen, in dem sie ihre Aufgabe erfüllt.</p>
+        <p class="muted">Bei einem einfachen Cluster fasst PVE-USV einzelne Gäste nie an: Beim
+        Poweroff werden sie ohnehin in ihrer konfigurierten Reihenfolge gestoppt — vom LRM,
+        solange HA armiert ist, und von <code>pve-guests</code>, sobald er disarmt ist — und
+        das Problem, das der HA-Disarm löst, ist ausschließlich das <i>Verschieben auf andere
+        Knoten</i> danach. Nur die Ceph-Option ändert das.</p>
+
+        <h3 id="cluster-ceph">Hyperkonvergente Cluster (Ceph) <span class="pill warn">Beta</span></h3>
+        <div class="callout warn">
+          <span><b>Das ist ein erheblich größerer Eingriff als der Abschnitt oben.</b> Mit
+          angehaktem „Ceph-Cluster vorbereiten" stoppt PVE-UPS <b>jede VM und jeden Container
+          des Clusters</b>, bevor der erste Knoten heruntergefahren wird — es wird nicht bloß
+          HA umgestellt. Außerdem braucht es drei weitere Rechte, der eigene Gast dieser
+          Appliance muss ausgewählt sein, damit er verschont wird, und dieser Gast darf nicht
+          auf Ceph-Storage liegen. Lesen Sie diesen Abschnitt, bevor Sie es
+          einschalten.</span>
+        </div>
+        <p>Alles aus <a href="#cluster">dem vorigen Abschnitt</a> gilt zusätzlich; hier kommen
+        zwei Schritte dazu. Die Reihenfolge unten ist die Reihenfolge der Ausführung, und sie
+        ist entscheidend — genau deshalb stehen die Schalter auf der Host-Karte in derselben
+        Reihenfolge:</p>
+        <ol>
+          <li><b>HA-Disarm</b> — muss zuerst kommen, sonst startet der HA-Manager jeden Gast
+          wieder, den Schritt 2 gerade gestoppt hat.</li>
+          <li><b>Alle Gäste werden clusterweit gestoppt</b> — jede VM und jeder Container
+          außer dieser Appliance selbst.</li>
+          <li><b>Ceph-Wartungsflags</b> — <code>noout</code>, <code>nobackfill</code>,
+          <code>norecover</code> und <code>norebalance</code> werden gesetzt, damit Ceph nicht
+          mit der Wiederherstellung beginnt, während die OSDs nacheinander wegfallen.
+          Entspricht <code>ceph osd set noout</code> und den übrigen Befehlen.</li>
+        </ol>
+        <p>Die Schritte 2 und 3 sind <i>eine</i> Option, und sie ist <b>standardmäßig aus</b>:
+        Viele Cluster laufen auf ZFS-Replikation oder gemeinsamem NFS/iSCSI, und dies ist der
+        einzige Teil, der in eine Storage-Ebene schreibt. Auf einem Cluster ohne Ceph wird sie
+        übersprungen, statt versucht und als Fehler gemeldet zu werden, und die zugehörigen
+        Rechte werden nicht gebraucht. Das Stoppen der Gäste hat <i>keinen eigenen
+        Schalter</i> — bei Ceph ist es keine Option, sondern der erste Schritt der offiziellen
+        Prozedur, und ein Haken, dessen Fehlen den Cluster beim Stromausfall hängen lässt,
+        wäre eine Falle.</p>
+        <p>Die Flags werden <b>überprüft, nicht angenommen</b>: Die Sammel-Aktualisierung
+        läuft asynchron (sie liefert nur eine Worker-Kennung), deshalb werden sie
+        zurückgelesen — notfalls einzeln gesetzt.</p>
+        <div class="callout warn">
+          <span><b>Lassen Sie „Gesamten Cluster als Einheit herunterfahren" hier an.</b> Ein
+          teilweise heruntergefahrener hyperkonvergenter Cluster hat keinen sinnvollen
+          Zustand. Ein echtes Beispiel aus einem Vier-Knoten-Cluster: Nur eine USV löste aus,
+          also gingen zwei Knoten herunter, während die beiden anderen weiterliefen. Die
+          Vorbereitung hatte da bereits jeden Gast gestoppt und HA clusterweit disarmt, und
+          zwei der drei Ceph-Monitore lagen auf den wegfallenden Knoten — die Überlebenden
+          standen also ohne Gäste, ohne HA und ohne Storage-Quorum da. Ob Sie einen
+          hyperkonvergenten Cluster ganz oder gar nicht herunterfahren, ist eine echte Wahl;
+          ihn halb herunterzufahren ist keine.</span>
+        </div>
+
+        <h4 id="cluster-guests">Warum die Gäste zuerst stoppen müssen</h4>
+        <p>Das ist der Teil, den ein Shutdown je Knoten falsch macht. Sich selbst überlassen,
+        stoppt jeder Knoten beim Ausschalten seine eigenen Gäste — das klingt sauber und
+        hängt dann. Bei den üblichen <code>size=3/min_size=2</code> ist der Pool nach dem
+        ersten Knoten noch in Ordnung, doch sobald die OSDs des zweiten Knotens weg sind,
+        fällt er unter <code>min_size</code>. Die auf dem verbliebenen Knoten noch laufenden
+        Gäste blockieren nun auf IO: Ihr Shutdown wird nie fertig, dieser Knoten geht also
+        nie aus, und der Akku ist leer, während der Cluster halb unten ist.</p>
+        <p>Proxmox dokumentiert dieselbe Reihenfolge („Shutdown Proxmox VE + Ceph HCI
+        cluster"): erst alle Ceph-Clients stoppen, dann die OSD-Flags setzen, dann die Knoten
+        ausschalten. PVE-UPS folgt ihr. Alle laufenden Gäste werden gleichzeitig zum
+        Herunterfahren aufgefordert — höchstens acht Anfragen zeitgleich, denn vierzig Gäste
+        nacheinander zu fragen kostet je einen Verbindungs-Timeout — und das Ergebnis wird
+        <b>überprüft</b>, indem die Gastliste des Clusters neu gelesen wird; aus der Antwort
+        der API wird es nie geschlossen.</p>
+        <p>Zwei Zeitlimits unter <i>Auslöser</i> steuern das, und sie sind bewusst getrennt:</p>
+        <ul>
+          <li><b>„Zeitlimit Gast-Shutdown"</b> (Vorgabe <b>300 s</b>) — das Budget für das
+          Stoppen der Gäste. Es wächst mit ihrer Zahl und ihrer Abschaltdauer; das Budget für
+          HA/Ceph daneben bemisst sich an HA-Runden von zehn Sekunden und schwankt kaum. Eine
+          Zahl könnte beides nicht leisten, und zusammengelegt würden die Gäste die Zeit des
+          Disarms aufbrauchen.</li>
+          <li><b>„Gäste hart stoppen nach"</b> (Vorgabe <b>120 s</b>) — wann ein Gast, der die
+          Anforderung ignoriert, hart gestoppt wird. Der Wert wird auch als Zeitlimit an den
+          Proxmox-Aufruf selbst übergeben, damit der Abbruch auch dann erfolgt, wenn diese
+          Appliance direkt danach das Netz verliert. Leer lassen heißt: nie erzwingen — ein
+          hängender Gast lässt die Vorbereitung dann fehlschlagen und wird im Eventlog
+          namentlich genannt.</li>
+        </ul>
+        <p>Behalten Sie die Summe im Blick. Zwischen dem Auslösen und der Aufforderung an den
+        letzten Knoten liegen im ungünstigsten Fall das HA/Ceph-Budget plus das Gast-Budget
+        plus das Zeitlimit je Knoten — mit den Vorgaben <b>420 s</b>. Die Einstellungsseite
+        zeigt diese Zahl an, und der Selbsttest warnt, wenn der Auslöser „geschätzte
+        Restlaufzeit unter" später greift, als der Ablauf braucht. Er warnt nur; er verstellt
+        nie selbst einen Auslöser.</p>
+        <p><b>Knoten-Reihenfolge:</b> Proxmox empfiehlt, zuerst die Knoten <i>ohne</i>
+        Ceph-Monitor auszuschalten. PVE-UPS liest die Monmap und weist im Host-Test und im
+        Selbsttest darauf hin, wenn Ihre „Reihenfolge"-Werte dem widersprechen — sortiert sie
+        aber nie selbst um. Ihre Reihenfolge ist ausdrückliche Konfiguration, und sie zur
+        Ausfallzeit still zu überstimmen würde die auf dem Dashboard angezeigte Abfolge zur
+        Lüge machen.</p>
+        <p class="muted">Nicht berücksichtigt: Die Gäste werden parallel gestoppt, nicht in
+        ihrer <code>startup</code>-Reihenfolge — eine Abhängigkeit zwischen einer Anwendung
+        und ihrer Datenbank wird also nicht beachtet. Ziel ist hier, die IO schnell zum
+        Stillstand zu bringen, und der Grund dafür ist der Akku.</p>
+
+        <h4 id="cluster-selfguest">Der eigene Gast dieser Appliance</h4>
+        <p>„Alle Gäste stoppen" darf die Appliance nicht einschließen, die das Stoppen
+        veranlasst. Unter <i>Auslöser</i> → <b>Diese Appliance</b> wählen Sie die VM oder den
+        Container, in dem PVE-UPS läuft, aus der Liste aus. Bewusst eine Liste und kein
+        Eingabefeld: Eine vertippte ID bedeutet, dass sich diese Appliance mitten im
+        Stromausfall <i>selbst</i> abschaltet. Läuft sie tatsächlich woanders — Docker auf
+        einem NAS, Blech, ein anderer Cluster —, wählen Sie „kein Gast dieses Clusters".</p>
+        <p>Die Auswahl bewirkt zweierlei. Sie markiert den einen Gast, der nie gestoppt wird,
+        und sie setzt <b>„Dieser Host"</b> auf der Host-Karte des Knotens, auf dem dieser
+        Gast läuft, damit dieser Knoten zuletzt heruntergefahren wird. Der Haken erscheint
+        dann als aus der Auswahl übernommen, statt doppelt gepflegt zu werden; ohne Auswahl
+        bleibt er ein manueller Schalter wie bei einem Standalone-Host. Wird die Appliance
+        später auf einen anderen Knoten migriert, meldet das der Selbsttest.</p>
+        <p>Solange nichts ausgewählt und „kein Gast dieses Clusters" nicht gesetzt ist,
+        <b>werden die Gäste gar nicht gestoppt</b>. Das Eventlog sagt das deutlich, und der
+        Shutdown läuft ohne diesen Schritt weiter — genau so, wie es frühere Versionen taten.
+        Verweigern ist hier die einzig sichere Antwort: Die Alternative wäre Raten, und ein
+        falscher Tipp schaltet die Maschine ab, die den Shutdown ausführt.</p>
+        <div class="callout warn">
+          <span><b>Dieser Container darf nicht auf Ceph-Storage liegen.</b> Er ist der eine
+          Gast, der den Cluster überleben muss, den er herunterfährt. Auf Ceph tut er das
+          nicht: Sobald die OSDs der abschaltenden Knoten den Pool unter
+          <code>min_size</code> drücken, antwortet seine eigene Platte nicht mehr, und er
+          kann nichts mehr herunterfahren — mitten im Stromausfall. Verwenden Sie
+          <code>local-lvm</code>, <code>local-zfs</code> oder einen Verzeichnis-Storage.
+          <code>install.sh</code> setzt das durch: Ceph-gestützte Storages werden bei der
+          automatischen Auswahl übersprungen und bei ausdrücklicher Angabe über
+          <code>--storage</code> abgelehnt, sofern Sie nicht
+          <code>--allow-ceph-storage</code> mitgeben. Zur Laufzeit weisen Host-Test,
+          Selbsttest und Dashboard darauf hin, falls die Appliance doch auf Ceph liegt.</span>
+        </div>
+
+        <h4 id="cluster-ceph-privs">Rechte für den Ceph-Teil</h4>
+        <p>Zusätzlich zu den <a href="#cluster-privs">Rechten für den einfachen Cluster</a>:</p>
+        <table>
+          <thead><tr><th>Angehakt</th><th>Zusätzlich nötig</th><th>ACL-Pfad</th></tr></thead>
+          <tbody>
+            <tr><td>Ceph-Cluster vorbereiten</td><td><code>Sys.Modify</code>, <code>VM.Audit</code>, <code>VM.PowerMgmt</code></td><td><code>/</code> (die VM-Rechte zählen auch auf <code>/vms</code>)</td></tr>
+            <tr><td>optional, für eine bessere Diagnose</td><td><code>Datastore.Audit</code></td><td><code>/</code> oder <code>/storage</code></td></tr>
+          </tbody>
+        </table>
+<pre><code># Ceph-Teil ohne HA-Disarm:
+pveum role add UpsCluster -privs "Sys.Audit Sys.Modify VM.Audit VM.PowerMgmt"
+
+# Alles, inklusive der optionalen Storage-Prüfung:
+pveum role add UpsCluster -privs "Sys.Audit Sys.Console Sys.Modify VM.Audit VM.PowerMgmt Datastore.Audit"</code></pre>
+        <p>Die Rolle wird mit denselben beiden <code>acl modify</code>-Befehlen wie oben
+        zugewiesen. Bei einem Cluster ohne Ceph werden nie <code>Sys.Modify</code>,
+        <code>VM.Audit</code> oder <code>VM.PowerMgmt</code> eingefordert.
+        <code>Datastore.Audit</code> ist die Ausnahme, die die Regel bestätigt: Es erkauft nur
+        die Prüfung, ob diese Appliance auf Ceph liegt, und sein Fehlen wird deshalb leise
+        erwähnt und nie als fehlendes Recht gemeldet.</p>
+        <div class="callout info">
+          <span><b>Warum <code>VM.Audit</code> wichtiger ist, als es aussieht.</b>
+          <code>/cluster/resources</code> filtert nach Rechten, statt abzulehnen: Ein Token
+          ohne <code>VM.Audit</code> bekommt eine völlig erfolgreiche Antwort mit
+          <i>leerer</i> Gastliste. PVE-UPS liest „leer" deshalb nie als „keine Gäste zu
+          stoppen", solange das Token das Recht nicht nachweislich hat — sonst würde es eine
+          erfolgreiche Vorbereitung melden, während vierzig Gäste weiter auf Ceph
+          schreiben.</span>
+        </div>
+        <p class="muted">„Cluster wiederherstellen" startet die Gäste <b>nicht</b> wieder —
+        sie kommen über ihre <code>onboot</code>-Einstellung zurück, wenn die Knoten
+        hochfahren.</p>
       </section>
 
       <section class="card" id="failsafe">
@@ -588,7 +972,8 @@ proxmox-backup-manager acl update /system/status Admin --auth-id 'ups@pbs!shutdo
             <tr><td>Reiner Kontaktverlust mit aktivem Opt-in</td><td>Shutdown nach Ablauf der Schwelle</td></tr>
             <tr><td>NUT-Server liefert veraltete Daten</td><td>gilt als nicht erreichbar (Alarm), nie als „Netzbetrieb"</td></tr>
             <tr><td>Dry-Run aktiv</td><td>Auslöser wird erkannt + protokolliert, nichts wird heruntergefahren</td></tr>
-            <tr><td>Netz kehrt zurück</td><td>Zustand wird zurückgesetzt</td></tr>
+            <tr><td>Netz kehrt zurück</td><td>Zustand wird zurückgesetzt; ein bereits
+            gesendeter Shutdown nach „Wieder scharf nach Netzrückkehr"</td></tr>
           </tbody>
         </table>
       </section>
@@ -647,8 +1032,10 @@ curl -s http://&lt;container-ip&gt;:8080/api/status \
 
         <h3 id="webhook">Webhook-Benachrichtigungen</h3>
         <p>Optional wird jedes wichtige Ereignis per HTTP-POST an eine URL Ihrer Wahl
-        geschickt (Einstellungen, Abschnitt 4). Zwei Einstellungen bestimmen, <i>was</i> und
-        <i>wann</i> gesendet wird.</p>
+        geschickt (Einstellungen, Abschnitt 4). Es lassen sich <b>beliebig viele Webhooks</b>
+        anlegen — eine Karte je Ziel, jeweils mit eigenem Format, eigenem Schweregrad-Filter
+        und eigener Testschaltfläche. Der Versand läuft parallel und wird einzeln gemeldet;
+        ein nicht erreichbares Ziel kostet den anderen also nicht ihre Benachrichtigung.</p>
         <p><b>Format</b> — Aufbau der Nutzlast, passend zum Zielsystem:</p>
         <table>
           <thead><tr><th>Format</th><th>Sendet</th></tr></thead>
@@ -663,12 +1050,52 @@ curl -s http://&lt;container-ip&gt;:8080/api/status \
             <tr><td>Klartext</td><td>einen kurzen, menschenlesbaren Status als
             <code>text/plain</code> — für alles, was einfach nur eine Textzeile
             anzeigt.</td></tr>
+            <tr><td>Slack</td><td>ein Attachment mit Farbbalken nach Schweregrad und den
+            Fakten als Felder. Die URL stammt aus der „Incoming Webhooks“-Integration einer
+            Slack-App (<code>https://hooks.slack.com/services/…</code>).</td></tr>
+            <tr><td>Discord</td><td>ein Embed mit Titel, Beschreibung und Feldern. Die URL
+            stammt aus Kanal → <i>Bearbeiten</i> → <i>Integrationen</i> →
+            <i>Webhooks</i>.</td></tr>
+            <tr><td>ntfy</td><td>eine Klartext-Push-Nachricht, deren Header
+            <code>Title</code>, <code>Priority</code> und <code>Tags</code> aus dem Ereignis
+            gesetzt werden. Die Topic-URL verwenden
+            (<code>https://ntfy.sh/dein-topic</code>).</td></tr>
+            <tr><td>Eigenes Format (Vorlage)</td><td>ein selbst geschriebener Inhalt samt
+            Content-Type — für ein Ziel, auf das keine der Vorlagen passt. Siehe
+            unten.</td></tr>
           </tbody>
         </table>
         <p>Für <b>Microsoft Teams</b> die URL eines Workflows „Beim Empfang einer
         Webhook-Anforderung in einem Kanal posten" verwenden (Teams → Kanal →
         <i>Workflows</i>); die URL eines klassischen eingehenden Webhooks funktioniert
         ebenso.</p>
+        <p><b>Eigene Vorlagen.</b> Beim Format <i>Eigenes Format</i> geben Sie Inhalt und
+        Content-Type selbst vor. Diese Platzhalter werden ersetzt, alles Übrige wird
+        unverändert gesendet:</p>
+        <table>
+          <thead><tr><th>Platzhalter</th><th>Enthält</th></tr></thead>
+          <tbody>
+            <tr><td><code>{{subject}}</code> / <code>{{body}}</code></td><td>Betreffzeile
+            und Detailtext des Ereignisses</td></tr>
+            <tr><td><code>{{severity}}</code> / <code>{{severity_upper}}</code></td><td>
+            <code>info</code>, <code>warning</code> oder <code>critical</code></td></tr>
+            <tr><td><code>{{facts}}</code> / <code>{{facts_json}}</code></td><td>die kurze
+            USV-/Host-Zusammenfassung, als Textzeilen oder als JSON-Objekt</td></tr>
+            <tr><td><code>{{status_json}}</code></td><td>der komplette
+            <code>/api/status</code>-Schnappschuss als JSON</td></tr>
+            <tr><td><code>{{timestamp}}</code> / <code>{{version}}</code></td><td>Zeitpunkt
+            des Ereignisses (UTC) und Version der Appliance</td></tr>
+          </tbody>
+        </table>
+        <p>Es handelt sich um reine Ersetzung, nicht um eine Ausdruckssprache: keine
+        Schleifen, keine Bedingungen. Enthält der Content-Type <code>json</code>, werden die
+        Werte automatisch JSON-escaped — ein Anführungszeichen im Ereignistext kann also
+        keine kaputte Nutzlast erzeugen.</p>
+        <p><b>Authentifizierungs-Header</b> (optional, je Webhook) — Name und Wert eines
+        zusätzlichen Headers, etwa <code>Authorization: Bearer …</code> für ein geschütztes
+        ntfy-Topic oder ein API-Key-Header. Der Wert gilt als Geheimnis: Er wird nie über die
+        API zurückgegeben und bleibt beim Speichern erhalten, ohne erneut eingegeben zu
+        werden.</p>
         <p><b>Senden ab Stufe</b> — welche Ereignisse überhaupt gesendet werden. Alles
         unterhalb der gewählten Stufe steht weiterhin im Ereignisprotokoll, löst aber keine
         Nachricht aus:</p>
@@ -702,6 +1129,12 @@ curl -s http://&lt;container-ip&gt;:8080/api/status \
         wird das Update typischerweise innerhalb weniger Sekunden eingespielt. Über das
         Webinterface können zudem Konfiguration exportiert/importiert, NTP-Server und
         Zeitzone gesetzt und das Ereignisprotokoll eingesehen/geleert werden.</p>
+        <p>Das Webinterface aktualisiert sich nach einem Update zuverlässig selbst: Die Seite
+        wird nie zwischengespeichert, und jedes geladene Skript bzw. Stylesheet trägt eine
+        Kennung, die sich mit der Datei ändert — der Browser kann also nicht weiter die
+        vorherige Fassung ausliefern. War ein Tab während des Neustarts geöffnet, erscheint
+        oben ein Hinweis mit der Schaltfläche <b>„Neu laden“</b>; bis dahin läuft dort noch
+        die alte Oberfläche.</p>
         <p class="muted">Hinweis: Die Zeitzone (Abschnitt System, z.B. <code>Europe/Berlin</code>)
         sollte gesetzt werden, da der Container sonst in UTC läuft. Die
         <b>Selbsttest-Startzeit</b> gilt in dieser lokalen Zeit; nach dem Setzen der
@@ -721,6 +1154,20 @@ curl -s http://&lt;container-ip&gt;:8080/api/status \
         zuschüttet. Im Akkubetrieb wird der Selbsttest komplett ausgelassen — im Ernstfall
         hat der Countdown Vorrang. Ein Neustart wiederholt einen Selbsttest nicht, der im
         aktuellen Zeitfenster bereits gelaufen ist.</p>
+        <p><b>Das Speichern der Einstellungen löst keinen Selbsttest aus</b> — das ist
+        Absicht, damit das Bearbeiten der Konfiguration nicht die Proxmox-API belastet. Nach
+        dem Ändern eines Tokens oder dem Aktivieren der Cluster-Option führt
+        <b>„Selbsttest jetzt ausführen"</b> im Dashboard die Prüfung sofort aus, statt auf
+        das nächste Zeitfenster zu warten. Das Ergebnis landet dabei immer im
+        Ereignisprotokoll — die Einmal-pro-Tag-Drosselung greift hier nicht —, und im
+        Akkubetrieb wird die Ausführung abgelehnt.</p>
+        <p>Für Hosts, die als <a href="#cluster">Cluster-Mitglied</a> markiert sind, prüft
+        der Selbsttest zusätzlich einmal den Cluster: Token-Rechte, Quorum,
+        Ceph-Wartungsflags, HA-Armierungszustand und die Shutdown-Policy des Datacenters.
+        Ein gesunder Cluster wird als <i>„Cluster &lt;Name&gt;: ok"</i> protokolliert, damit
+        „geprüft und in Ordnung" von „gar nicht geprüft" unterscheidbar ist. Die Kehrseite:
+        <b>ohne gesetzten Cluster-Haken läuft nichts davon</b>, und im Protokoll steht dann
+        nur die schlichte Zeile je Host.</p>
         <p>Das Ergebnis wird zusätzlich <b>je Host</b> festgehalten: die Host-Tabelle im
         Dashboard zeigt die Beanstandung in ihrer Fehlerspalte auch dann, wenn gar nichts
         heruntergefahren wurde, und <a href="#monitoring">/api/health</a> zählt, wie viele
@@ -858,6 +1305,89 @@ systemctl start pve-usv-agent.service</code></pre>
         <p class="muted">Vereinfachte, nutzersichtbare Highlights. Der vollständige technische
         Verlauf steht im <a href="https://github.com/ffind-dev/pve-ups/blob/main/CHANGELOG.md"
         target="_blank" rel="noopener">Changelog des GitHub-Repositories</a>.</p>
+
+        <div class="cl-ver">4.0.0 <span class="date">2026</span></div>
+        <ul>
+          <li><b>Der Installer lehnt Ceph-gestützten Storage für den Container ab.</b>
+          Er muss den Cluster überleben, den er herunterfährt, und auf Ceph kann er das
+          nicht. <code>--allow-ceph-storage</code> setzt sich darüber hinweg.</li>
+          <li><b>Nach dem automatischen Wiederarmieren läuft sofort ein Selbsttest</b>,
+          damit ein während des Ausfalls abgelaufenes Token, ein nicht zurückgekehrter Knoten
+          oder ein noch vorbereiteter Cluster gleich auffällt statt erst beim nächsten
+          geplanten Termin.</li>
+          <li><b>Proxmox-VE-Cluster werden vor dem Shutdown vorbereitet</b>
+          <span class="pill warn">Beta</span>. Wird ein Knoten als Cluster-Mitglied markiert,
+          disarmt PVE-UPS einmal je Cluster den HA-Manager — und stoppt, wenn Sie die
+          Ceph-Option einschalten, zuerst alle Gäste des Clusters und setzt danach die
+          Wartungsflags —, bevor der erste Knoten heruntergefahren wird; jeder Schritt
+          überprüft, alles unter harten Zeitlimits. Dass die Gäste zuerst gestoppt werden,
+          macht einen hyperkonvergenten Cluster überhaupt erst überlebensfähig: Knoten für
+          Knoten fällt der Pool unter <code>min_size</code>, während noch Gäste laufen, deren
+          IO blockiert und der letzte Knoten nie ausgeht. Danach armiert die Schaltfläche
+          <b>„Cluster wiederherstellen"</b> im Dashboard HA wieder und löscht die Flags.
+          Setzt Proxmox VE 9.2 oder neuer voraus; als Beta gekennzeichnet, solange
+          Praxiserfahrung gesammelt wird, und durchgehend opt-in. Siehe
+          <a href="#cluster">Abschnitt 6</a>, der jetzt den einfachen Cluster vom
+          <a href="#cluster-ceph">hyperkonvergenten Fall</a> trennt — beide unterscheiden
+          sich in Tragweite und benötigten Rechten weit mehr, als ein Abschnitt tragen
+          konnte.</li>
+          <li><b>Ein Cluster wird als Einheit heruntergefahren</b> (standardmäßig an). Die
+          Vorbereitung wirkte clusterweit, der Shutdown hostweise — lösten nur einzelne USVs
+          aus, blieb ein halbierter Cluster zurück: Knoten mit gestoppten Gästen, disarmtem
+          HA und, auf einem hyperkonvergenten Cluster, ohne Monitor-Quorum. Jetzt nimmt ein
+          fälliger Knoten den gesamten Cluster mit, in der konfigurierten Reihenfolge. Für
+          einen einfachen Cluster, bei dem HA die Gäste eines einzelnen ausfallenden Knotens
+          übernehmen soll, lässt sich das abschalten. Der Selbsttest warnt außerdem, wenn die
+          Knoten eines Clusters an USVs hängen, die unabhängig voneinander auslösen
+          können.</li>
+          <li><b>„Selbsttest jetzt ausführen" im Dashboard.</b> Das Speichern der
+          Einstellungen löst bewusst keine Prüfung der Anmeldedaten aus, und der nächste
+          geplante Lauf kann Stunden entfernt sein. Die Schaltfläche führt die Host- und
+          Cluster-Prüfungen sofort aus und schreibt das Ergebnis immer ins Eventlog.</li>
+          <li><b>Der Shutdown geht an die Maschine hinter der eingetragenen API-URL</b>
+          (<code>/nodes/localhost/status</code>); ein vertippter „Knoten" kann ihn also
+          nicht mehr fehlleiten — und Proxmox behandelt diese Form ohne Rückfrage beim
+          Cluster, was genau dann zählt, wenn Knoten wegbrechen. Der Knotenname wird
+          weiterhin gegen die API geprüft, denn er beschriftet den Host überall: „Test"
+          bietet den richtigen zum Anklicken an und füllt ein leeres Feld, und ein Name,
+          zu dem kein Knoten passt, wird im Dashboard markiert und vom Selbsttest gemeldet.
+          Im Cluster geht die Prüfung einen Schritt weiter, denn dort ist jeder Mitgliedsname
+          ein Name, den die API kennt: Darf das Token <code>/cluster/status</code> lesen
+          (<code>Sys.Audit</code>, das die Cluster-Optionen ohnehin brauchen), weiß PVE-UPS
+          auch, <i>welches</i> Mitglied hinter dieser API-URL antwortet — ein Name, der zu
+          einem anderen gehört, wird als „anderer Knoten" gemeldet und der richtige zum
+          Anklicken angeboten.
+          Zwei Einträge auf derselben API-URL sind die Ausnahme, in der der Name weiterhin
+          entscheidet, wo der Shutdown landet — davor warnt PVE-UPS von sich aus. Siehe
+          <a href="#token">Abschnitt 4</a>.</li>
+          <li><b>Das Umbenennen eines Hosts verwirft nicht mehr sein API-Token.</b>
+          Host-Einträge wurden bisher über ihren Knotennamen identifiziert — ein Feld, das
+          man bearbeitet —, sodass eine Korrektur als „anderer Host" gelesen wurde: Das
+          gespeicherte Token ging verloren, und der Test meldete „Authentication failed
+          (token invalid?)" für ein völlig gültiges. Zwei Einträge mit demselben Namen
+          teilten sich zudem einen Shutdown-Zustand, wodurch die zweite Maschine
+          weiterlief.</li>
+          <li><b>Mehrere Webhooks statt nur einem</b>, jeder mit eigenem Format, Filter und
+          Test — dazu neue Formate für <b>Slack</b>, <b>Discord</b> und <b>ntfy</b> sowie
+          eine <b>eigene Vorlage</b> für alles Weitere. Ein vorhandener Webhook wird
+          automatisch übernommen. Siehe <a href="#webhook">Abschnitt 9</a>.</li>
+          <li><b>Ein kurzer USV-Aussetzer löst keine Benachrichtigung mehr aus.</b> Ein
+          einzelnes verlorenes SNMP-Paket erzeugte bisher sofort eine Meldung
+          „Verbindung verloren“; der Verlust wird jetzt erst nach der eingestellten Anzahl
+          fehlgeschlagener Polls in Folge gemeldet. Zeitlimit, Wiederholungen und diese
+          Schwelle sind nun alle im Assistenten sichtbar.</li>
+          <li><b>Das Hochladen eines Release-Pakets funktioniert wieder in Safari.</b> Die
+          Dateiauswahl graut das Archiv nicht mehr aus, und eine von Safari beim Download
+          entpackte <code>.tar</code>-Datei wird ebenfalls angenommen. Pakete werden nun
+          zudem vor dem Anwenden geprüft, sodass ein beschädigter Upload mit einer klaren
+          Meldung abgelehnt wird.</li>
+          <li><b>Ein Browser-Tab, der während eines Updates offen war, bietet das Neuladen
+          an</b>, statt die alte Oberfläche gegen das neue Backend laufen zu lassen — und
+          er liefert nach einem Update kein veraltetes <code>app.js</code> mehr aus dem
+          Cache.</li>
+          <li>Die <b>Auslastung der USV</b> wird auf der Statuskarte angezeigt, sofern das
+          Gerät sie meldet.</li>
+        </ul>
 
         <div class="cl-ver">3.5.0 <span class="date">2026</span></div>
         <ul>

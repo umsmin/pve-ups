@@ -78,6 +78,11 @@ curl -fsSL https://github.com/ffind-dev/pve-ups/releases/latest/download/install
   --ctid 950 --ip 10.0.0.50/24 --gateway 10.0.0.1 --hostname pve-usv
 ```
 
+On a **Ceph cluster** the installer refuses a Ceph-backed rootfs storage (and skips one
+when picking automatically): this container has to keep running while the cluster it is
+shutting down goes away, which on Ceph it cannot — once the pool loses `min_size` its own
+disk stops answering. Pick a local storage, or override with `--allow-ceph-storage`.
+
 PVE-UPS is also listed on [community-scripts.org](https://community-scripts.org/) (search
 for "PVE-UPS") — a community-maintained collection of Proxmox helper scripts. The one-liner
 above stays the reference path.
@@ -89,7 +94,9 @@ Then open the web UI at **`http://<container-ip>:8080`**:
 4. When everything checks out: **disable dry-run** (mode "ARMED").
 
 > The LXC typically runs on one of the protected hosts. Mark that host as **"This host"**
-> in the host list — it is then guaranteed to shut down last.
+> in the host list — it is then guaranteed to shut down last. On a Ceph cluster, pick this
+> container under *Triggers → This appliance* instead: the mark then follows that selection,
+> and the cluster-wide guest shutdown knows which guest it must never stop.
 
 ## Docker (alternative deployment)
 
@@ -139,11 +146,18 @@ different token schemes and privilege names:
 | API port | 8006 | 8007 |
 | Privilege | `Sys.PowerMgmt` | `Sys.PowerManagement` |
 | Granted on | `/nodes` | `/system/status` |
-| "Node" field | the real node name | a free label (PBS ignores it) |
+| "Node" field | a label; must match a node name | a free label (PBS ignores it) |
+| API URL | one per node — it decides which machine is shut down | one per server |
 
 Picking the wrong type is the most common cause of a failing test: a Backup Server entered
 as "Proxmox VE" rejects the request outright and reports *"Authentication failed (token
 invalid?)"*, however valid the token is.
+
+**Give every host entry its own API URL.** The shutdown is sent to the node behind the URL
+you entered, so that is what decides which machine goes down — and a node that is already
+powered off cannot forward the shutdown for the ones still to come. The "Node" name is
+checked against the API and labels the host everywhere in the UI, but it no longer steers
+the shutdown. Two entries sharing one URL are the exception, and PVE-UPS warns about it.
 
 ### Proxmox VE
 
@@ -237,8 +251,29 @@ from Proxmox VE and explain the commands above:
 - **Bilingual UI**: English (default) and German, picked automatically from the browser
   language; user manual built in (both languages).
 - Per-UPS **threshold overrides** on top of the global defaults.
-- **Webhook notifications** on notable events, as full status JSON, a **Microsoft Teams**
-  adaptive card or plain text — with a severity filter and a test-send button.
+- **Proxmox VE cluster preparation** (**Beta**, needs Proxmox VE **9.2+**): once per
+  cluster, before its first node goes down, the HA manager is disarmed, so services are not
+  recovered onto nodes that are shutting down themselves. Verified rather than assumed, under
+  a hard timeout, and a **“Restore cluster”** button undoes it afterwards. Because that
+  preparation is cluster-wide while the shutdown is per host, **“shut the whole cluster down
+  as a unit”** (on by default) takes every node of the cluster down as soon as one of them is
+  due — otherwise a single failing UPS leaves the cluster in halves. Marked Beta while it
+  gathers field experience; opt-in throughout, and reports are welcome via
+  [issues](https://github.com/ffind-dev/pve-ups/issues).
+- **Hyper-converged clusters (Ceph)** (**Beta**): with the Ceph option on, PVE-UPS follows
+  the official Proxmox order — disarm HA, then **stop every guest in the cluster**, then set
+  the maintenance flags (`noout,nobackfill,norecover,norebalance`). Stopping the guests first
+  is what makes such a cluster survivable: node by node the pool falls below `min_size` while
+  guests are still running, their IO blocks and the last node never powers off. **Off by
+  default** and skipped entirely on clusters without Ceph. It needs three more privileges,
+  the appliance's own guest is picked from a list so it is never stopped, and that guest must
+  not live on Ceph storage — the installer refuses that. Leave “as a unit” on here: a half
+  shut-down hyper-converged cluster loses its monitor quorum and has no working storage.
+- **Webhook notifications** on notable events — as many targets as you like, each with its
+  own format (full status JSON, **Microsoft Teams**, **Slack**, **Discord**, **ntfy**,
+  plain text, or a **custom template** with placeholder substitution), severity filter,
+  optional authentication header and test-send button. Sends run in parallel, so one
+  unreachable target does not cost the others their notification.
 - **REST status** (`/api/status`, `/api/health`) — read-only, no auth, no secrets;
   event log of the last 48 h included. `/api/health` also counts how many shutdown targets
   passed their last self-test. Event/webhook texts are uniformly English.
@@ -258,6 +293,11 @@ from Proxmox VE and explain the commands above:
   A **test shutdown** simulates the shutdown order without any effect.
 - A confirmed trigger and the on-battery countdown are **persisted to disk** and survive
   a service restart.
+- **Ready for the next outage on its own:** a shutdown that was really sent stays latched,
+  so a machine on its way down is never commanded twice. The latch is released once every
+  UPS has been reachable and on mains for five minutes (configurable, or off for the
+  manual "Reset state" button only) — a grid that dips twice in a minute must not re-arm in
+  between, and an unreachable UPS never counts as mains being back.
 - **"Own host last":** the host carrying the appliance is always shut down last.
 - **Targets cannot block each other:** hosts sharing a shutdown order are commanded at the
   same time, each call has a hard deadline, and the appliance's own host still forms the
@@ -317,10 +357,16 @@ PVE_USV_CONFIG=./dev-config.yaml PVE_USV_DB=./dev-events.db python -m app.main
 
 ## Limits / assumptions
 
-- Hosts are shut down **individually**, each through its own API. Nodes of a cluster work
-  as targets (one datacenter-wide token covers them all), but PVE-UPS does not touch the
-  **HA manager or quorum** and resolves no dependencies between nodes — a possible future
-  extension.
+- Hosts are shut down **individually**, each through its own API. For a **Proxmox VE
+  cluster** the shutdown can be prepared once per cluster beforehand (HA disarm, the
+  cluster-wide guest shutdown and the Ceph maintenance flags, see the feature list); beyond
+  that PVE-UPS does not resolve dependencies between nodes and does not manage quorum. Node
+  order stays manual — a MON node that should go last is reported, never re-sorted — and the
+  guests are stopped in parallel rather than in their `startup` order. The preparation starts
+  as soon as the *first* node of a cluster is due, which is why “shut the whole cluster down
+  as a unit” exists: it is what keeps the shutdown and the preparation talking about the same
+  set of machines. That preparation is **Beta** in 4.0.0: the mechanism verifies every step
+  and defaults to the safe choices, but it has seen few real clusters so far.
 - Shutdown targets are **Proxmox VE and Proxmox Backup Server**. Proxmox Mail Gateway and
   Datacenter Manager are not implemented: each speaks its own token scheme, and shipping
   untested support would be worse than none.

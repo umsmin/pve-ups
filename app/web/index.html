@@ -19,6 +19,7 @@
     <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
     <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
     <symbol id="i-reset" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.5 15a9 9 0 1 0 2.1-9.4L1 10"/></symbol>
+    <symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></symbol>
     <symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
     <symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></symbol>
     <symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
@@ -58,6 +59,10 @@
   </header>
 
   <main>
+    <!-- Shown when /api/status reports a version other than the one this page loaded
+         with (i.e. the service restarted into an update while the tab stayed open). -->
+    <div id="reloadNote" class="banner info" hidden></div>
+
     <!-- LOGIN -->
     <section id="login" class="card center" hidden>
       <span class="brand"><svg class="mark icon-lg"><use href="#i-shield"></use></svg> PVE-UPS</span>
@@ -146,7 +151,14 @@
           <button id="resetBtn" class="btn-ghost"
             title="Clears the internal trigger/alarm state after a test or alarm." data-i18n-title="dash.resetTitle">
             <svg class="icon"><use href="#i-reset"></use></svg> <span data-i18n="dash.reset">Reset state</span></button>
+          <button id="selftestBtn" class="btn-ghost"
+            title="Runs the credential and cluster checks now instead of waiting for the next scheduled slot." data-i18n-title="dash.selftestTitle">
+            <svg class="icon"><use href="#i-shield"></use></svg> <span data-i18n="dash.selftest">Run self-test now</span></button>
+          <button id="restoreClusterBtn" class="btn-warn" hidden
+            title="Arms the HA manager again and clears the Ceph maintenance flags." data-i18n-title="dash.restoreClusterTitle">
+            <svg class="icon"><use href="#i-shield"></use></svg> <span data-i18n="dash.restoreCluster">Restore cluster</span></button>
         </div>
+        <p class="help" id="clusterStateHelp" hidden></p>
         <p class="help" data-i18n-html="dash.actionsHelp">
           <b>Test shutdown:</b> simulates the shutdown order without effect.
           <b>Reset state:</b> clears a test/alarm latch.
@@ -215,7 +227,50 @@
           <label title="Polling interval while on battery." data-i18n-title="th.pollBatteryTitle"><span data-i18n="th.pollBattery">Poll interval battery (s)</span> <input id="th_poll_interval_battery_s" type="number" /></label>
           <label title="Maximum time to wait for the Proxmox API per host." data-i18n-title="th.hostTimeoutTitle"><span data-i18n="th.hostTimeout">Host shutdown timeout (s)</span> <input id="th_host_shutdown_timeout_s" type="number" /></label>
         </div>
+        <div class="row">
+          <label title="How many polls in a row must fail before the UPS is reported as unreachable. Short dropouts stay silent." data-i18n-title="th.unreachablePollsTitle"><span data-i18n="th.unreachablePolls">Report unreachable after (polls)</span> <input id="th_unreachable_alarm_after_polls" type="number" min="1" /></label>
+          <label title="How long mains have to be back before the appliance is ready for the next outage. Empty = only the “Reset state” button." data-i18n-title="th.rearmTitle"><span data-i18n="th.rearm">Re-arm after mains back (min)</span> <input id="th_rearm_after_mains_min" type="number" min="0" /></label>
+        </div>
+        <p class="help" id="th_unreachable_hint"></p>
         <hr/>
+        <div id="clusterThresholds" hidden>
+          <span class="cfg-label" data-i18n="th.clusterGroup">Cluster preparation</span>
+          <span class="chip beta" data-i18n="common.beta">Beta</span>
+          <div class="row">
+            <label title="How long the HA disarm and the Ceph flags may take, per cluster." data-i18n-title="th.clusterTimeoutTitle"><span data-i18n="th.clusterTimeout">HA disarm / Ceph flags timeout (s)</span> <input id="th_cluster_prep_timeout_s" type="number" min="5" /></label>
+            <label title="How long the cluster-wide guest shutdown may take, per cluster. Its own budget, because it scales with the number of guests while the one on the left does not." data-i18n-title="th.clusterGuestTimeoutTitle"><span data-i18n="th.clusterGuestTimeout">Guest shutdown timeout (s)</span> <input id="th_cluster_guest_shutdown_timeout_s" type="number" min="10" /></label>
+            <label title="After how many seconds a guest that ignores the shutdown is stopped hard. Empty = never force, a hung guest then fails the preparation." data-i18n-title="th.clusterGuestForceTitle"><span data-i18n="th.clusterGuestForce">Force-stop guests after (s)</span> <input id="th_cluster_guest_force_after_s" type="number" min="10" placeholder="never" data-i18n-placeholder="th.clusterGuestForcePh" /></label>
+          </div>
+          <p class="help" id="th_cluster_total_hint"></p>
+          <label class="switch" title="Abort the shutdown when the cluster preparation fails." data-i18n-title="th.clusterAbortTitle">
+            <input type="checkbox" id="th_cluster_abort_on_prep_failure" />
+            <span data-i18n="th.clusterAbort">Abort the shutdown if the cluster preparation fails</span></label>
+          <!-- Which guest the appliance itself runs in. Only shown with the Ceph option
+               on, because that is the only path that stops guests cluster-wide. Picked
+               from a list and never typed: a wrong vmid means this appliance stops
+               ITSELF in the middle of an outage. -->
+          <div id="applianceBox" hidden>
+            <span class="cfg-label" data-i18n="appl.box">This appliance</span>
+            <div class="row">
+              <label title="The VM or container this appliance itself runs in. It is the one guest that is never stopped." data-i18n-title="appl.pickTitle"><span data-i18n="appl.pick">Runs as guest</span> <select id="ap_self_pick"></select></label>
+              <button type="button" class="btn-ghost btn-sm" id="ap_reload" data-i18n="appl.reload">Load list</button>
+            </div>
+            <p class="help" id="ap_self_state"></p>
+            <p class="help" data-i18n="appl.help">The node this guest runs on is shut down last; the “this host” mark on that host card follows this selection automatically.</p>
+            <p class="warnnote">
+              <svg class="icon"><use href="#i-alert"></use></svg>
+              <span data-i18n-html="appl.cephWarn">This container must <b>not</b> live on Ceph storage. Once the OSDs of the nodes going down
+              drop the pool below <code>min_size</code>, its own disk stops answering and it can no longer shut anything
+              down — halfway through the outage. Use a local storage (local-lvm, local-zfs).</span></p>
+          </div>
+          <p class="warnnote">
+            <svg class="icon"><use href="#i-alert"></use></svg>
+            <span data-i18n-html="th.clusterAbortWarn">Off by default, and that is the safer setting: if the preparation fails, the
+            HA manager stays <b>armed</b> and stops the guests itself — noisier, but the machines still come down.
+            Switching this on means a failed preparation leaves the whole cluster running until the battery is
+            empty and the power simply goes.</span></p>
+          <hr/>
+        </div>
         <label class="switch"
           title="Keep the running on-battery countdown when SNMP drops during an outage." data-i18n-title="th.keepShutdownTitle">
           <input type="checkbox" id="th_keep_shutdown_on_comm_loss" />
@@ -234,28 +289,10 @@
         <details>
           <summary><span class="section-num">4</span> <span data-i18n="notif.title">Notifications</span> <span class="muted" data-i18n="notif.optional">(optional)</span>
             <a class="doclink" href="/manual.html#webhook" data-manual="webhook" target="_blank" rel="noopener" title="Read in the manual: Webhook notifications" data-i18n-title="notif.doc"><svg class="icon"><use href="#i-help"></use></svg></a></summary>
-          <label class="switch" title="Send an HTTP POST to a URL on every notable event." data-i18n-title="notif.webhookTitle"><input type="checkbox" id="webhook_enabled" /><span data-i18n="notif.webhook">Webhook</span></label>
-          <label title="Target URL for the webhook." data-i18n-title="notif.urlTitle"><span data-i18n="notif.url">URL</span> <input id="webhook_url" placeholder="https://..." /></label>
-          <div class="row">
-            <label title="Shape of the payload that is sent to the URL." data-i18n-title="notif.formatTitle"><span data-i18n="notif.format">Format</span>
-              <select id="webhook_format">
-                <option value="json" data-i18n="whfmt.json">JSON (full status)</option>
-                <option value="teams" data-i18n="whfmt.teams">Microsoft Teams (adaptive card)</option>
-                <option value="text" data-i18n="whfmt.text">Plain text</option>
-              </select></label>
-            <label title="Which events are sent at all." data-i18n-title="notif.minSeverityTitle"><span data-i18n="notif.minSeverity">Send from level</span>
-              <select id="webhook_min_severity">
-                <option value="info" data-i18n="whlvl.info">All events (including info)</option>
-                <option value="warning" data-i18n="whlvl.warning">Warnings and critical (default)</option>
-                <option value="critical" data-i18n="whlvl.critical">Critical only</option>
-              </select></label>
-          </div>
-          <p class="help" id="webhook_help"></p>
-          <div class="row" style="margin:0;align-items:center">
-            <button id="testWebhookBtn" class="btn-ghost btn-sm" style="flex:0 0 auto"
-              title="Sends a sample notification with the settings entered here — no need to save first." data-i18n-title="notif.testTitle"
-              data-i18n="notif.test">Send test notification</button>
-            <span class="muted" id="webhookMsg"></span>
+          <p class="help" data-i18n="notif.help">Every notable event is POSTed to each enabled webhook. Add one target per chat or monitoring system — a failing target never affects the shutdown.</p>
+          <div id="webhookList"></div>
+          <div class="row" style="margin-top:12px;align-items:center">
+            <button id="addWebhookBtn" class="btn-ghost btn-sm" style="flex:0 0 auto" data-i18n="notif.addWebhook">+ Webhook</button>
           </div>
         </details>
       </div>
@@ -303,12 +340,16 @@
           (SNMP community, API token). Store it safely!</span></p>
       </div>
 
-      <div class="card">
+      <div class="card" id="updCard">
         <div class="card-h"><h3><svg class="icon"><use href="#i-upload"></use></svg> <span data-i18n="upd.title">Update</span></h3>
           <a class="doclink" href="/manual.html#updates" data-manual="updates" target="_blank" rel="noopener" title="Read in the manual: Updates &amp; operation" data-i18n-title="sys.doc"><svg class="icon"><use href="#i-help"></use></svg></a></div>
         <p class="help"><span data-i18n="upd.current">Current version:</span> <b id="upd_version">–</b>.
           <span data-i18n="upd.helpRest">Upload a release package (.tar.gz/.zip); the system applies it and restarts the service.</span></p>
-        <input type="file" id="updateFile" accept=".tar.gz,.tgz,.zip" hidden />
+        <!-- Both extensions AND MIME types: Safari maps extensions to UTIs and does not
+             recognise the compound ".tar.gz", which greys the file out in the picker.
+             ".tar" is listed because Safari unpacks the archive on download. -->
+        <input type="file" id="updateFile" hidden
+          accept=".tar.gz,.tgz,.tar,.gz,.zip,application/gzip,application/x-gzip,application/x-tar,application/zip" />
         <div class="row" id="updBtnRow" style="margin:0;align-items:center">
           <button id="updateBtn" class="btn-warn" style="flex:0 0 auto"><svg class="icon"><use href="#i-upload"></use></svg> <span data-i18n="upd.upload">Upload update package …</span></button>
           <span class="muted" id="updateMsg"></span>

@@ -98,17 +98,20 @@ import os, shutil, sys, tarfile, tempfile, zipfile
 
 pkg, app_dir = sys.argv[1], sys.argv[2]
 tmp = tempfile.mkdtemp()
-if pkg.endswith(".zip"):
+# Detect by CONTENT, not by file name: Safari unpacks .tar.gz on download, so a valid
+# release asset can arrive as a plain .tar. tarfile.open() handles gzip and plain alike.
+if zipfile.is_zipfile(pkg):
     with zipfile.ZipFile(pkg) as z:
         z.extractall(tmp)
-elif pkg.endswith((".tar.gz", ".tgz")):
-    with tarfile.open(pkg) as t:
-        try:
-            t.extractall(tmp, filter="data")  # blocks ../ paths/devices (Python >= 3.12)
-        except TypeError:  # older Python without the filter argument
-            t.extractall(tmp)
 else:
-    sys.exit("Unknown format")
+    try:
+        with tarfile.open(pkg) as t:
+            try:
+                t.extractall(tmp, filter="data")  # blocks ../ paths/devices (Python >= 3.12)
+            except TypeError:  # older Python without the filter argument
+                t.extractall(tmp)
+    except tarfile.TarError as exc:
+        sys.exit("Not a readable zip/tar archive: %s" % exc)
 
 src = None
 for root, _dirs, files in os.walk(tmp):

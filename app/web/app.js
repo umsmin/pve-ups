@@ -57,6 +57,9 @@ function show(view) {
 // --- bootstrap --------------------------------------------------------------
 let pollTimer = null;
 let deployment = "lxc";  // "lxc" (default) or "docker" - set from /api/session in boot()
+// Version this page was loaded with. A different one in /api/status means the service
+// restarted into an update underneath us, so this app.js no longer matches the backend.
+let bootVersion = null;
 
 async function boot() {
   const s = await api("/api/session");
@@ -203,16 +206,34 @@ function upsCardHtml(u) {
       <div class="gauge"><div class="gauge-fill${gcls}" style="width:${gw}"></div></div>
     </div>
     <div class="stat"><span>${esc(t("ups.runtime"))}</span><b>${fmt(u.runtime_remaining_min, " min")}</b></div>
+    ${u.load_pct === null || u.load_pct === undefined ? ""
+      : `<div class="stat" title="${esc(t("ups.loadTitle"))}"><span>${esc(t("ups.load"))}</span><b>${u.load_pct} %</b></div>`}
     <div class="stat"><span>${esc(t("ups.battery"))}</span><b>${esc(u.battery_status)}</b></div>
     ${cd}${clr}${trig}
     <div class="stat"><span>${esc(t("ups.lastPoll"))}</span><b>${u.last_poll ? new Date(u.last_poll).toLocaleTimeString() : "–"}</b></div>
   </div>`;
 }
 
+// An update restarts the service while open tabs keep running the old app.js against
+// the new backend. Ask for a reload instead of letting the mismatch play out silently;
+// the reload is enough because "/" is never cached and the assets carry fresh stamps.
+function checkAppVersion(version) {
+  if (!version) return;
+  if (bootVersion === null) { bootVersion = version; return; }
+  const el = $("reloadNote");
+  if (!el || version === bootVersion || !el.hidden) return;  // build the note once
+  el.innerHTML = svgIcon("i-info") + "<span>" + esc(t("reload.newVersion", { v: version })) +
+    "</span> <button class=\"btn-ghost btn-sm\" id=\"reloadBtn\"></button>";
+  $("reloadBtn").textContent = t("reload.btn");
+  $("reloadBtn").onclick = () => location.reload();
+  el.hidden = false;
+}
+
 async function refreshStatus() {
   let s;
   try { s = await api("/api/status"); } catch (_) { return; }
   $("version").textContent = "v" + s.appliance.version;
+  checkAppVersion(s.appliance.version);
 
   const a = s.appliance, sd = s.shutdown, upses = s.ups || [];
 
@@ -227,6 +248,7 @@ async function refreshStatus() {
   $("d_reason").textContent = sd.reason || "–";
   $("d_countdown").textContent = fmt(sd.countdown_remaining_s, " s");
   $("d_uptime").textContent = fmtUptime(a.uptime_s);
+  renderClusters(s.clusters, sd.triggered);
 
   // banner + header status chip (aggregate across all UPS)
   const anyBattery = upses.some((u) => u.power_source === "battery");
@@ -264,6 +286,8 @@ async function refreshStatus() {
   nav.className = "statuschip " + chip.cls;
   $("navStatusText").textContent = chip.text;
 
+  rememberClusterNames(s.hosts);
+
   const rows = s.hosts.map((h) => {
     const st = h.shutdown_state;
     const cls = st === "sent" ? "ok" : st === "failed" ? "crit" : h.eligible ? "warn" : "muted";
@@ -274,10 +298,20 @@ async function refreshStatus() {
     const star = h.this_host
       ? ` <span class='chip star' title="${esc(t("hosts.thisChipTitle"))}">${esc(t("hosts.thisChip"))}</span>` : "";
     const kind = ` <span class='chip muted'>${esc(hostTypeLabel(h.type))}</span>`;
+    // Same reasoning as the ★: membership decides whether this node gets a cluster-wide
+    // preparation before it goes down, so it belongs next to the name.
+    const clus = h.cluster
+      ? ` <span class='chip muted' title="${esc(t("hosts.clusterChipTitle"))}">${esc(h.cluster_name || t("host.sumCluster"))}</span>` : "";
+    // A node name the API does not know. It no longer misdirects the shutdown (that goes
+    // to the machine behind the API URL), but it labels this host in every event and on
+    // this very row — and with its own API URL the self-test counts the entry as fine, so
+    // without this chip the mismatch would live in the event log alone.
+    const nodeBad = ["wrong", "invalid", "proxied"].includes(h.node_state)
+      ? ` <span class='chip warn' title="${esc(t("nodest.chipTitle"))}">${esc(t("nodest." + h.node_state))}</span>` : "";
     // A credential that broke long before any outage would otherwise stay invisible:
     // show the self-test complaint whenever there is no fresher shutdown error.
     const err = h.last_error || h.last_test_error || "";
-    return `<tr><td>${esc(h.name)}${kind}${star}</td>
+    return `<tr><td>${esc(h.name)}${kind}${clus}${nodeBad}${star}</td>
       <td>${feeds} <span class="muted">(${esc(policy)})</span></td>
       <td>${pill(stLbl, cls)}</td><td class="muted">${esc(err)}</td></tr>`;
   }).join("");
@@ -315,6 +349,99 @@ $("resetBtn").onclick = async () => {
   catch (e) { $("actionMsg").textContent = e.message; }
   refreshStatus();
 };
+const _apReload = document.getElementById("ap_reload");
+if (_apReload) _apReload.onclick = loadApplianceGuests;
+const _apPick = document.getElementById("ap_self_pick");
+if (_apPick) _apPick.onchange = onApplianceChange;
+["th_cluster_prep_timeout_s", "th_cluster_guest_shutdown_timeout_s",
+ "th_host_shutdown_timeout_s"].forEach((id) => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener("input", updateClusterBudgetHint);
+});
+
+$("selftestBtn").onclick = async () => {
+  $("actionMsg").textContent = t("msg.selftesting");
+  try {
+    const r = await api("/api/selftest/run", "POST");
+    $("actionMsg").textContent = (r.ok ? "✓ " : "✗ ") + r.message;
+  } catch (e) { $("actionMsg").textContent = "✗ " + e.message; }
+  refreshStatus();
+  refreshEvents();
+};
+
+$("restoreClusterBtn").onclick = async () => {
+  if (!confirm(t("confirm.restoreCluster"))) return;
+  $("actionMsg").textContent = t("msg.restoringCluster");
+  try {
+    const r = await api("/api/cluster/restore", "POST");
+    $("actionMsg").textContent = (r.ok ? "✓ " : "✗ ") + r.message;
+  } catch (e) { $("actionMsg").textContent = "✗ " + e.message; }
+  refreshStatus();
+  refreshEvents();
+};
+
+// Cluster name per host, keyed by the host id (HostConfig.key on the backend). It is
+// discovered from the API, not configured, so the settings cards can only learn it from a
+// status refresh — hence this cache and the redraw below. Keyed on the id rather than the
+// node name so that correcting a name does not orphan the entry.
+const CLUSTER_NAMES = {};
+
+function rememberClusterNames(hosts) {
+  let changed = false;
+  (hosts || []).forEach((h) => {
+    if (!h.cluster_name || !h.id) return;
+    if (CLUSTER_NAMES[h.id] !== h.cluster_name) {
+      CLUSTER_NAMES[h.id] = h.cluster_name;
+      changed = true;
+    }
+  });
+  // Only on a real change: the summary is rewritten on every keystroke otherwise.
+  if (changed) {
+    document.querySelectorAll("#hostRows .host-cfg").forEach((el) => {
+      if (el._updSum) el._updSum();
+    });
+  }
+}
+
+// The button only appears while there is actually something to undo — an armed cluster
+// with clean flags needs no action, and offering one would invite pointless clicks.
+// It is also hidden during a shutdown: needs_recovery turns true the moment the
+// preparation lands, and undoing it there would arm HA while the nodes are powering off.
+// The API refuses that too; this only keeps the button from inviting the attempt.
+function renderClusters(clusters, shuttingDown) {
+  const btn = $("restoreClusterBtn");
+  const help = $("clusterStateHelp");
+  if (!btn || !help) return;
+  const list = clusters || [];
+  const stale = list.filter((c) => c.needs_recovery);
+  btn.hidden = stale.length === 0 || !!shuttingDown;
+  if (!list.length) { help.hidden = true; return; }
+  help.hidden = false;
+  help.innerHTML = list.map((c) => {
+    const bits = [];
+    if (!c.quorate) bits.push(t("cluster.noQuorum"));
+    if (c.ceph_flags_set && c.ceph_flags_set.length) {
+      bits.push(t("cluster.cephFlags", { flags: c.ceph_flags_set.join(", ") }));
+    }
+    if (c.ha_armed_state && c.ha_armed_state !== "armed") {
+      bits.push(t("cluster.haDisarmed", { state: c.ha_armed_state }));
+    }
+    // Two deployment mistakes that only bite during an outage, so they belong where the
+    // operator actually looks. Only shown once a Ceph cluster is configured for it —
+    // elsewhere no guests are stopped and neither question arises.
+    if (c.ceph_configured) {
+      if (c.self_guest_on_ceph === true) bits.push(t("cluster.selfOnCeph"));
+      else if (c.self_guest_vmid == null) bits.push(t("cluster.selfUnknown"));
+    }
+    const state = bits.length ? bits.join(" · ") : t("cluster.ok");
+    const guests = c.guests_readable
+      ? " · " + t("cluster.guests", { running: c.guests_running, total: c.guests_total })
+      : "";
+    return `<b>${esc(c.name)}</b> (${c.nodes_online}/${(c.nodes || []).length} `
+      + `${esc(t("cluster.nodes"))}${esc(guests)}): ${esc(state)}`;
+  }).join("<br>");
+}
+
 $("clearLogBtn").onclick = async () => {
   if (!confirm(t("confirm.clearLog"))) return;
   try { await api("/api/events", "DELETE"); } catch (e) { $("actionMsg").textContent = e.message; }
@@ -343,6 +470,9 @@ const DEFAULT_PORTS = { snmp: 161, nut: 3493 };
 const HOST_TYPES = [["pve", t("htype.pve")], ["pbs", t("htype.pbs")]];
 const HOST_DEFAULT_PORTS = { pve: 8006, pbs: 8007 };
 const TRISTATE = [["", t("tristate.global")], ["on", t("tristate.on")], ["off", t("tristate.off")]];
+// Order and values mirror config.WebhookFormat / WebhookLevel (tests/test_i18n.py checks it).
+const WEBHOOK_FORMATS = [["json", t("whfmt.json")], ["teams", t("whfmt.teams")], ["text", t("whfmt.text")], ["slack", t("whfmt.slack")], ["discord", t("whfmt.discord")], ["ntfy", t("whfmt.ntfy")], ["custom", t("whfmt.custom")]];
+const WEBHOOK_LEVELS = [["info", t("whlvl.info")], ["warning", t("whlvl.warning")], ["critical", t("whlvl.critical")]];
 const opts = (list, val) => list.map(([v, l]) => `<option value="${v}" ${v === val ? "selected" : ""}>${l}</option>`).join("");
 const triVal = (v) => v === true ? "on" : v === false ? "off" : "";
 
@@ -415,6 +545,11 @@ function addUpsCard(u, open) {
       </div>
       <p class="muted" style="margin:.15rem 0 0">${esc(t("cfg.nutHint"))}</p>
     </div>
+    <div class="row u_tuning">
+      <label title="${esc(t("cfg.timeoutTitle"))}">${esc(t("cfg.timeout"))} <input class="u_timeout" type="number" step="0.5" min="0.5" value="${u.timeout_s ?? 3}" /></label>
+      <label class="u_retries_wrap" title="${esc(t("cfg.retriesTitle"))}">${esc(t("cfg.retries"))} <input class="u_retries" type="number" min="0" value="${u.retries ?? 1}" /></label>
+    </div>
+    <p class="help u_tuning_help">${esc(t("cfg.tuningHelp"))}</p>
     <details class="u_over">
       <summary>${esc(t("cfg.overrideSummary"))} <span class="muted">${esc(t("cfg.overrideGlobal"))}</span></summary>
       <div class="row">
@@ -446,6 +581,8 @@ function addUpsCard(u, open) {
     const ty = div.querySelector(".u_type").value;
     div.querySelector(".u_snmp").hidden = ty !== "snmp";
     div.querySelector(".u_nut").hidden = ty !== "nut";
+    // Retries are an SNMP notion; the NUT client talks TCP and has a timeout only.
+    div.querySelector(".u_retries_wrap").hidden = ty !== "snmp";
     updSum();
   };
   const updSum = () => {
@@ -487,6 +624,7 @@ function upsFromCard(div) {
     type,
     host: q(".u_host").value.trim(),
     port: Number(q(".u_port").value || DEFAULT_PORTS[type]),
+    timeout_s: Number(q(".u_timeout").value || 3),
     overrides: {
       on_battery_seconds: numOr(".o_obs"),
       runtime_below_minutes: numOr(".o_rbm"),
@@ -508,6 +646,7 @@ function upsFromCard(div) {
   return Object.assign(base, {
     version: q(".u_version").value,
     mib: q(".u_mib").value,
+    retries: Number(q(".u_retries").value || 0),
     community: comm === "" ? SECRET_PLACEHOLDER : comm,
     v3_user: q(".u_v3_user").value,
     v3_auth_proto: q(".u_v3_auth_proto").value,
@@ -566,6 +705,129 @@ async function testUps(div) {
   } catch (e) { msg.textContent = "✗ " + e.message; wrap.hidden = true; }
 }
 
+// "3 polls" says nothing on its own — spell out what it means in seconds at the current
+// mains interval, since this value alone decides when a connection loss is notified.
+function updateUnreachableHint() {
+  const el = $("th_unreachable_hint");
+  if (!el) return;
+  const polls = Number(($("th_unreachable_alarm_after_polls") || {}).value || 0);
+  const every = Number(($("th_poll_interval_normal_s") || {}).value || 0);
+  el.textContent = polls > 0 && every > 0
+    ? t("th.unreachableHint", { polls, every, total: polls * every })
+    : "";
+}
+
+// The cluster thresholds only mean anything once a host is marked as a cluster member —
+// showing them otherwise would suggest the appliance does something it does not.
+function syncClusterThresholds() {
+  const block = $("clusterThresholds");
+  if (!block) return;
+  block.hidden = !document.querySelector("#hostRows .h_cluster:checked");
+  const box = $("applianceBox");
+  // Only the Ceph path stops guests, and only then does it matter which guest we are.
+  if (box) box.hidden = !document.querySelector("#hostRows .h_cluster_ceph:checked");
+}
+
+// --- the appliance's own guest ----------------------------------------------
+// Picked from a list, never typed: a wrong vmid means the appliance shuts ITSELF down in
+// the middle of an outage. applianceGuests holds the last list the API returned.
+let applianceGuests = [];
+// What the config actually holds. The list needs a reachable cluster, so the settings
+// page routinely opens without one — and then the node behind the stored vmid is only
+// known from here. Without this fallback, opening settings and pressing Save would write
+// an empty self_node back and silently unpick the node that has to shut down last.
+let applianceStored = { vmid: null, node: "", external: false };
+
+function applianceChoice() {
+  const sel = $("ap_self_pick");
+  if (!sel) return { ...applianceStored };
+  if (sel.value === "external") return { vmid: null, node: "", external: true };
+  if (!sel.value) return { vmid: null, node: "", external: false };
+  const vmid = Number(sel.value);
+  const g = applianceGuests.find((x) => x.vmid === vmid);
+  const node = g ? g.node : (applianceStored.vmid === vmid ? applianceStored.node : "");
+  return { vmid, node, external: false };
+}
+
+// The node carrying the appliance is exactly the one that has to be shut down last, so
+// the "this host" tick is derived from the pick rather than maintained twice. Without a
+// pick (standalone PVE, PBS, Docker, bare metal) it stays a manual switch.
+function syncThisHostFromAppliance(el) {
+  const chk = el.querySelector(".h_this");
+  const note = el.querySelector(".h_thisderived");
+  const { node, external } = applianceChoice();
+  if (!node || external) {
+    chk.disabled = false;
+    note.hidden = true;
+    return;
+  }
+  const mine = el.querySelector(".h_name").value.trim() === node;
+  chk.checked = mine;
+  chk.disabled = true;
+  note.hidden = !mine;
+}
+
+function renderApplianceGuests(sel, guests, chosen) {
+  applianceGuests = guests || [];
+  sel.innerHTML = "";
+  const add = (value, label) => {
+    const o = document.createElement("option");
+    o.value = value;
+    o.textContent = label;
+    sel.appendChild(o);
+  };
+  add("", t("appl.pickNone"));
+  applianceGuests.forEach((g) =>
+    add(String(g.vmid), `${g.vmid} — ${g.name || "?"} (${g.type === "lxc" ? "CT" : "VM"}, ${g.node})`));
+  add("external", t("appl.pickExternal"));
+  // A previously stored vmid that is no longer in the list must NOT silently fall back to
+  // "none": that reads as "nothing configured" when the truth is "the selection is gone".
+  if (chosen.external) sel.value = "external";
+  else if (chosen.vmid != null) {
+    if (!applianceGuests.some((g) => g.vmid === chosen.vmid))
+      add(String(chosen.vmid), t("appl.pickMissing", { vmid: chosen.vmid }));
+    sel.value = String(chosen.vmid);
+  } else sel.value = "";
+}
+
+async function loadApplianceGuests() {
+  const state = $("ap_self_state");
+  const row = document.querySelector("#hostRows .h_cluster_ceph:checked")?.closest(".host-cfg");
+  if (!row) { state.textContent = t("appl.needHost"); return; }
+  state.textContent = t("appl.loading");
+  try {
+    const r = await api("/api/cluster/guests", "POST", hostFromRow(row));
+    if (!r.ok) { state.textContent = r.message || t("appl.failed"); return; }
+    renderApplianceGuests($("ap_self_pick"), r.guests, applianceChoice());
+    const det = r.detected || {};
+    state.textContent = det.label
+      ? t("appl.detected", { guest: det.label })
+      : r.message;
+    onApplianceChange();
+  } catch (e) {
+    state.textContent = String(e.message || e);
+  }
+}
+
+function onApplianceChange() {
+  document.querySelectorAll("#hostRows .host-cfg").forEach((el) => {
+    syncThisHostFromAppliance(el);
+    if (el._updSum) el._updSum();
+  });
+  renderShutdownSequence();
+}
+
+// The whole sequence now holds the battery for the disarm, the guests and the nodes.
+// Shown as one number because that is what has to fit inside the trigger.
+function updateClusterBudgetHint() {
+  const el = $("th_cluster_total_hint");
+  if (!el) return;
+  const prep = getNum("th_cluster_prep_timeout_s") || 60;
+  const guests = getNum("th_cluster_guest_shutdown_timeout_s") || 300;
+  const nodes = getNum("th_host_shutdown_timeout_s") || 60;
+  el.textContent = t("th.clusterTotalHint", { total: prep + guests + nodes });
+}
+
 async function loadConfig() {
   currentConfig = await api("/api/config");
   const c = currentConfig;
@@ -583,8 +845,25 @@ async function loadConfig() {
   setVal("th_poll_interval_normal_s", t.poll_interval_normal_s);
   setVal("th_poll_interval_battery_s", t.poll_interval_battery_s);
   setVal("th_host_shutdown_timeout_s", t.host_shutdown_timeout_s);
+  setVal("th_unreachable_alarm_after_polls", t.unreachable_alarm_after_polls);
   setVal("th_comm_loss_shutdown_after_min", t.comm_loss_shutdown_after_min);
+  setVal("th_rearm_after_mains_min", t.rearm_after_mains_min);
   setChk("th_keep_shutdown_on_comm_loss", t.keep_shutdown_on_comm_loss);
+  setVal("th_cluster_prep_timeout_s", t.cluster_prep_timeout_s);
+  setChk("th_cluster_abort_on_prep_failure", t.cluster_abort_on_prep_failure);
+  setVal("th_cluster_guest_shutdown_timeout_s", t.cluster_guest_shutdown_timeout_s);
+  setVal("th_cluster_guest_force_after_s", t.cluster_guest_force_after_s);
+  const ap = c.appliance || {};
+  applianceStored = { vmid: ap.self_vmid ?? null, node: ap.self_node || "",
+                      external: !!ap.self_external };
+  // Rendered from the stored value alone: the list needs a reachable cluster, and a
+  // settings page that cannot open without one would be worse than a single entry saying
+  // what is currently selected. "Reload" fetches the rest.
+  renderApplianceGuests($("ap_self_pick"), applianceGuests, applianceStored);
+  updateUnreachableHint();
+  updateClusterBudgetHint();
+  syncClusterThresholds();
+  onApplianceChange();
 
   setVal("ntp_server", c.ntp_server);
   setVal("tz_timezone", c.timezone);
@@ -592,11 +871,7 @@ async function loadConfig() {
   setVal("selftest_hour", c.selftest_hour);
   setVal("selftest_interval_min", c.selftest_interval_min);
 
-  const wh = c.notifications.webhook;
-  setChk("webhook_enabled", wh.enabled); setVal("webhook_url", wh.url);
-  setVal("webhook_format", wh.format || "json");
-  setVal("webhook_min_severity", wh.min_severity || "warning");
-  showWebhookHelp();
+  renderWebhooks(c.notifications.webhooks || []);
 
   drawConfigTopology();
   refreshUpdateStatus();
@@ -618,8 +893,13 @@ function addHostRow(h, isNew, open) {
   // Remember the desired feeds so renderHostUpsCheckboxes() can preselect them.
   el.dataset.feeds = h.ups_ids ? JSON.stringify(h.ups_ids) : (isNew ? "ALL" : "[]");
   const type = h.type || "pve";
+  // Stable identity: what the backend matches the stored token secret on, and what the
+  // engine latches a shutdown against. A new card gets one here so it survives the first
+  // save; an existing one keeps whatever the backend assigned.
+  const hostId = h.id || nextHostId();
   el.innerHTML = `
     <summary class="cfg-head">${svgIcon("i-server")}<span class="cfg-title h_sum_name"></span><span class="cfg-sub h_sum_meta"></span></summary>
+    <input type="hidden" class="h_id" value="${esc(hostId)}" />
     <div class="row">
       <label title="${esc(t("host.typeTitle"))}">${esc(t("host.type"))} <select class="h_type">${opts(HOST_TYPES, type)}</select></label>
       <label class="h_namelbl" title=""><span class="h_namecap"></span> <input class="h_name" value="${esc(h.name || "")}" /></label>
@@ -629,6 +909,7 @@ function addHostRow(h, isNew, open) {
       <label title="${esc(t("host.tokenIdTitle"))}">${esc(t("host.tokenId"))} <input class="h_token_id" value="${esc(h.token_id || "")}" /></label>
       <label title="${esc(t("host.tokenSecretTitle"))}">${esc(t("host.tokenSecret"))} <input class="h_token_secret" type="password" placeholder="${esc(secretSet ? t("cfg.unchanged") : t("host.tokenSecretPh"))}" /></label>
     </div>
+    <p class="warnnote h_dupurl" hidden>${esc(t("host.dupUrl"))}</p>
     <p class="help h_hint"><span class="h_hinttext"></span> <a class="h_hintdoc" data-manual="token-pve" target="_blank" rel="noopener"></a></p>
     <div class="feedsblock" title="${esc(t("host.feedsTitle"))}">
       <span class="cfg-label">${esc(t("host.feeds"))}</span>
@@ -639,13 +920,61 @@ function addHostRow(h, isNew, open) {
       <label class="h_orderlbl" title="${esc(t("host.orderTitle"))}">${esc(t("host.order"))} <input class="h_order" type="number" value="${h.order || 0}" /></label>
       <label class="chkline" title="${esc(t("host.verifyTitle"))}"><input class="h_verify" type="checkbox" ${h.verify_tls ? "checked" : ""} /> ${esc(t("host.verify"))}</label>
       <label class="chkline h_thislbl" title="${esc(t("host.thisTitle"))}"><input class="h_this" type="checkbox" ${h.this_host ? "checked" : ""} /> ${esc(t("host.this"))}</label>
+      <span class="help h_thisderived" hidden>${esc(t("host.thisHostDerived"))}</span>
       <label class="chkline" title="${esc(t("host.enabledTitle"))}"><input class="h_enabled" type="checkbox" ${h.enabled !== false ? "checked" : ""} /> ${esc(t("host.enabled"))}</label>
+    </div>
+    <!-- The cluster switches as one set-apart group, never a collapsible one:
+         hiding the master switch behind a fold made the whole feature hard to find, while
+         leaving it loose among the other per-host flags gave its sub-options nothing
+         to belong to. The group is always visible (on PVE); only the sub-options follow
+         the tick.
+         The two sub-switches are listed in the order the steps actually run — HA disarm
+         first, then the Ceph part — because that order is load-bearing (disarming after
+         the guests would let the HA manager restart them) and a list that contradicts it
+         teaches the wrong mental model. -->
+    <div class="clusterbox">
+      <span class="cfg-label">${esc(t("host.clusterBox"))} <span class="chip beta">${esc(t("common.beta"))}</span></span>
+      <label class="chkline h_clusterlbl" title="${esc(t("host.clusterTitle"))}"><input class="h_cluster" type="checkbox" ${h.cluster ? "checked" : ""} /> ${esc(t("host.cluster"))}</label>
+      <div class="h_clusteropts">
+        <p class="warnnote"><svg class="icon"><use href="#i-alert"></use></svg>
+          <span>${esc(t("host.clusterNeeds92"))}</span></p>
+        <!-- Defaults to ON (see PveHostConfig.cluster_shutdown_all), hence "!== false".
+             It keeps the shutdown in step with the preparation, which is cluster-wide
+             either way — see the comment on the config field. -->
+        <label class="chkline" title="${esc(t("host.clusterShutdownAllTitle"))}"><input class="h_cluster_shutdown_all" type="checkbox" ${h.cluster_shutdown_all !== false ? "checked" : ""} /> ${esc(t("host.clusterShutdownAll"))}</label>
+        <p class="help h_unitnote">${esc(t("host.clusterShutdownAllHelp"))}</p>
+        <p class="warnnote h_unitwarn" hidden><svg class="icon"><use href="#i-alert"></use></svg>
+          <span>${esc(t("host.clusterShutdownAllWarn"))}</span></p>
+        <label class="chkline" title="${esc(t("host.clusterHaTitle"))}"><input class="h_cluster_ha_disarm" type="checkbox" ${h.cluster_ha_disarm !== false ? "checked" : ""} /> ${esc(t("host.clusterHa"))}</label>
+        <p class="help">${esc(t("host.clusterPrivHint"))}
+          <a data-manual="cluster" target="_blank" rel="noopener">${esc(t("host.clusterPrivDoc"))}</a></p>
+        <p class="help">${esc(t("host.clusterHelp"))}</p>
+        <!-- The Ceph part is set apart because it is a different order of magnitude: it
+             stops every guest in the cluster, not just HA. The manuals split at exactly
+             this line too (#cluster vs #cluster-ceph). -->
+        <hr class="clustersep"/>
+        <span class="cfg-label">${esc(t("host.clusterCephGroup"))}</span>
+        <!-- Ceph defaults to OFF (see PveHostConfig.cluster_ceph), so plain truthiness —
+             "!== false" would tick it on every newly added card. This one switch covers
+             the whole hyper-converged procedure: stopping every guest first, then the
+             flags. The guest stop deliberately has no tick of its own — with Ceph it is
+             not optional, and a tick whose absence hangs the cluster is a trap. -->
+        <label class="chkline" title="${esc(t("host.clusterCephTitle"))}"><input class="h_cluster_ceph" type="checkbox" ${h.cluster_ceph ? "checked" : ""} /> ${esc(t("host.clusterCeph"))}</label>
+        <p class="help h_cephnote">${esc(t("host.clusterCephHelp"))}
+          <a data-manual="cluster-ceph" target="_blank" rel="noopener">${esc(t("host.clusterCephDoc"))}</a></p>
+        <p class="help">${esc(t("host.clusterBetaNote"))}
+          <a href="https://github.com/ffind-dev/pve-ups/issues" target="_blank" rel="noopener">${esc(t("host.clusterBetaLink"))}</a></p>
+      </div>
     </div>
     <div class="row" style="margin:0;align-items:center">
       <button class="btn-ghost btn-sm h_test" style="flex:0 0 auto">${esc(t("host.test"))}</button>
       <button class="btn-ghost btn-sm h_del" style="flex:0 0 auto">${esc(t("host.remove"))}</button>
       <span class="muted h_msg"></span>
-    </div>`;
+    </div>
+    <details class="help h_diagwrap" hidden style="margin-top:.5rem">
+      <summary>${esc(t("cprobe.diag"))}</summary>
+      <pre class="h_diag" style="white-space:pre-wrap;overflow:auto;max-height:16rem;font-family:monospace;font-size:.85em"></pre>
+    </details>`;
   el.querySelector(".h_policy").value = h.ups_policy || "all";
   const updSum = () => {
     const nm = el.querySelector(".h_name").value.trim() || t("host.newName");
@@ -653,9 +982,19 @@ function addHostRow(h, isNew, open) {
     const en = el.querySelector(".h_enabled").checked;
     const ty = el.querySelector(".h_type").value;
     el.querySelector(".h_sum_name").textContent = nm + (isThis ? " ★" : "");
+    // Cluster membership belongs on the collapsed card for the same reason the ★ does:
+    // it changes what happens at shutdown and should not need unfolding to be seen. The
+    // discovered name is used when the engine has one, the plain word until then.
+    const inCluster = ty !== "pbs" && el.querySelector(".h_cluster").checked;
+    const cname = inCluster ? (CLUSTER_NAMES[el.querySelector(".h_id").value] || "") : "";
     el.querySelector(".h_sum_meta").textContent =
-      "· " + hostTypeLabel(ty) + (en ? "" : " " + t("host.inactive"));
+      "· " + hostTypeLabel(ty)
+      + (inCluster ? " · " + (cname || t("host.sumCluster")) : "")
+      + (en ? "" : " " + t("host.inactive"));
   };
+  // Kept on the element so a later status refresh can redraw every summary: the cluster
+  // name arrives from the API, not from the form.
+  el._updSum = updSum;
   // Everything that reads differently per product: the name field is a real node name on
   // PVE but only a label on PBS, and each has its own port, token realm and manual anchor.
   const toggleHostType = () => {
@@ -690,16 +1029,44 @@ function addHostRow(h, isNew, open) {
     // host is last whatever it says. Hide the field rather than let it suggest an
     // effect it does not have. The value is kept, so unticking restores it.
     el.querySelector(".h_orderlbl").hidden = el.querySelector(".h_this").checked;
+    // A Backup Server is never part of a PVE cluster, so the whole group is PVE-only.
+    // Unlike "this host" the values are NOT cleared: switching a card back to PVE should
+    // find the cluster settings as they were.
+    el.querySelector(".clusterbox").hidden = pbs;
+    // The sub-switches only mean anything once the host is marked as a cluster member.
+    el.querySelector(".h_clusteropts").hidden = !el.querySelector(".h_cluster").checked;
+    // The Ceph note describes what the tick does; showing it while the tick is off would
+    // read as a description of the cluster rather than of the option.
+    const ceph = el.querySelector(".h_cluster_ceph").checked;
+    el.querySelector(".h_cephnote").hidden = !ceph;
+    // Only a problem when the two halves can disagree: the preparation is cluster-wide,
+    // so a partial shutdown is what leaves nodes stranded. Worth shouting about with
+    // Ceph, where it also means every guest was stopped for nothing.
+    el.querySelector(".h_unitwarn").hidden =
+      el.querySelector(".h_cluster_shutdown_all").checked || !ceph;
+    syncThisHostFromAppliance(el);
     updSum();
   };
-  el.querySelector(".h_del").onclick = () => { el.remove(); drawConfigTopology(); };
+  el.querySelector(".h_del").onclick = () => {
+    el.remove();
+    drawConfigTopology();
+    syncDuplicateUrls();
+  };
   el.querySelector(".h_test").onclick = () => testHost(el);
   el.querySelector(".h_name").oninput = () => { updSum(); drawConfigTopology(); };
+  el.querySelector(".h_url").oninput = syncDuplicateUrls;
   el.querySelector(".h_this").onchange = () => { syncFlags(); drawConfigTopology(); };
+  el.querySelector(".h_cluster").onchange = () => { syncFlags(); syncClusterThresholds(); };
+  el.querySelector(".h_cluster_ceph").onchange = syncFlags;
+  el.querySelector(".h_cluster_shutdown_all").onchange = syncFlags;
   // Order and "active" do not touch the diagram, but they do change the shutdown
   // sequence shown below it.
   el.querySelector(".h_order").oninput = renderShutdownSequence;
-  el.querySelector(".h_enabled").onchange = () => { updSum(); drawConfigTopology(); };
+  el.querySelector(".h_enabled").onchange = () => {
+    updSum();
+    drawConfigTopology();
+    syncDuplicateUrls();
+  };
   el.querySelector(".h_type").onchange = () => {
     // Carry the URL over to the new type's default port, unless the user typed their own.
     const ty = el.querySelector(".h_type").value;
@@ -709,11 +1076,33 @@ function addHostRow(h, isNew, open) {
       known.includes(port) ? ":" + HOST_DEFAULT_PORTS[ty] : m);
     toggleHostType();
     drawConfigTopology();
+    syncDuplicateUrls();
   };
   $("hostRows").appendChild(el);
   toggleHostType();
+  syncDuplicateUrls();
 }
 $("addHostBtn").onclick = () => { addHostRow({}, true, true); renderHostUpsCheckboxes(); drawConfigTopology(); };
+
+// Two enabled entries behind one API URL are almost always a copy-paste slip (row
+// duplicated, IP not adjusted) — and the one case where the shutdown still has to be
+// addressed by the configured node name, because PVE's proxying is then the only thing
+// telling the entries apart. Flagged while editing, and again by the self-test for configs
+// that arrive by backup import and never pass through this form.
+function syncDuplicateUrls() {
+  const rows = Array.from(document.querySelectorAll("#hostRows .host-cfg"));
+  const count = {};
+  rows.forEach((tr) => {
+    if (!tr.querySelector(".h_enabled").checked) return;
+    const url = tr.querySelector(".h_url").value.trim().replace(/\/+$/, "").toLowerCase();
+    if (url) count[url] = (count[url] || 0) + 1;
+  });
+  rows.forEach((tr) => {
+    const url = tr.querySelector(".h_url").value.trim().replace(/\/+$/, "").toLowerCase();
+    const dupe = tr.querySelector(".h_enabled").checked && count[url] > 1;
+    tr.querySelector(".h_dupurl").hidden = !dupe;
+  });
+}
 
 // (Re)build the per-host UPS feed checkboxes from the current UPS list, preserving selection.
 function renderHostUpsCheckboxes() {
@@ -737,9 +1126,20 @@ function renderHostUpsCheckboxes() {
   });
 }
 
+let hostSeq = 0;
+
+function nextHostId() {
+  const taken = new Set(Array.from(document.querySelectorAll("#hostRows .h_id"))
+    .map((el) => el.value));
+  let n = ++hostSeq;
+  while (taken.has("host" + n)) n = ++hostSeq;
+  return "host" + n;
+}
+
 function hostFromRow(tr) {
   const secret = tr.querySelector(".h_token_secret").value;
   return {
+    id: tr.querySelector(".h_id").value,
     name: tr.querySelector(".h_name").value.trim(),
     type: tr.querySelector(".h_type").value,
     api_url: tr.querySelector(".h_url").value.trim(),
@@ -752,16 +1152,94 @@ function hostFromRow(tr) {
     enabled: tr.querySelector(".h_enabled").checked,
     ups_ids: Array.from(tr.querySelectorAll(".h_feed")).filter((c) => c.checked).map((c) => c.value),
     ups_policy: tr.querySelector(".h_policy").value,
+    // Cluster preparation. Sent for PBS entries too (as plain false/defaults): the
+    // backend drops unknown fields per type, and omitting them here would silently
+    // revert the setting on every save.
+    cluster: tr.querySelector(".h_cluster").checked,
+    cluster_shutdown_all: tr.querySelector(".h_cluster_shutdown_all").checked,
+    cluster_ceph: tr.querySelector(".h_cluster_ceph").checked,
+    cluster_ha_disarm: tr.querySelector(".h_cluster_ha_disarm").checked,
   };
+}
+
+// Mirror of renderProbe() for the cluster endpoints: one line per call, so a failing
+// cluster check shows WHAT answered what instead of only a summary sentence.
+function renderClusterProbe(c) {
+  const lines = (c.entries || []).map((e) => {
+    const st = t("cprobe.st." + e.status, { err: e.error || "" });
+    // 30 fits the longest path (/cluster/ha/status/current is 27) plus a gap.
+    return e.name.padEnd(30) + st + (e.value ? " = " + e.value : "");
+  });
+  const head = [];
+  if (c.missing_privileges && c.missing_privileges.length) {
+    head.push(t("cprobe.missingPrivs", { list: c.missing_privileges.join(", ") }));
+  }
+  return head.concat(lines).join("\n");
+}
+
+// The node name is the one field nothing else validates — it goes verbatim into
+// /nodes/<name>/status, so a wrong one passes every check and fails during the outage.
+// An empty field is filled in (nothing is lost), a filled-in one only ever gets an offer:
+// silently rewriting a name the user typed could shut down a different machine.
+function applyNodeCheck(el, msg, n) {
+  if (!n || !n.readable || n.match || !n.suggestion) return;
+  const input = el.querySelector(".h_name");
+  const take = () => {
+    input.value = n.suggestion;
+    updSum();
+    drawConfigTopology();
+  };
+  if (!input.value.trim()) {
+    take();
+    msg.append(" " + t("host.nodeFilled", { node: n.suggestion }));
+    return;
+  }
+  const link = document.createElement("a");
+  link.href = "#";
+  link.textContent = t("host.nodeSuggest", { node: n.suggestion });
+  link.onclick = (ev) => { ev.preventDefault(); take(); link.remove(); };
+  msg.append(" ");
+  msg.append(link);
+}
+
+// The verdict itself, as the chip the dashboard already uses. The sentence is in the
+// test message, but a wrong node name reads like just another clause there — and it is
+// the one setting that fails only during a real outage.
+function applyNodeState(msg, state) {
+  if (!["wrong", "invalid", "proxied"].includes(state)) return;
+  const chip = document.createElement("span");
+  chip.className = "chip warn";
+  chip.title = t("nodest.chipTitle");
+  chip.textContent = t("nodest." + state);
+  msg.append(" ");
+  msg.append(chip);
 }
 
 async function testHost(el) {
   const msg = el.querySelector(".h_msg");
+  const wrap = el.querySelector(".h_diagwrap");
+  const pre = el.querySelector(".h_diag");
   msg.textContent = t("msg.testing");
+  wrap.hidden = true;
   try {
     const r = await api("/api/test/host", "POST", hostFromRow(el));
     msg.textContent = (r.ok ? "✓ " : "✗ ") + r.message;
-  } catch (e) { msg.textContent = "✗ " + e.message; }
+    applyNodeState(msg, r.node_state);
+    applyNodeCheck(el, msg, r.node_check);
+    const c = r.cluster;
+    if (c && (c.entries || []).length) {
+      // Unfold on its own exactly when there is something to look at.
+      const trouble = !r.ok || !c.reachable || !c.is_cluster || c.ha_disarmed
+        || (c.missing_privileges || []).length > 0
+        || c.entries.some((e) => e.status === "denied" || e.status === "error");
+      pre.textContent = renderClusterProbe(c);
+      wrap.hidden = false;
+      wrap.open = trouble;
+      // classList, not className: the latter would drop the h_diagwrap selector class.
+      wrap.classList.toggle("warnnote", trouble);
+      wrap.classList.toggle("help", !trouble);
+    }
+  } catch (e) { msg.textContent = "✗ " + e.message; wrap.hidden = true; }
 }
 
 // ===== topology diagram (UPS -> Host) ======================================
@@ -896,31 +1374,124 @@ function renderShutdownSequence() {
 }
 
 // ===== notifications =======================================================
-function showWebhookHelp() {
-  // Dynamic key (like t("mib." + …) above); tests/test_i18n.py keeps whfmt.*Help complete.
-  $("webhook_help").textContent = t("whfmt." + getVal("webhook_format") + "Help");
+// One card per webhook, mirroring the UPS cards: several targets can be configured and
+// each is tested on its own.
+let webhookSeq = 0;
+
+function nextWebhookId() {
+  const taken = new Set(Array.from(document.querySelectorAll("#webhookList .w_id"))
+    .map((el) => el.value));
+  let n = ++webhookSeq;
+  while (taken.has("webhook" + n)) n = ++webhookSeq;
+  return "webhook" + n;
 }
 
-$("webhook_format").onchange = showWebhookHelp;
+function renderWebhooks(list) {
+  $("webhookList").innerHTML = "";
+  (list || []).forEach((w) => addWebhookCard(w, false));  // loaded cards start collapsed
+}
 
-// A "?" inside a <summary> would fold the card on click — the link alone must win.
-document.querySelectorAll("details > summary .doclink")
-  .forEach((a) => { a.onclick = (e) => e.stopPropagation(); });
+function addWebhookCard(w, open) {
+  w = w || {};
+  const id = w.id || nextWebhookId();
+  const div = document.createElement("details");
+  div.className = "ups-cfg";
+  if (open !== false) div.open = true;
+  const authPh = w.auth_header_value === SECRET_PLACEHOLDER ? t("cfg.unchanged") : "";
+  div.innerHTML = `
+    <summary class="cfg-head">${svgIcon("i-bell")}<span class="cfg-title w_sum_name"></span><span class="cfg-sub w_sum_url"></span></summary>
+    <input type="hidden" class="w_id" value="${esc(id)}" />
+    <label class="switch" title="${esc(t("notif.webhookTitle"))}"><input type="checkbox" class="w_enabled" ${w.enabled ? "checked" : ""} /><span>${esc(t("notif.webhookEnabled"))}</span></label>
+    <div class="row">
+      <label title="${esc(t("notif.nameTitle"))}">${esc(t("cfg.name"))} <input class="w_name" value="${esc(w.name || "")}" placeholder="${esc(id)}" /></label>
+      <label title="${esc(t("notif.urlTitle"))}">${esc(t("notif.url"))} <input class="w_url" value="${esc(w.url || "")}" placeholder="https://..." /></label>
+    </div>
+    <div class="row">
+      <label title="${esc(t("notif.formatTitle"))}">${esc(t("notif.format"))} <select class="w_format">${opts(WEBHOOK_FORMATS, w.format || "json")}</select></label>
+      <label title="${esc(t("notif.minSeverityTitle"))}">${esc(t("notif.minSeverity"))} <select class="w_min_severity">${opts(WEBHOOK_LEVELS, w.min_severity || "warning")}</select></label>
+    </div>
+    <p class="help w_help"></p>
+    <div class="w_custom" hidden>
+      <label title="${esc(t("notif.contentTypeTitle"))}">${esc(t("notif.contentType"))} <input class="w_content_type" value="${esc(w.content_type || "application/json")}" /></label>
+      <label title="${esc(t("notif.templateTitle"))}">${esc(t("notif.template"))}
+        <textarea class="w_template" rows="5" style="font-family:monospace;font-size:.85em">${esc(w.template || "")}</textarea></label>
+      <p class="help">${esc(t("notif.templateHelp"))}</p>
+    </div>
+    <details class="w_auth">
+      <summary>${esc(t("notif.authSummary"))} <span class="muted">${esc(t("notif.authOptional"))}</span></summary>
+      <div class="row">
+        <label title="${esc(t("notif.authNameTitle"))}">${esc(t("notif.authName"))} <input class="w_auth_name" value="${esc(w.auth_header_name || "")}" placeholder="Authorization" /></label>
+        <label title="${esc(t("notif.authValueTitle"))}">${esc(t("notif.authValue"))} <input class="w_auth_value" type="password" placeholder="${esc(authPh)}" /></label>
+      </div>
+    </details>
+    <div class="row" style="margin:0;align-items:center">
+      <button class="btn-ghost btn-sm w_test" style="flex:0 0 auto" title="${esc(t("notif.testTitle"))}">${esc(t("notif.test"))}</button>
+      <button class="btn-ghost btn-sm w_del" style="flex:0 0 auto">${esc(t("notif.removeWebhook"))}</button>
+      <span class="muted w_msg"></span>
+    </div>`;
+  const showHelp = () => {
+    // Dynamic key (like t("mib." + …) above); tests/test_i18n.py keeps whfmt.*Help complete.
+    const fmt = div.querySelector(".w_format").value;
+    div.querySelector(".w_help").textContent = t("whfmt." + fmt + "Help");
+    div.querySelector(".w_custom").hidden = fmt !== "custom";
+  };
+  const updSum = () => {
+    const nm = div.querySelector(".w_name").value.trim() || id;
+    const url = div.querySelector(".w_url").value.trim();
+    const on = div.querySelector(".w_enabled").checked;
+    div.querySelector(".w_sum_name").textContent = nm + (on ? "" : " (" + t("notif.disabled") + ")");
+    div.querySelector(".w_sum_url").textContent = url ? "· " + url.slice(0, 60) : "";
+  };
+  div.querySelector(".w_format").onchange = showHelp;
+  div.querySelector(".w_name").oninput = updSum;
+  div.querySelector(".w_url").oninput = updSum;
+  div.querySelector(".w_enabled").onchange = updSum;
+  div.querySelector(".w_test").onclick = (e) => { e.preventDefault(); testWebhook(div); };
+  div.querySelector(".w_del").onclick = (e) => { e.preventDefault(); div.remove(); };
+  $("webhookList").appendChild(div);
+  showHelp();
+  updSum();
+}
 
-$("testWebhookBtn").onclick = async () => {
-  const msg = $("webhookMsg");
+function webhookFromCard(div) {
+  const q = (s) => div.querySelector(s);
+  const av = q(".w_auth_value").value;
+  return {
+    id: q(".w_id").value,
+    name: q(".w_name").value.trim(),
+    enabled: q(".w_enabled").checked,
+    url: q(".w_url").value.trim(),
+    format: q(".w_format").value,
+    min_severity: q(".w_min_severity").value,
+    template: q(".w_template").value,
+    content_type: q(".w_content_type").value.trim() || "application/json",
+    auth_header_name: q(".w_auth_name").value.trim(),
+    // Empty means "unchanged" — same convention as every other secret in this UI.
+    auth_header_value: av === "" ? SECRET_PLACEHOLDER : av,
+  };
+}
+
+function currentWebhookList() {
+  return Array.from(document.querySelectorAll("#webhookList .ups-cfg"))
+    .map(webhookFromCard).filter((w) => w.url);
+}
+
+async function testWebhook(div) {
+  const msg = div.querySelector(".w_msg");
   msg.textContent = t("msg.testing");
   try {
     // Sends with the values entered here, saved or not — and regardless of the level
     // filter, because the user asked for this one explicitly.
-    const r = await api("/api/test/webhook", "POST", {
-      url: getVal("webhook_url").trim(),
-      format: getVal("webhook_format"),
-      min_severity: getVal("webhook_min_severity"),
-    });
+    const r = await api("/api/test/webhook", "POST", webhookFromCard(div));
     msg.textContent = (r.ok ? "✓ " : "✗ ") + r.message;
   } catch (e) { msg.textContent = "✗ " + e.message; }
-};
+}
+
+$("addWebhookBtn").onclick = (e) => { e.preventDefault(); addWebhookCard({}, true); };
+
+// A "?" inside a <summary> would fold the card on click — the link alone must win.
+document.querySelectorAll("details > summary .doclink")
+  .forEach((a) => { a.onclick = (e) => e.stopPropagation(); });
 
 function buildConfig() {
   const hosts = Array.from(document.querySelectorAll("#hostRows .host-cfg"))
@@ -944,17 +1515,28 @@ function buildConfig() {
       on_battery_low: getChk("th_on_battery_low"),
       poll_interval_normal_s: getNum("th_poll_interval_normal_s") || 30,
       poll_interval_battery_s: getNum("th_poll_interval_battery_s") || 8,
-      unreachable_alarm_after_polls: currentConfig.thresholds.unreachable_alarm_after_polls,
+      unreachable_alarm_after_polls:
+        getNum("th_unreachable_alarm_after_polls")
+        || currentConfig.thresholds.unreachable_alarm_after_polls,
       host_shutdown_timeout_s: getNum("th_host_shutdown_timeout_s") || 60,
       comm_loss_shutdown_after_min: getNum("th_comm_loss_shutdown_after_min"),
+      // An empty field means "never" (manual reset only) — null, which is what the
+      // backend reads as off. 0 is a valid value: re-arm on the first mains poll.
+      rearm_after_mains_min: getNum("th_rearm_after_mains_min"),
       keep_shutdown_on_comm_loss: getChk("th_keep_shutdown_on_comm_loss"),
+      cluster_prep_timeout_s: getNum("th_cluster_prep_timeout_s") || 60,
+      cluster_abort_on_prep_failure: getChk("th_cluster_abort_on_prep_failure"),
+      cluster_guest_shutdown_timeout_s:
+        getNum("th_cluster_guest_shutdown_timeout_s") || 300,
+      // Empty means "never force" — null, which is what the backend reads as off.
+      cluster_guest_force_after_s: getNum("th_cluster_guest_force_after_s"),
     },
-    notifications: {
-      webhook: {
-        enabled: getChk("webhook_enabled"), url: getVal("webhook_url").trim(),
-        format: getVal("webhook_format"), min_severity: getVal("webhook_min_severity"),
-      },
+    appliance: {
+      self_vmid: applianceChoice().vmid,
+      self_node: applianceChoice().node,
+      self_external: applianceChoice().external,
     },
+    notifications: { webhooks: currentWebhookList() },
   };
 }
 
@@ -1089,13 +1671,11 @@ function pollUpdate(jobId, prevVersion, tries = 0) {
   }, 3000);
 }
 
-$("updateBtn").onclick = () => $("updateFile").click();
-$("updateFile").onchange = async () => {
-  const file = $("updateFile").files[0];
+// One upload path for both the file picker and drag & drop. The backend validates the
+// archive by content, so nothing here needs to second-guess the file name.
+async function uploadUpdatePackage(file) {
   if (!file) return;
-  if (!confirm(t("confirm.update"))) {
-    $("updateFile").value = ""; return;
-  }
+  if (!confirm(t("confirm.update"))) return;
   $("updateMsg").textContent = t("msg.uploading");
   try {
     const form = new FormData();
@@ -1112,7 +1692,36 @@ $("updateFile").onchange = async () => {
     $("updateMsg").textContent = info;
     pollUpdate(data.job_id, data.running_version);
   } catch (e) { $("updateMsg").textContent = "✗ " + e.message; }
+}
+
+$("updateBtn").onclick = () => $("updateFile").click();
+$("updateFile").onchange = async () => {
+  await uploadUpdatePackage($("updateFile").files[0]);
   $("updateFile").value = "";
 };
+
+// Keep the "N polls ≈ M s" hint honest while either input is being edited.
+["th_unreachable_alarm_after_polls", "th_poll_interval_normal_s"].forEach((id) => {
+  const el = $(id);
+  if (el) el.addEventListener("input", updateUnreachableHint);
+});
+
+// Drag & drop onto the update card — the way out when a browser's file picker greys the
+// package out (Safari and compound extensions, see the accept list in index.html).
+(function initUpdateDrop() {
+  const card = $("updCard");
+  if (!card) return;
+  const stop = (e) => { e.preventDefault(); e.stopPropagation(); };
+  ["dragenter", "dragover"].forEach((ev) =>
+    card.addEventListener(ev, (e) => { stop(e); card.classList.add("dropping"); })
+  );
+  ["dragleave", "drop"].forEach((ev) =>
+    card.addEventListener(ev, (e) => { stop(e); card.classList.remove("dropping"); })
+  );
+  card.addEventListener("drop", (e) => {
+    const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (file) uploadUpdatePackage(file);
+  });
+})();
 
 boot().catch((e) => { document.body.innerHTML = "<pre style='padding:20px'>" + esc(t("err.prefix") + e.message) + "</pre>"; });

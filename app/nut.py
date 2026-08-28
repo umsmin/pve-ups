@@ -42,13 +42,16 @@ log = logging.getLogger("pve-usv.nut")
 VAR_STATUS = "ups.status"        # flag list: OL, OB, LB, ...
 VAR_CHARGE = "battery.charge"    # percent
 VAR_RUNTIME = "battery.runtime"  # SECONDS remaining (not minutes)
+VAR_LOAD = "ups.load"            # percent of rated capacity (informational)
 VAR_MFR = "device.mfr"
 VAR_MODEL = "device.model"
 VAR_MFR_LEGACY = "ups.mfr"       # pre-2.8 drivers
 VAR_MODEL_LEGACY = "ups.model"
 
 # Objects the manual test reports on, in display order.
-_PROBE_VARS = (VAR_STATUS, VAR_CHARGE, VAR_RUNTIME, VAR_MFR, VAR_MODEL)
+# VAR_LOAD is listed for diagnostics only; it feeds no trigger (see _TRIGGER_VARS), so a
+# driver that omits it shows as "missing" here without the wizard warning about anything.
+_PROBE_VARS = (VAR_STATUS, VAR_CHARGE, VAR_RUNTIME, VAR_LOAD, VAR_MFR, VAR_MODEL)
 
 # Which variable each device-dependent trigger needs (see ups.PROBE_TRIGGERS).
 _TRIGGER_VARS = {
@@ -258,6 +261,9 @@ def _apply_variables(state: UpsState, variables: dict[str, str]) -> None:
     charge = _coerce_float(variables.get(VAR_CHARGE))
     if charge is not None:
         state.battery_charge_pct = int(charge)
+    load = _coerce_float(variables.get(VAR_LOAD))
+    if load is not None:
+        state.load_pct = int(load)
     runtime_s = _coerce_float(variables.get(VAR_RUNTIME))
     if runtime_s is not None:
         # NUT reports seconds. Round *down* so a threshold fires a moment early rather

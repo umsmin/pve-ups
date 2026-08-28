@@ -19,7 +19,7 @@ import asyncio
 
 from . import pbs, proxmox
 from .config import HostConfig, PbsHostConfig, PveHostConfig
-from .proxmox import TestResult
+from .proxmox import NodeVerdict, TestResult
 
 # Headroom over the caller's timeout: the client's own httpx timeout should be what
 # actually fires, so its error message survives. This deadline is the backstop for
@@ -31,12 +31,19 @@ def _unsupported(host: HostConfig) -> str:
     return f"Unsupported shutdown target type: {getattr(host, 'type', '?')}"
 
 
-async def shutdown(host: HostConfig, timeout: float) -> tuple[bool, str]:
-    """Shut down one target. Never raises, never exceeds ``timeout`` by more than the grace."""
+async def shutdown(
+    host: HostConfig, timeout: float, use_localhost: bool = False
+) -> tuple[bool, str]:
+    """Shut down one target. Never raises, never exceeds ``timeout`` by more than the grace.
+
+    ``use_localhost`` only means anything to PVE: it addresses the node behind the entry's
+    API URL directly instead of by its configured name (see proxmox.shutdown_node). PBS
+    ignores the segment entirely and always has, so the flag never reaches it.
+    """
     if isinstance(host, PbsHostConfig):
         call = pbs.shutdown_node(host, timeout)
     elif isinstance(host, PveHostConfig):
-        call = proxmox.shutdown_node(host, timeout)
+        call = proxmox.shutdown_node(host, timeout, use_localhost=use_localhost)
     else:
         # Unknown type: report a failure instead of guessing a product. Sending a PVE
         # token to something else would be a silent, wrong action on a real machine.
@@ -46,6 +53,26 @@ async def shutdown(host: HostConfig, timeout: float) -> tuple[bool, str]:
         return await asyncio.wait_for(call, timeout=timeout + DEADLINE_GRACE_S)
     except (asyncio.TimeoutError, TimeoutError):
         return False, f"No response within {timeout + DEADLINE_GRACE_S:.0f}s — gave up"
+
+
+async def verify_node(host: HostConfig, timeout: float = 10.0) -> NodeVerdict:
+    """Check a target's configured node name against its API. Never raises, always bounded.
+
+    Only Proxmox VE has a node name that can be wrong. PBS ignores the path segment
+    entirely (see PbsHostConfig.api_node), so there is nothing to verify and nothing to
+    report — "unverified" is the honest answer, not a defect.
+    """
+    if not isinstance(host, PveHostConfig):
+        return NodeVerdict(state="unverified")
+    try:
+        return await asyncio.wait_for(
+            proxmox.verify_node(host, timeout=timeout), timeout=timeout + DEADLINE_GRACE_S
+        )
+    except (asyncio.TimeoutError, TimeoutError):
+        return NodeVerdict(
+            state="unverified",
+            detail=f"No response within {timeout + DEADLINE_GRACE_S:.0f}s — gave up",
+        )
 
 
 async def test_connection(host: HostConfig, timeout: float = 10.0) -> TestResult:

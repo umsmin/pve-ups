@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, URLSafeTimedSerializer
 from passlib.context import CryptContext
@@ -30,6 +30,7 @@ from . import __version__, db
 from .config import (
     TARGET_MODELS,
     UPS_SOURCE_MODELS,
+    ApplianceConfig,
     AppConfig,
     HostConfig,
     PveHostConfig,
@@ -37,12 +38,16 @@ from .config import (
     UpsBase,
     WebhookConfig,
     _to_serialisable,
+    assign_host_ids,
     assign_ups_ids,
+    assign_webhook_ids,
     load_config,
     save_config,
 )
-from .engine import Engine
-from . import notify, sources, targets
+from .engine import Engine, _hostname
+# ``cluster`` and ``proxmox`` are PVE-specific on purpose: both back wizard checks
+# that only exist for a Proxmox VE node. Shutdowns still go through ``targets``.
+from . import cluster, notify, proxmox, sources, targets
 
 log = logging.getLogger("pve-usv")
 
@@ -146,28 +151,72 @@ def _agent_drainer_active() -> Optional[bool]:
         return None
 
 
-def _read_package_version(path: Path) -> Optional[str]:
-    """Best-effort: read ``__version__`` from app/__init__.py inside the uploaded archive."""
+def _archive_names(path: Path) -> Optional[list[str]]:
+    """Member names of an uploaded archive, or None if it is not a readable archive.
+
+    Detection is by CONTENT, never by file name: Safari unpacks .tar.gz on download, so
+    the very same release asset arrives as a plain .tar and an extension check would
+    reject a perfectly good package (see the update card's accept list).
+    """
     try:
-        data: Optional[str] = None
-        if path.name.endswith(".zip"):
+        if zipfile.is_zipfile(path):
             with zipfile.ZipFile(path) as z:
-                names = [n for n in z.namelist() if n.endswith("app/__init__.py")]
-                if names:
-                    data = z.read(min(names, key=len)).decode("utf-8", "replace")
-        else:
-            with tarfile.open(path) as t:
-                members = [m for m in t.getmembers() if m.name.endswith("app/__init__.py")]
-                if members:
-                    fh = t.extractfile(min(members, key=lambda m: len(m.name)))
-                    data = fh.read().decode("utf-8", "replace") if fh else None
-        if data:
-            m = re.search(r"""__version__\s*=\s*["']([^"']+)["']""", data)
-            if m:
-                return m.group(1)
+                return z.namelist()
+        # tarfile.open() transparently handles gzip and uncompressed tar alike.
+        with tarfile.open(path) as t:
+            return t.getnames()
+    except Exception as exc:  # noqa: BLE001 - an unreadable archive is a rejection, not a crash
+        log.warning("Could not read archive %s: %s", path, exc)
+        return None
+
+
+def _read_member(path: Path, name: str) -> Optional[str]:
+    """Read one member of an archive as text, by content-detected format."""
+    try:
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as z:
+                return z.read(name).decode("utf-8", "replace")
+        with tarfile.open(path) as t:
+            fh = t.extractfile(name)
+            return fh.read().decode("utf-8", "replace") if fh else None
     except Exception as exc:  # noqa: BLE001 - best effort only
-        log.warning("Could not read package version from %s: %s", path, exc)
-    return None
+        log.warning("Could not read %s from %s: %s", name, path, exc)
+        return None
+
+
+def _inspect_package(path: Path) -> tuple[Optional[str], Optional[str]]:
+    """Validate an uploaded update package and read its version.
+
+    Returns ``(version, error)``. ``error`` is a user-facing English message when the
+    file is not a usable package; the caller must then discard it. Validating here —
+    rather than leaving it to the privileged agent — means a broken or unrelated upload
+    never reaches the root path at all.
+    """
+    names = _archive_names(path)
+    if names is None:
+        return None, (
+            "Not a readable .tar.gz/.tar/.zip archive. If the file came from Safari, "
+            "the download may have been unpacked or truncated — re-download it with "
+            "automatic unarchiving turned off."
+        )
+
+    # The package must look like this project: pyproject.toml next to an app/ package.
+    # Both are what the agent later looks for, so checking them here fails fast.
+    init_members = [n for n in names if n.endswith("app/__init__.py")]
+    has_pyproject = any(n == "pyproject.toml" or n.endswith("/pyproject.toml") for n in names)
+    if not init_members or not has_pyproject:
+        return None, (
+            "This archive does not look like a PVE-UPS release package "
+            "(pyproject.toml and app/__init__.py are missing)."
+        )
+
+    version = None
+    data = _read_member(path, min(init_members, key=len))
+    if data:
+        m = re.search(r"""__version__\s*=\s*["']([^"']+)["']""", data)
+        if m:
+            version = m.group(1)
+    return version, None
 
 
 def _ingest_agent_result() -> Optional[dict]:
@@ -257,6 +306,12 @@ async def api_health():
     # A shutdown target counts as ok once the self-test confirmed both its credentials
     # and its power-management privilege; hosts never tested yet count as neither.
     hosts_ok = sum(1 for h in host_list if h["credentials_ok"] and h["power_mgmt_ok"])
+    # Node names that provably do not match the API behind them. Reported separately from
+    # hosts_ok because the two differ in consequence: with one API URL per entry the
+    # shutdown addresses the node directly and a wrong name is only a misleading label.
+    hosts_node_ok = sum(
+        1 for h in host_list if h.get("node_state") in (None, "ok", "unverified")
+    )
     tested = [h for h in host_list if h["last_test_at"]]
     payload = {
         "status": "ok" if ok else "degraded",
@@ -272,7 +327,23 @@ async def api_health():
         "hosts_total": len(host_list),
         "hosts_ok": hosts_ok,
         "hosts_selftest_ok": (hosts_ok == len(host_list)) if tested else None,
+        "hosts_node_ok": hosts_node_ok,
         "hosts_selftest_at": max((h["last_test_at"] for h in tested), default=None),
+        # Cluster state, for the same reason and with the same caveat as hosts_ok above:
+        # monitoring information only, never part of ``status`` or the HTTP code. Empty
+        # unless at least one host has cluster preparation enabled.
+        "clusters": [
+            {
+                "name": c["name"],
+                "quorate": c["quorate"],
+                "ha_armed": not c["ha_armed_state"] or c["ha_armed_state"] == "armed",
+                "guests_running": c.get("guests_running"),
+                "self_guest_on_ceph": c.get("self_guest_on_ceph"),
+                "ceph_flags_clean": not c["ceph_flags_set"],
+                "needs_recovery": c["needs_recovery"],
+            }
+            for c in snap.get("clusters", [])
+        ],
     }
     return JSONResponse(payload, status_code=200 if ok else 503)
 
@@ -376,9 +447,31 @@ def _host_model(host_entry: dict) -> type[HostConfig]:
     return TARGET_MODELS.get(str(host_entry.get("type") or "pve"), PveHostConfig)
 
 
-def _host_key(host_entry: dict) -> str:
-    """The stored host's key for a submitted entry (mirrors HostConfig.key)."""
+def _legacy_host_key(host_entry: dict) -> str:
+    """The pre-id key of a submitted entry: type + node name."""
     return f"{host_entry.get('type') or 'pve'}:{host_entry.get('name')}"
+
+
+def _find_host(host_entry: dict, by_id: dict, by_legacy: dict) -> Optional[HostConfig]:
+    """The stored host a submitted entry refers to — by id, else by type + node name.
+
+    The fallback is not cosmetic. The first save after this version arrives carries no ids
+    at all (a cached older app.js, or a config whose ids were only just assigned on load),
+    and matching on the id alone would drop every secret exactly once — the very bug the
+    id was introduced to fix.
+    """
+    entry_id = str(host_entry.get("id") or "")
+    if entry_id and entry_id in by_id:
+        return by_id[entry_id]
+    return by_legacy.get(_legacy_host_key(host_entry))
+
+
+def _host_lookups(hosts: list) -> tuple[dict, dict]:
+    """(by id, by legacy type:name) for the stored hosts."""
+    return (
+        {h.id: h for h in hosts if h.id},
+        {f"{getattr(h, 'type', 'pve')}:{h.name}": h for h in hosts},
+    )
 
 
 def _reconcile_host_secrets(host_entry: dict, old: Optional[HostConfig]) -> None:
@@ -402,17 +495,29 @@ def _merge_config(incoming: dict, existing: AppConfig) -> AppConfig:
         _reconcile_ups_secrets(ups_entry, existing_ups.get(ups_entry.get("id")))
     data.pop("snmp", None)  # legacy key never accepted from the form
 
-    # Host token secrets, matched by type + node name (hosts have no id of their own).
-    existing_hosts = {h.key: h for h in existing.hosts}
+    # Host token secrets, matched by stable host id (with the pre-id fallback).
+    by_id, by_legacy = _host_lookups(existing.hosts)
     for host in data.get("hosts", []) or []:
-        _reconcile_host_secrets(host, existing_hosts.get(_host_key(host)))
+        _reconcile_host_secrets(host, _find_host(host, by_id, by_legacy))
+
+    # Webhook auth-header secrets, matched by stable webhook id.
+    existing_hooks = {h.id: h for h in existing.notifications.webhooks}
+    for hook in (data.get("notifications") or {}).get("webhooks", []) or []:
+        if not isinstance(hook, dict):
+            continue
+        old = existing_hooks.get(hook.get("id"))
+        for fld, default in WebhookConfig.secret_fields().items():
+            old_secret = getattr(old, fld).get_secret_value() if old is not None else default
+            hook[fld] = _reconcile_secret(hook.get(fld), old_secret)
 
     # Never overwrite auth/session material from the config form.
     data["ui_password_hash"] = existing.ui_password_hash
     data["session_secret"] = existing.session_secret
 
     cfg = AppConfig.model_validate(data)
-    assign_ups_ids(cfg.ups)  # safety net: fill any still-empty UPS ids with stable slugs
+    assign_ups_ids(cfg.ups)  # safety net: fill any still-empty ids with stable slugs
+    assign_host_ids(cfg.hosts)
+    assign_webhook_ids(cfg.notifications.webhooks)
     return cfg
 
 
@@ -481,6 +586,7 @@ async def api_config_import(incoming: dict):
     except Exception as exc:  # noqa: BLE001 - validation error -> 400
         raise HTTPException(status_code=400, detail=f"Invalid import file: {exc}")
     assign_ups_ids(new_cfg.ups)  # backups from <2.0 migrate to a single UPS; ensure ids
+    assign_host_ids(new_cfg.hosts)  # backups from before 4.0.0 carry no host ids
     new_cfg.configured = True
     save_config(new_cfg)
     engine.update_config(new_cfg)
@@ -541,19 +647,318 @@ async def api_test_snmp(incoming: dict):
     return await api_test_ups(incoming)
 
 
+def _configured_node_names(host: PveHostConfig) -> list[str]:
+    """Node names of all enabled PVE targets, including the one being tested.
+
+    The tested entry is usually still unsaved when "Test" is pressed, so taking the
+    stored config alone would report the node the user is configuring right now as
+    uncovered.
+    """
+    stored = [
+        h.name
+        for h in (engine.cfg.hosts if engine else [])
+        if isinstance(h, PveHostConfig) and h.enabled and h.key != host.key
+    ]
+    return stored + [host.name]
+
+
+async def _check_node_name(
+    host: PveHostConfig, known: proxmox.NodeList
+) -> tuple[dict, str]:
+    """Work out what to OFFER for a node name the API does not recognise.
+
+    The verdict itself comes from proxmox.verify_node() via the credential test, which is
+    what the self-test uses too — this only adds what a form can do and a background check
+    cannot: propose a value. Hence the message here is the suggestion alone; repeating the
+    diagnosis would say the same thing twice in one line.
+
+    ``match`` comes from that same verdict rather than from "the name is in the list":
+    on a cluster every member is in the list, so a name belonging to a *different* node
+    than the one this API URL answers for used to count as a match and nothing was ever
+    offered. Where the listing marks the local node, that node is the offer.
+
+    A suggestion is offered only where it is not a guess — an empty field, a name that
+    names another member of this cluster, or one differing from a real node in case or
+    domain suffix alone. A filled-in field with no near match gets none: picking one of
+    several nodes could name the wrong machine.
+    """
+    verdict = await proxmox.verify_node(host, known=known)
+    data = {
+        "readable": known.readable,
+        "nodes": list(known.nodes),
+        "match": verdict.state == "ok",
+        "suggestion": None,
+        "reason": None,
+    }
+    if not known.readable or data["match"]:
+        return data, ""
+
+    if verdict.state == "proxied" and known.local:
+        # Not a guess: the API itself said which node answers here.
+        data.update(suggestion=known.local, reason="local")
+        return data, ""
+
+    if not host.name:
+        if known.local:
+            data.update(suggestion=known.local, reason="local")
+        elif len(known.nodes) == 1:
+            data.update(suggestion=known.nodes[0], reason="only")
+        return data, (
+            f"No node name entered. This API reports: {', '.join(known.nodes)}."
+        )
+
+    near = dict(cluster.node_coverage(known.nodes, [host.name]).near).get(host.name)
+    if not near:
+        return data, ""
+    # No sentence: this endpoint only ever answers the wizard, which renders the
+    # suggestion as the clickable "Use <node>?" right after the message. Saying it in
+    # words as well would put the same offer on the line twice.
+    data.update(suggestion=near, reason="near")
+    return data, ""
+
+
+async def _check_host_cluster(
+    host: PveHostConfig,
+) -> tuple[dict, str, proxmox.NodeList]:
+    """Verify the cluster side of a host's token and describe what was found.
+
+    Returns the structured findings, one English sentence to append to the test message
+    (API texts are English throughout, see the language policy), and the node names this
+    inspection saw — the caller checks the configured name against them rather than
+    asking the API a second time. Reuses cluster.inspect(), which is total and
+    hard-bounded, so this cannot hang the request.
+
+    A shorter timeout than the default: this is interactive, and the credential test
+    before it may already have spent up to 10 s.
+    """
+    ap = engine.cfg.appliance if engine is not None else ApplianceConfig()
+    info = await cluster.inspect(
+        host, timeout=8.0, self_vmid=ap.self_vmid, self_node=ap.self_node,
+        hostname=_hostname(),
+    )
+    # The guest privileges follow the Ceph tick, because that is the switch the
+    # cluster-wide guest stop hangs on — it has none of its own.
+    missing = cluster.missing_privileges(
+        info, want_ceph=host.cluster_ceph, want_disarm=host.cluster_ha_disarm,
+        want_guests=host.cluster_ceph,
+    )
+    # /cluster/status names every member and marks the one that answered, so a cluster
+    # member never needs the extra /nodes round trip.
+    known = proxmox.NodeList(
+        readable=bool(info.nodes), nodes=list(info.nodes), local=info.local_node or None
+    )
+    data = {
+        "checked": True,
+        "reachable": info.reachable,
+        "is_cluster": info.is_cluster,
+        "name": info.name,
+        "nodes": len(info.nodes),
+        "nodes_online": info.nodes_online,
+        "quorate": info.quorate,
+        "ceph_configured": info.ceph_configured,
+        "ha_services": info.ha_services,
+        "ha_armed_state": info.ha_armed_state,
+        "ha_disarmed": info.ha_disarmed,
+        "disarm_supported": info.disarm_supported,
+        "missing_privileges": missing,
+        # Missing but not fatal — kept apart so a hint never reads as a broken setup.
+        "advisory_privileges": cluster.advisory_privileges(info),
+        "guests_total": len(info.guests),
+        "guests_running": len(info.running_guests),
+        "guests_readable": info.guests_read,
+        "mon_nodes": list(info.mon_nodes),
+        "self_guest": (
+            {
+                "vmid": info.self_guest.vmid,
+                "node": info.self_guest.node,
+                "name": info.self_guest.name,
+                "type": info.self_guest.kind,
+                "label": info.self_guest.label,
+            }
+            if info.self_guest
+            else None
+        ),
+        "self_guest_source": info.self_guest_source,
+        "self_guest_on_ceph": info.self_guest_on_ceph,
+        # Per-endpoint findings for the diagnostics panel, like the UPS test's probe.
+        "entries": [asdict(e) for e in info.probe],
+    }
+
+    if not info.reachable:
+        return data, f"Cluster check failed: {info.error or 'no answer'}.", known
+    if not info.is_cluster and not info.can_audit:
+        # Without Sys.Audit /cluster/status is refused, and "no cluster record" then means
+        # "not allowed to look" — reporting it as "standalone" would send the user hunting
+        # for the wrong problem.
+        return data, (
+            "Cluster status cannot be read: the token lacks Sys.Audit on '/', so it is "
+            "unknown whether this node belongs to a cluster. See the manual for the "
+            "pveum commands."
+        ), known
+    if not info.is_cluster:
+        return data, (
+            "This node is not part of a cluster — the cluster preparation will be "
+            "skipped. Untick the cluster option, or point this entry at a cluster member."
+        ), known
+
+    parts = []
+    if missing:
+        # Named individually: "403" tells an operator nothing, the privilege name points
+        # straight at the pveum commands in the manual.
+        parts.append(
+            f"Cluster '{info.name}' found, but the token is missing "
+            f"{', '.join(missing)} on '/' — see the manual for the pveum commands."
+        )
+    else:
+        ceph = "detected"
+        if not info.ceph_configured:
+            # Only a denied read is actionable; everything else means "no Ceph here".
+            ceph = "not configured" if info.ceph_unavailable else (
+                "status not readable (missing privilege)"
+            )
+        parts.append(
+            f"Cluster '{info.name}': {len(info.nodes)} nodes "
+            f"({info.nodes_online} online), "
+            f"Ceph {ceph}, "
+            f"HA {info.ha_armed_state or 'stack not reporting a state'} "
+            f"({info.ha_services} HA guests)."
+        )
+    # A tick for a feature this cluster does not have. Worth saying here rather than only
+    # in the scheduled self-test: this is the moment the operator is configuring it.
+    if host.cluster_ceph and info.ceph_unavailable:
+        parts.append(
+            "The Ceph option is ticked, but this cluster does not run Ceph — "
+            f"the step is skipped before every shutdown. Untick it; {cluster.PRIV_MODIFY} "
+            "is then not needed on '/' either."
+        )
+    elif host.cluster_ceph:
+        # The Ceph tick also switches on the cluster-wide guest stop, so this is where
+        # the operator finds out what that will actually do — while it can still be
+        # changed, rather than during the outage.
+        parts.extend(_guest_stop_notes(host, info))
+    # Reported regardless of whether HA manages any guest: a disarmed stack means no
+    # fencing cluster-wide, and it stays that way until someone arms it again.
+    if info.ha_disarmed:
+        parts.append(
+            "HA is currently disarmed — no fencing takes place. Use 'Restore cluster' "
+            "on the dashboard once the cluster is fully back."
+        )
+    if (
+        host.cluster_ha_disarm
+        and (info.ha_resources or info.ha_present)
+        and info.disarm_unavailable
+    ):
+        parts.append(
+            "HA disarm needs Proxmox VE 9.2 or newer and will be skipped here; the Ceph "
+            "flags still work."
+        )
+    if not info.quorate:
+        parts.append("The cluster currently has no quorum.")
+    # Nodes nobody would shut down. Said here and not only in the scheduled self-test for
+    # the same reason as the Ceph note above: this is the moment it can still be fixed.
+    # The entry being tested is usually unsaved, so it is added to the stored ones.
+    cov = cluster.node_coverage(info.nodes, _configured_node_names(host))
+    if cov.missing:
+        parts.append(f"Not covered by any entry: {', '.join(cov.missing)}.")
+    if host.cluster_ceph and info.mon_nodes:
+        parts.append(
+            f"Ceph monitors run on {', '.join(info.mon_nodes)} — those nodes should have "
+            f"the highest 'order' so they are powered down last."
+        )
+    return data, " ".join(parts), known
+
+
+def _guest_stop_notes(host: PveHostConfig, info: cluster.ClusterInfo) -> list[str]:
+    """What the cluster-wide guest stop would do, or why it will not run."""
+    if info.guests_unreadable:
+        return [
+            "The cluster's guest list cannot be read, so the guests cannot be stopped "
+            f"before the nodes go down. Grant {cluster.PRIV_VM_AUDIT} and "
+            f"{cluster.PRIV_VM_POWER} (on '/' or '/vms'). This endpoint filters by "
+            "privilege instead of refusing, so an empty answer is never read as "
+            "'no guests'."
+        ]
+    ap = engine.cfg.appliance if engine is not None else ApplianceConfig()
+    guest = info.self_guest
+    notes = []
+    if guest is None and not ap.self_external:
+        notes.append(
+            {
+                "missing": f"The selected guest {ap.self_vmid} does not exist here.",
+                "ambiguous": "Several guests carry this appliance's hostname.",
+            }.get(info.self_guest_source, "This appliance's own guest is not selected.")
+            + " Until it is picked under Settings -> Appliance the guests are NOT stopped "
+            "before the shutdown, because stopping all of them would stop this appliance "
+            "too."
+        )
+        return notes
+    targets = cluster.stop_targets(info.guests, guest, _hostname())
+    notes.append(
+        f"Before the nodes go down, {len(targets)} of {len(info.running_guests)} running "
+        f"guests would be stopped"
+        + (f", sparing {guest.label}." if guest else " (this appliance runs elsewhere).")
+    )
+    if info.self_guest_on_ceph:
+        on = [s for s in info.self_guest_storages if s in info.ceph_storages]
+        notes.append(
+            f"{guest.label} lives on Ceph storage ({', '.join(on)}). Move it to local "
+            f"storage: once the OSDs drop below min_size its own IO blocks and it can no "
+            f"longer shut anything down."
+        )
+    elif info.self_guest_on_ceph is None and guest is not None:
+        notes.append(
+            f"Whether {guest.label} sits on Ceph storage could not be checked "
+            f"({cluster.PRIV_DS_AUDIT} missing) — everything else works."
+        )
+    return notes
+
+
 @app.post("/api/test/host", dependencies=[Depends(require_auth)])
 async def api_test_host(incoming: dict):
     assert engine is not None
-    # Reconcile this single host's secret against the stored one (by type + name).
+    # Reconcile this single host's secret against the stored one (by id, then legacy).
+    # Felt here first: accepting the node name this very endpoint suggests changes the
+    # name, and matching on it would answer "Authentication failed" for a valid token.
     incoming = dict(incoming)
-    existing_hosts = {h.key: h for h in engine.cfg.hosts}
-    _reconcile_host_secrets(incoming, existing_hosts.get(_host_key(incoming)))
+    _reconcile_host_secrets(incoming, _find_host(incoming, *_host_lookups(engine.cfg.hosts)))
     try:
         host = _host_model(incoming).model_validate(incoming)
     except Exception as exc:  # noqa: BLE001 - validation error -> 400
         raise HTTPException(status_code=400, detail=f"Invalid host settings: {exc}")
     result = await targets.test_connection(host)
-    return {"ok": result.ok, "message": result.message, "has_power_mgmt": result.has_power_mgmt}
+    message, cluster_info, node_check = result.message, None, None
+    # PVE only, and only once the credentials work: an unreachable API cannot answer these
+    # questions either, so asking would add its own timeout to the wait and append a
+    # second, redundant error to the message.
+    if result.ok and isinstance(host, PveHostConfig):
+        # With the cluster switch on, the cluster features need three privileges beyond
+        # Sys.PowerMgmt — without this check the user would not find out until the next
+        # scheduled self-test, or the next real outage. It also names every member, which
+        # saves the /nodes round trip below.
+        if host.cluster:
+            cluster_info, extra, known = await _check_host_cluster(host)
+            message = f"{message} {extra}"
+        else:
+            known = await proxmox.list_nodes(host)
+        # The node name is the one setting nothing else validates: test_connection() never
+        # touches it, so a wrong one passes every check here and fails during the outage.
+        node_check, extra = await _check_node_name(host, known)
+        if extra:
+            message = f"{message} {extra}"
+    return {
+        "ok": result.ok,
+        "message": message,
+        "has_power_mgmt": result.has_power_mgmt,
+        # Member of proxmox.NODE_STATES, "unverified" for PBS and for anything unreadable.
+        # The sentence is already in ``message``; this is what lets the UI label it with
+        # the same chip the dashboard uses instead of hiding a warning in prose.
+        "node_state": result.node_state,
+        # None when the host is not a cluster member (or not PVE) — a new field only.
+        "cluster": cluster_info,
+        # None for non-PVE targets; "readable": false means the API would not name its
+        # nodes, which is explicitly NOT a verdict on the configured name.
+        "node_check": node_check,
+    }
 
 
 @app.post("/api/test/webhook", dependencies=[Depends(require_auth)])
@@ -589,6 +994,112 @@ async def api_test_shutdown():
     assert engine is not None
     msg = await engine.simulate_shutdown()
     return {"ok": True, "message": msg}
+
+
+@app.post("/api/selftest/run", dependencies=[Depends(require_auth)])
+async def api_selftest_run():
+    """Run the credential and cluster checks now instead of waiting for the next slot.
+
+    Saving settings deliberately does not fire a self-test, so without this a changed
+    token or a freshly ticked cluster option would only be verified hours later.
+    """
+    assert engine is not None
+    ok, message = await engine.run_selftest_now()
+    return {"ok": ok, "message": message}
+
+
+@app.post("/api/cluster/guests", dependencies=[Depends(require_auth)])
+async def api_cluster_guests(incoming: dict):
+    """List the cluster's guests, so the appliance's own can be PICKED rather than typed.
+
+    A wrong vmid here means the appliance shuts itself down in the middle of an outage,
+    which is precisely the class of mistake a free-text field invites. Hence a list.
+
+    It takes a full host payload like /api/test/host — including the masked-secret
+    reconcile — so the picker works from an unsaved host card too, and it is deliberately
+    a separate endpoint: choosing the guest must not require running a credential test
+    first.
+    """
+    assert engine is not None
+    incoming = dict(incoming)
+    _reconcile_host_secrets(incoming, _find_host(incoming, *_host_lookups(engine.cfg.hosts)))
+    try:
+        host = _host_model(incoming).model_validate(incoming)
+    except Exception as exc:  # noqa: BLE001 - validation error -> 400
+        raise HTTPException(status_code=400, detail=f"Invalid host settings: {exc}")
+    if not isinstance(host, PveHostConfig):
+        return {"ok": False, "message": "Only Proxmox VE hosts have a guest list.",
+                "guests": []}
+
+    ap = engine.cfg.appliance
+    info = await cluster.inspect(
+        host, timeout=8.0, self_vmid=ap.self_vmid, self_node=ap.self_node,
+        hostname=_hostname(),
+    )
+    if not info.reachable:
+        return {"ok": False, "message": info.error or "no answer", "guests": []}
+    if info.guests_unreadable:
+        # Named rather than returned as an empty list: /cluster/resources filters by
+        # privilege instead of refusing, so "no guests" and "may not look" arrive
+        # identically on the wire and must not read identically here.
+        return {
+            "ok": False,
+            "message": f"The guest list could not be read - the token needs "
+                       f"{cluster.PRIV_VM_AUDIT} (on '/' or '/vms').",
+            "guests": [],
+        }
+    return {
+        "ok": True,
+        "message": f"{len(info.guests)} guests in cluster '{info.name or host.name}'.",
+        "guests": [
+            {
+                "vmid": g.vmid,
+                "name": g.name,
+                "node": g.node,
+                "type": g.kind,
+                "status": g.status,
+                "label": g.label,
+            }
+            for g in sorted(info.guests, key=lambda g: g.vmid)
+        ],
+        # What the hostname match found, as a suggestion for the picker. Only ever a
+        # pre-selection: the stored value is whatever the operator confirms.
+        "detected": (
+            {"vmid": info.self_guest.vmid, "node": info.self_guest.node,
+             "label": info.self_guest.label, "source": info.self_guest_source}
+            if info.self_guest
+            else {"vmid": None, "node": "", "label": "",
+                  "source": info.self_guest_source}
+        ),
+        "ceph_storages": list(info.ceph_storages),
+    }
+
+
+@app.post("/api/cluster/restore", dependencies=[Depends(require_auth)])
+async def api_cluster_restore():
+    """Arm the HA manager again and clear the Ceph maintenance flags, per cluster.
+
+    Explicit and manual on purpose: there is no automatic re-arm. Bringing HA back while
+    nodes are still booting is a judgement call for someone who can see the cluster.
+    """
+    assert engine is not None
+    allowed, results = await engine.restore_clusters()
+    if not allowed:
+        # Refused, not queued: arming HA while the nodes are powering off would undo the
+        # preparation at exactly the moment it is doing its job.
+        return {
+            "ok": False,
+            "message": "Not while a power outage is in progress.",
+            "results": [],
+        }
+    if not results:
+        return {"ok": True, "message": "No cluster needs restoring.", "results": []}
+    ok = all(r["ok"] for r in results)
+    return {
+        "ok": ok,
+        "message": "; ".join(f"{r['cluster']}: {r['message']}" for r in results),
+        "results": results,
+    }
 
 
 @app.post("/api/reset", dependencies=[Depends(require_auth)])
@@ -662,8 +1173,13 @@ async def api_update_upload(file: UploadFile = File(...)):
             "Pull a new image tag and recreate the container.",
         )
     name = file.filename or ""
-    if not name.endswith((".tar.gz", ".tgz", ".zip")):
-        raise HTTPException(status_code=400, detail="Only .tar.gz/.tgz/.zip allowed")
+    # ".tar" and ".gz" are accepted because Safari unpacks .tar.gz on download; the real
+    # decision is made on the archive's CONTENT below, so the extension is only a cheap
+    # first filter against obvious mistakes.
+    if not name.endswith((".tar.gz", ".tgz", ".tar", ".gz", ".zip")):
+        raise HTTPException(
+            status_code=400, detail="Only .tar.gz/.tgz/.tar/.gz/.zip archives are accepted"
+        )
     UPDATE_DIR.mkdir(parents=True, exist_ok=True)
     # Sanitise the name to a basename; the agent only looks in UPDATE_DIR.
     safe = Path(name).name
@@ -674,7 +1190,16 @@ async def api_update_upload(file: UploadFile = File(...)):
             size += len(chunk)
             fh.write(chunk)
 
-    pkg_version = _read_package_version(target)
+    # Validate BEFORE queueing: the agent applies the job as root, so a package that is
+    # unreadable or simply not this project must be rejected while it is still ours.
+    pkg_version, error = _inspect_package(target)
+    if error:
+        try:
+            target.unlink()
+        except Exception as exc:  # noqa: BLE001 - the rejection stands either way
+            log.warning("Could not remove rejected upload %s: %s", target, exc)
+        raise HTTPException(status_code=400, detail=error)
+
     same_version = bool(pkg_version) and pkg_version == __version__
     job_id = _enqueue_agent("update", package=str(target))
     try:
@@ -698,12 +1223,63 @@ async def api_update_upload(file: UploadFile = File(...)):
 
 
 # --- static UI --------------------------------------------------------------
+# Cache busting without a build step. Browsers may cache a response that carries no
+# Cache-Control heuristically (roughly 10% of its age), so after an update the old
+# app.js/style.css can be served for days without a single request reaching us. The
+# fix has two halves: index.html itself is never stored, and every asset it references
+# gets a "?v=<stamp>" that changes whenever the file does, so the stamped URL can then
+# be cached forever. The stamp comes from the file's mtime/size, NOT from __version__:
+# the update agent copies with shutil.copy2 (mtimes survive the tarball), it also works
+# while developing without a version bump, and it leaves unchanged files in the cache.
+_ASSET_REF_RE = re.compile(r'((?:src|href)=")(/[^"?#]+\.(?:js|css))(")')
+
+
+
+def _asset_stamp(url_path: str) -> str:
+    """Short cache-busting token for a web asset; falls back to the app version."""
+    try:
+        st = (WEB_DIR / url_path.lstrip("/")).stat()
+    except OSError:
+        return __version__
+    return f"{st.st_mtime_ns:x}{st.st_size:x}"
+
+
+def _render_index() -> str:
+    """index.html with a "?v=" stamp on every local .js/.css reference.
+
+    Rendered per request on purpose: it is a handful of stat() calls on a document that
+    is fetched once per page load, and nothing can then go stale behind a cache of ours.
+    """
+    return _ASSET_REF_RE.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}?v={_asset_stamp(m.group(2))}{m.group(3)}",
+        (WEB_DIR / "index.html").read_text(encoding="utf-8"),
+    )
+
+
+class _StaticWithCacheHeaders(StaticFiles):
+    """Static files with explicit caching rules (never leave it to the heuristic)."""
+
+    async def get_response(self, path, scope):
+        resp = await super().get_response(path, scope)
+        if resp.status_code in (200, 304):
+            stamped = b"v=" in scope.get("query_string", b"")
+            resp.headers["cache-control"] = (
+                "public, max-age=31536000, immutable" if stamped
+                # No stamp (manual.html, a hand-typed asset URL): revalidate every time.
+                # Starlette answers with an ETag, so an unchanged file costs a 304.
+                else "no-cache"
+            )
+        return resp
+
+
 @app.get("/")
 async def index():
-    return FileResponse(WEB_DIR / "index.html")
+    # no-store, not no-cache: this response has no ETag to revalidate against, and it
+    # is the document that carries the current asset stamps — it must never be reused.
+    return HTMLResponse(_render_index(), headers={"Cache-Control": "no-store"})
 
 
-app.mount("/", StaticFiles(directory=WEB_DIR), name="web")
+app.mount("/", _StaticWithCacheHeaders(directory=WEB_DIR), name="web")
 
 
 def run() -> None:

@@ -11,6 +11,7 @@ venv/
 # Local dev runtime state (never commit secrets/config)
 dev-config.yaml
 dev-events.db
+engine-state.json
 *.db
 
 # Editor/OS

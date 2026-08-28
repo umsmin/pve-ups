@@ -82,6 +82,26 @@ def test_probe_status_keys_exist_in_both_dictionaries():
     assert not missing, f"probe statuses without a dictionary entry: {missing}"
 
 
+def test_cluster_probe_status_keys_exist_in_both_dictionaries():
+    """Every per-endpoint outcome of the cluster check needs a UI label in EN and DE."""
+    from app.cluster import CLUSTER_PROBE_STATUSES
+
+    missing = _both_dictionaries_define("cprobe.st.", CLUSTER_PROBE_STATUSES)
+    assert not missing, f"cluster probe statuses without a dictionary entry: {missing}"
+
+
+def test_node_state_keys_exist_in_both_dictionaries():
+    """Every node-name verdict needs a UI label in EN and DE.
+
+    The dashboard shows a chip for the three states that mean "does not match this API";
+    the other two exist so the closed set stays labelled, exactly like the probe statuses.
+    """
+    from app.proxmox import NODE_STATES
+
+    missing = _both_dictionaries_define("nodest.", NODE_STATES)
+    assert not missing, f"node states without a dictionary entry: {missing}"
+
+
 def test_probe_trigger_keys_exist_in_both_dictionaries():
     """Same for the trigger names a probe reports as unavailable on this device."""
     from app.ups import PROBE_TRIGGERS
@@ -177,6 +197,19 @@ def _select_values(select_id: str) -> list[str]:
     return re.findall(r'value="([a-z0-9_]+)"', block.group(1))
 
 
+def _js_option_values(const_name: str) -> list[str]:
+    """The values of a [["value", label], …] dropdown table in app.js, in order.
+
+    Webhooks are rendered as cards (one per target), so their dropdowns are built in JS
+    like SNMP_MIBS above rather than sitting in index.html as static markup.
+    """
+    block = re.search(
+        rf"const {const_name} = \[(.*?)\];", (WEB / "app.js").read_text(encoding="utf-8")
+    )
+    assert block, f"{const_name} not found in app.js"
+    return re.findall(r'\["([a-z0-9_]+)"', block.group(1))
+
+
 def test_webhook_format_keys_exist_in_both_dictionaries():
     """Every payload format needs a renderer, a dropdown entry and labels in EN and DE."""
     from app.config import WebhookFormat
@@ -189,7 +222,7 @@ def test_webhook_format_keys_exist_in_both_dictionaries():
         "whfmt.", [f"{k}Help" for k in kinds]
     )
     assert not missing, f"formats without a dictionary entry: {missing}"
-    assert _select_values("webhook_format") == kinds
+    assert _js_option_values("WEBHOOK_FORMATS") == kinds
 
 
 def test_webhook_level_keys_exist_in_both_dictionaries():
@@ -201,7 +234,7 @@ def test_webhook_level_keys_exist_in_both_dictionaries():
     assert kinds == [db.INFO, db.WARNING, db.CRITICAL], "WebhookLevel and db severities drifted apart"
     missing = _both_dictionaries_define("whlvl.", kinds)
     assert not missing, f"levels without a dictionary entry: {missing}"
-    assert _select_values("webhook_min_severity") == kinds
+    assert _js_option_values("WEBHOOK_LEVELS") == kinds
 
 
 def test_selftest_interval_options_match_the_backend():

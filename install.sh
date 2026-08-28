@@ -6,7 +6,13 @@
 #
 # Usage:
 #   ./install.sh [--ctid 950] [--hostname pve-usv] [--storage local-lvm] \
-#                [--bridge vmbr0] [--ip dhcp] [--memory 256] [--disk 4]
+#                [--bridge vmbr0] [--ip dhcp] [--memory 256] [--disk 4] \
+#                [--allow-ceph-storage]
+#
+# The container must NOT live on Ceph storage: it has to keep running while the
+# cluster it is shutting down goes away. Ceph-backed storages are therefore skipped
+# when picking one automatically and refused when named with --storage, unless
+# --allow-ceph-storage is given.
 #
 set -euo pipefail
 
@@ -41,6 +47,7 @@ GATEWAY=""
 MEMORY=256
 DISK=4
 TEMPLATE="debian-12-standard"
+ALLOW_CEPH_STORAGE=0    # see the Ceph guard below
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -52,6 +59,7 @@ while [[ $# -gt 0 ]]; do
     --gateway) GATEWAY="$2"; shift 2;;
     --memory) MEMORY="$2"; shift 2;;
     --disk) DISK="$2"; shift 2;;
+    --allow-ceph-storage) ALLOW_CEPH_STORAGE=1; shift;;
     *) echo "Unknown option: $1"; exit 1;;
   esac
 done
@@ -67,18 +75,63 @@ fi
 # Lists storage names that support a given content type.
 _storages_for() { pvesm status --content "$1" 2>/dev/null | awk 'NR>1 {print $1}'; }
 
+# Storage TYPE, from column 2 of `pvesm status` (Name Type Status Total Used Free %).
+# The content check above says a storage can hold a container; only the type says what
+# it is made of.
+_storage_type() { pvesm status 2>/dev/null | awk -v s="$1" 'NR>1 && $1==s {print $2}'; }
+
+# This container is the one guest that has to OUTLIVE the cluster it shuts down. On Ceph
+# it does not: once the OSDs of the nodes going down drop the pool below min_size, the
+# appliance's own IO blocks and it can no longer tell anything to power off - halfway
+# through the outage, with the battery draining. So a Ceph-backed rootfs is refused
+# rather than warned about, and --allow-ceph-storage is the deliberate way past it.
+CEPH_STORAGE_TYPES="rbd cephfs"
+_is_ceph_storage() {
+  local _t; _t="$(_storage_type "$1")"
+  [[ -n "$_t" ]] && grep -qw -- "$_t" <<<"$CEPH_STORAGE_TYPES"
+}
+_ceph_storage_note() {
+  echo "Storage '$1' is Ceph-backed (type '$(_storage_type "$1")')."
+  echo "This container must not live on Ceph: when the cluster is shut down its own"
+  echo "disk stops answering, so it can no longer shut anything down. Use a local"
+  echo "storage (local-lvm, local-zfs, dir) instead."
+  echo "If you really mean it, re-run with --allow-ceph-storage."
+}
+
 ROOTDIR_STORAGES="$(_storages_for rootdir)"
 if [[ -n "$STORAGE" ]]; then
   grep -qx "$STORAGE" <<<"$ROOTDIR_STORAGES" || {
     echo "Storage '$STORAGE' does not exist or cannot hold containers (content 'rootdir')."
     echo "Available: $(echo $ROOTDIR_STORAGES)"; exit 1; }
+  if _is_ceph_storage "$STORAGE"; then
+    if [[ "$ALLOW_CEPH_STORAGE" -eq 1 ]]; then
+      echo "!! WARNING: '$STORAGE' is Ceph-backed and you asked for it anyway."
+      echo "!! This appliance will freeze mid-shutdown once the pool loses min_size."
+    else
+      # Refused, never prompted: the documented install path is `curl ... | bash`, where
+      # stdin IS the script - a prompt would either hang or eat the rest of it.
+      _ceph_storage_note "$STORAGE"; exit 1
+    fi
+  fi
 else
-  # Prefer the usual defaults, otherwise the first suitable storage.
+  # Prefer the usual defaults, otherwise the first suitable storage - skipping anything
+  # Ceph-backed, so the automatic path can never land there.
   for _cand in local-lvm local-zfs $ROOTDIR_STORAGES; do
-    if grep -qx "$_cand" <<<"$ROOTDIR_STORAGES"; then STORAGE="$_cand"; break; fi
+    if grep -qx "$_cand" <<<"$ROOTDIR_STORAGES" && ! _is_ceph_storage "$_cand"; then
+      STORAGE="$_cand"; break
+    fi
   done
   [[ -n "$STORAGE" ]] || {
-    echo "No storage with content 'rootdir' found. Specify one with --storage <name>."; exit 1; }
+    echo "No local storage with content 'rootdir' found."
+    if [[ -n "$ROOTDIR_STORAGES" ]]; then
+      echo "Only Ceph-backed ones are available: $(echo $ROOTDIR_STORAGES)"
+      echo "This container must not live on Ceph - it has to outlive the cluster it"
+      echo "shuts down. Add a local storage, or force it with"
+      echo "--storage <name> --allow-ceph-storage."
+    else
+      echo "Specify one with --storage <name>."
+    fi
+    exit 1; }
   echo ">> Storage picked automatically: $STORAGE"
 fi
 

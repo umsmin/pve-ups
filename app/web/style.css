@@ -157,6 +157,8 @@ main { max-width: var(--maxw); margin: 22px auto 8px; padding: 0 18px; }
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-lg);
   padding: 18px; margin-bottom: 16px; box-shadow: var(--shadow);
 }
+/* Drop target feedback for the update card (drag & drop of a release package). */
+.card.dropping { border-color: var(--border-strong); border-style: dashed; }
 .card-h {
   display: flex; align-items: center; gap: 10px;
   margin: -2px 0 14px;
@@ -326,6 +328,22 @@ table.mini td { border: none; padding: 5px 6px; }
 }
 /* "★ dieser" marker — mirrors the ★ on the appliance host in the topology diagram */
 .chip.star { color: var(--text); border-color: var(--border-strong); font-weight: 650; }
+/* Feature still gathering field experience (cluster preparation, since 4.0.0) */
+.chip.beta { color: var(--warn); border-color: var(--warn-bd); background: var(--warn-soft); }
+/* Node name that does not match the API behind the host entry (see proxmox.NODE_STATES).
+   Same colours as .chip.beta, a different name so the two can drift apart later. */
+.chip.warn { color: var(--warn); border-color: var(--warn-bd); background: var(--warn-soft); }
+/* The three cluster switches as one set-apart group inside the host card. The card is
+   --surface-2, so --surface reads as a quiet inset rather than another box. */
+.clusterbox {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 10px 12px; margin-bottom: 12px;
+}
+/* Indented, so master switch -> sub-options is visible without a second border. */
+.clusterbox .h_clusteropts { margin-top: 8px; padding-left: 18px; }
+/* Splits the box where the manuals split: cluster basics above, the far heavier
+   hyper-converged part (which stops every guest) below. */
+.clusterbox .clustersep { margin: 12px 0 8px; border: 0; border-top: 1px solid var(--border); }
 
 /* event severities -> dot badge */
 .sev { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; font-size: 12px; }

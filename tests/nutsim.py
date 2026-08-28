@@ -25,6 +25,7 @@ SCENARIOS: dict[str, dict[str, str]] = {
         "ups.status": "OL",
         "battery.charge": "100",
         "battery.runtime": "2520",
+        "ups.load": "37",
     },
     # Power outage, still plenty of runtime.
     "battery": {
@@ -33,6 +34,7 @@ SCENARIOS: dict[str, dict[str, str]] = {
         "ups.status": "OB DISCHRG",
         "battery.charge": "82",
         "battery.runtime": "1080",
+        "ups.load": "41",
     },
     # Outage, the UPS itself reports a low battery -> immediate trigger.
     "low": {
@@ -41,6 +43,7 @@ SCENARIOS: dict[str, dict[str, str]] = {
         "ups.status": "OB LB DISCHRG",
         "battery.charge": "12",
         "battery.runtime": "120",
+        "ups.load": "44",
     },
     # A driver that publishes neither runtime nor charge — the wizard must warn about it.
     "sparse": {

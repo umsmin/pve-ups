@@ -226,6 +226,10 @@ class HostConfig(BaseModel):
     privilege name, node path) lives in the client module behind app/targets.py.
     """
 
+    # Identity, mirroring UpsBase and WebhookConfig: ``id`` is a stable slug (auto-filled
+    # on save), ``name`` the label. Both are needed because ``name`` is edited — it is the
+    # Proxmox node name, and correcting a typo in it must not read as "a different host".
+    id: str = ""
     name: str  # Proxmox node name, e.g. "pve01"; a free label for products that ignore it
     api_url: str  # e.g. "https://10.0.0.10:8006"
     method: ShutdownMethod = ShutdownMethod.api_token
@@ -249,10 +253,16 @@ class HostConfig(BaseModel):
     def key(self) -> str:
         """Stable runtime key (shutdown latches, per-host state, secret reconcile).
 
-        Hosts have no id field, so the name carries that role — but a PVE and a PBS
-        entry may legitimately share one, which must not make them share a latch.
+        The id, precisely because it does not change when the entry does. It used to be
+        "<type>:<name>", which tied identity to an editable field: correcting a node name
+        discarded the stored token secret and the self-test result, and two entries sharing
+        a type and a name — a duplicated row with the IP not adjusted — shared one shutdown
+        latch, so only the first of them was ever fired.
+
+        Falls back to the old form while the id is still empty (a config loaded but not yet
+        through assign_host_ids), because this key must never be blank.
         """
-        return f"{getattr(self, 'type', 'pve')}:{self.name}"
+        return self.id or f"{getattr(self, 'type', 'pve')}:{self.name}"
 
     @property
     def api_node(self) -> str:
@@ -272,6 +282,45 @@ class PveHostConfig(HostConfig):
     # YAML/JSON "pve" validates directly and round-trips through yaml.safe_dump
     # untouched. HostType stays the single list of valid values.
     type: Literal["pve"] = "pve"
+
+    # --- cluster preparation (PBS has no cluster, hence only here) -------------
+    # Opt-in: writing to a cluster's Ceph and HA state is never done unasked. Members of
+    # one cluster are grouped at runtime by the cluster name discovered from the API,
+    # not from configuration.
+    cluster: bool = False
+    # Whether the whole cluster goes down as soon as ONE of its nodes is due.
+    #
+    # Default on, because the preparation is already cluster-wide: it disarms HA and — with
+    # the Ceph option — stops every guest in the cluster. Shutting down only the nodes whose
+    # own UPS happened to trigger then leaves the rest standing with no guests, HA disarmed
+    # and the maintenance flags set. On a hyper-converged cluster that is worse than it
+    # sounds: take two of three monitors down and Ceph has no quorum, so the survivors have
+    # no working storage either. Matching the shutdown to the preparation is the only
+    # coherent option; the alternative is two different notions of "the cluster".
+    #
+    # Turn it off for a plain cluster where HA should recover the guests of a single failing
+    # node onto the others — there a partial shutdown is a perfectly good outcome.
+    cluster_shutdown_all: bool = True
+    # Split because the privileges differ sharply: the Ceph flags need Sys.Modify, while
+    # arming/disarming HA needs Sys.Console — effectively shell access to the nodes. Who
+    # only wants the Ceph part must not be forced to hand out Sys.Console.
+    #
+    # Off by default, unlike the disarm below: Ceph is the exception rather than the rule
+    # (ZFS replication, NFS/iSCSI), and on a cluster without it every single attempt would
+    # fail. Writing into someone's storage layer is opted into, never inherited from
+    # ticking "this is a cluster member".
+    #
+    # This one switch covers the WHOLE hyper-converged procedure, not just the flags:
+    # stopping every guest cluster-wide first, then setting the flags (see
+    # cluster._prepare). The guest stop deliberately has no switch of its own — with Ceph
+    # it is not optional but the first step of the official procedure, and a tick whose
+    # absence hangs the cluster during a power cut would be a trap. Without Ceph nothing
+    # of this runs, which is why a plain cluster is unaffected.
+    cluster_ceph: bool = False
+    # Kept even where the endpoint is missing (PVE < 9.2): the value is checked against
+    # runtime feature detection, so an upgrade to 9.2 activates it without the user
+    # having to notice and re-tick anything.
+    cluster_ha_disarm: bool = True
 
 
 class PbsHostConfig(HostConfig):
@@ -296,6 +345,31 @@ TARGET_MODELS: dict[str, type[HostConfig]] = {
     "pve": PveHostConfig,
     "pbs": PbsHostConfig,
 }
+
+
+class ApplianceConfig(BaseModel):
+    """Where this appliance itself runs, so a cluster-wide guest shutdown skips it.
+
+    One appliance runs in one guest, so this is a single top-level block rather than a
+    per-host field: with three cluster members the same fact would otherwise be entered
+    three times and could be entered inconsistently. It is not a per-*cluster* setting
+    either — there is no cluster config object by design (members are grouped at runtime
+    by the name the API reports).
+
+    ``self_vmid`` is picked from a list in the UI (POST /api/cluster/guests), never typed:
+    a mistyped id means the appliance shuts *itself* down in the middle of an outage.
+    ``self_node`` is written along with that choice and disambiguates two guests sharing
+    a name. Both empty means "not picked yet" — the guest stop then refuses rather than
+    guessing (see engine._prepare_clusters).
+    """
+
+    self_vmid: Optional[int] = None
+    self_node: str = ""
+    # Explicit opt-out for an appliance that genuinely is not a guest of a managed
+    # cluster (Docker on a NAS, bare metal). Deliberately NOT inferred from
+    # PVE_USV_DEPLOYMENT=docker: a Docker container can perfectly well run inside a VM
+    # of the very cluster being shut down.
+    self_external: bool = False
 
 
 class Thresholds(BaseModel):
@@ -329,6 +403,45 @@ class Thresholds(BaseModel):
     # Seconds to wait for a guest/node shutdown to be accepted before moving on.
     host_shutdown_timeout_s: int = 60
 
+    # How long mains have to be back — every UPS reachable, on mains and no longer
+    # triggered — before the appliance releases the shutdown latches by itself and is
+    # ready for the next outage. Without it the latches only ever came off through the
+    # manual "Reset state" button or a restart of the service, so a second outage found
+    # every host still flagged as fired and shut down nothing. The delay exists because
+    # mains coming back is not the same as mains staying: a grid that flickers would
+    # otherwise re-arm between two dips. None = never, i.e. manual only (the pre-4.0
+    # behaviour). Restoring a prepared cluster stays manual either way.
+    rearm_after_mains_min: Optional[int] = 5
+
+    # Total budget for the cluster preparation (Ceph flags + HA disarm) per cluster.
+    # It runs while the battery drains, so it is a hard ceiling, not a per-call timeout —
+    # but it IS the budget the HA disarm waits out (see cluster._prepare), so a value
+    # under half a minute mostly buys a failed verification: CRM and every LRM work in
+    # rounds of ten seconds, and the disarm is only done once the last watchdog is
+    # released. The nodes of that cluster wait for this, so it is time off the battery.
+    cluster_prep_timeout_s: int = 60
+
+    # What to do when the preparation fails or times out. Default: shut down anyway.
+    # A failed disarm leaves the LRM armed, and an armed LRM still stops the guests
+    # itself — degraded (HA churn on the other nodes) but safe. Aborting instead would
+    # mean letting the cluster lose power uncontrolled when the battery runs out.
+    cluster_abort_on_prep_failure: bool = False
+
+    # Budget for the cluster-wide guest shutdown, which runs between the HA disarm and
+    # the Ceph flags. Deliberately its own number and NOT a share of the one above: that
+    # one is documented as the time the HA disarm gets and is measured in CRM/LRM rounds
+    # of ten seconds (a control-plane property, essentially constant), while this one is
+    # measured against how long *this* estate takes to stop and scales with the number of
+    # guests. Folding them together would silently reinterpret an existing setting and
+    # start starving the disarm.
+    cluster_guest_shutdown_timeout_s: int = 300
+
+    # After how many seconds a guest that ignores the shutdown request is stopped hard.
+    # None = never force, i.e. a hung guest makes the preparation fail and says so. The
+    # value is also handed to Proxmox as the shutdown call's own timeout, so the kill
+    # still happens if we lose the network right after asking.
+    cluster_guest_force_after_s: Optional[int] = 120
+
 
 class WebhookFormat(str, Enum):
     """Shape of the payload the webhook POSTs (see app/notify.py: FORMATTERS).
@@ -340,6 +453,10 @@ class WebhookFormat(str, Enum):
     json = "json"  # {"subject", "body", "severity", "status"} — the full status snapshot
     teams = "teams"  # Microsoft Teams adaptive card (Workflows / incoming webhook)
     text = "text"  # human-readable plain text, sent as text/plain
+    slack = "slack"  # Slack incoming webhook (attachment with a colour bar)
+    discord = "discord"  # Discord webhook (embed with fields)
+    ntfy = "ntfy"  # ntfy.sh: plain body plus Title/Priority/Tags headers
+    custom = "custom"  # user-defined body with {{placeholder}} substitution
 
 
 class WebhookLevel(str, Enum):
@@ -355,11 +472,39 @@ class WebhookLevel(str, Enum):
 
 
 class WebhookConfig(BaseModel):
+    # Identity, mirroring UpsBase: ``id`` is a stable slug (auto-filled on save), ``name``
+    # the label shown in the UI. Several webhooks may point at different chat systems.
+    id: str = ""
+    name: str = ""
+
     enabled: bool = False
     url: str = ""
     # POSTs a rendered notification on each notable event that passes ``min_severity``.
     format: WebhookFormat = WebhookFormat.json
     min_severity: WebhookLevel = WebhookLevel.warning
+
+    # ``custom`` format only: the body to send, with {{placeholder}} substitution (see
+    # app/notify.py: _render_custom). Deliberately NOT an expression language — plain
+    # replacement covers the target systems without putting a template engine on the
+    # notification path.
+    template: str = ""
+    content_type: str = "application/json"
+
+    # Optional single auth header (e.g. "Authorization: Bearer …" for ntfy, or an API-key
+    # header). One named header rather than a free-form map: it covers the real cases and
+    # keeps the value on the proven masked-secret path below.
+    auth_header_name: str = ""
+    auth_header_value: SecretStr = SecretStr("")
+
+    @property
+    def label(self) -> str:
+        """Display label, falling back to the id and finally the format."""
+        return self.name or self.id or getattr(self.format, "value", self.format) or "Webhook"
+
+    @classmethod
+    def secret_fields(cls) -> dict[str, str]:
+        """Secret field names -> default value, for the API's masked-secret reconcile."""
+        return {"auth_header_value": ""}
 
     @field_validator("format", mode="before")
     @classmethod
@@ -387,7 +532,29 @@ class WebhookConfig(BaseModel):
 class Notifications(BaseModel):
     # Legacy configs (< 3.0.0) may still contain a ``smtp`` block; Pydantic ignores
     # unknown keys, so it is dropped silently on load and gone after the next save.
-    webhook: WebhookConfig = WebhookConfig()
+    webhooks: list[WebhookConfig] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_webhook_list(cls, data):
+        """Turn the pre-4.0 single ``webhook: {...}`` block into a one-element list.
+
+        Same rule as the UPS/host migrations: an existing config.yaml, a backup import and
+        the form POST of a stale, cached app.js all pass through here, so none of them may
+        be refused over a key whose shape simply changed. A malformed block is dropped
+        rather than rejected — losing one webhook is fixable, a refused import is not.
+        """
+        if not isinstance(data, dict):
+            return data
+        legacy = data.pop("webhook", None)
+        if legacy is not None and not data.get("webhooks"):
+            if isinstance(legacy, BaseModel):
+                legacy = legacy.model_dump()
+            if isinstance(legacy, dict):
+                legacy = dict(legacy)
+                legacy.setdefault("id", "webhook1")
+                data["webhooks"] = [legacy]
+        return data
 
 
 class AppConfig(BaseModel):
@@ -401,6 +568,9 @@ class AppConfig(BaseModel):
     hosts: list[ShutdownTarget] = Field(default_factory=list)
     thresholds: Thresholds = Thresholds()
     notifications: Notifications = Notifications()
+    # Where the appliance itself runs. A config written before this existed validates to
+    # the defaults, so no migration validator is needed.
+    appliance: ApplianceConfig = ApplianceConfig()
 
     # Scheduled self-test: verify the API token + power-management privilege still work,
     # so a broken/expired credential is caught long before a real outage needs it.
@@ -536,10 +706,40 @@ class AppConfig(BaseModel):
         active = [h for h in self.hosts if h.enabled]
         return sorted(active, key=lambda h: (h.this_host, h.order, h.name))
 
+    def duplicate_api_urls(self) -> list[str]:
+        """API URLs shared by more than one enabled target, normalised.
 
-def _slugify(text: str) -> str:
+        Almost always a copy-paste slip (entry duplicated, IP not adjusted), and the one
+        state in which the node name still decides where a shutdown lands — see
+        api_url_is_unique(). Across all types on purpose: two Backup Servers on one URL is
+        the same mistake as two PVE nodes.
+        """
+        seen: dict[str, int] = {}
+        for host in self.hosts:
+            if host.enabled:
+                key = _norm_api_url(host.api_url)
+                seen[key] = seen.get(key, 0) + 1
+        return sorted(url for url, count in seen.items() if url and count > 1)
+
+    def api_url_is_unique(self, host: HostConfig) -> bool:
+        """Whether this entry is the only enabled target behind its API URL.
+
+        This is what makes "the node behind this URL" unambiguous, and therefore what
+        decides whether the shutdown may address /nodes/localhost instead of a configured
+        name (see app/proxmox.py). Where a URL serves several entries, PVE's proxying is
+        the only thing that tells them apart, so the name has to stay in the path.
+        """
+        return _norm_api_url(host.api_url) not in self.duplicate_api_urls()
+
+
+def _norm_api_url(url: str) -> str:
+    """Compare form of an API URL — case and a trailing slash are not a difference."""
+    return (url or "").strip().rstrip("/").lower()
+
+
+def _slugify(text: str, fallback: str = "ups") -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
-    return slug or "ups"
+    return slug or fallback
 
 
 def assign_ups_ids(ups: list[UpsBase]) -> None:
@@ -555,6 +755,47 @@ def assign_ups_ids(ups: list[UpsBase]) -> None:
             candidate = f"{base}-{n}"
             n += 1
         u.id = candidate
+        taken.add(candidate)
+
+
+def assign_host_ids(hosts: list[HostConfig]) -> None:
+    """Fill empty host ids with stable, collision-free slugs (in place).
+
+    Same job as assign_ups_ids, and needed for the same reason: the id is what the UI's
+    per-card secret reconcile matches on, and what the engine latches shutdowns against —
+    so it has to survive renaming, reordering, and two entries carrying the same name.
+    """
+    taken = {h.id for h in hosts if h.id}
+    for i, h in enumerate(hosts, start=1):
+        if h.id:
+            continue
+        base = _slugify(h.name, f"host{i}") if h.name else f"host{i}"
+        candidate = base
+        n = 2
+        while candidate in taken or candidate == "":
+            candidate = f"{base}-{n}"
+            n += 1
+        h.id = candidate
+        taken.add(candidate)
+
+
+def assign_webhook_ids(hooks: list[WebhookConfig]) -> None:
+    """Fill empty webhook ids with stable, collision-free slugs (in place).
+
+    Same job as assign_ups_ids: the id is what the UI's per-card secret reconcile matches
+    on, so it has to survive renaming and reordering.
+    """
+    taken = {h.id for h in hooks if h.id}
+    for i, h in enumerate(hooks, start=1):
+        if h.id:
+            continue
+        base = _slugify(h.name) if h.name else f"webhook{i}"
+        candidate = base
+        n = 2
+        while candidate in taken or candidate == "":
+            candidate = f"{base}-{n}"
+            n += 1
+        h.id = candidate
         taken.add(candidate)
 
 
@@ -581,7 +822,17 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
         return AppConfig()
     with path.open("r", encoding="utf-8") as fh:
         data = yaml.safe_load(fh) or {}
-    return AppConfig.model_validate(data)
+    cfg = AppConfig.model_validate(data)
+    # A config written before hosts had ids gets them here, so the runtime keys and the
+    # ids the UI sends back are id-based from the first request on. Nothing is written to
+    # disk until the next save, which is enough: the assignment is deterministic.
+    #
+    # UPS ids for the same reason, and because an empty one is worse than a wrong one: the
+    # engine keys its per-UPS runtime on the id, so a hand-written entry without one would
+    # be polled and its answer then dropped — the device would simply never trigger.
+    assign_ups_ids(cfg.ups)
+    assign_host_ids(cfg.hosts)
+    return cfg
 
 
 def save_config(cfg: AppConfig, path: Path = CONFIG_PATH) -> None:
