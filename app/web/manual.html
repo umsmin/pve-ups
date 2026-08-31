@@ -167,7 +167,7 @@
   <header class="topbar">
     <span class="brand">
       <svg class="mark icon-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 5v6c0 5 3.4 8.5 8 11 4.6-2.5 8-6 8-11V5l-8-3z"/></svg>
-      PVE-UPS <span class="sub">User Manual · v4.0.0</span>
+      PVE-UPS <span class="sub">User Manual · v4.1.0</span>
     </span>
     <span class="spacer"></span>
     <a class="btn" href="https://github.com/ffind-dev/pve-ups" target="_blank"
@@ -521,13 +521,38 @@ proxmox-backup-manager acl update /system/status Admin --auth-id 'ups@pbs!shutdo
           <li><b>“stale data”</b> (NUT): upsd answers, but its driver has lost contact with
           the UPS. The values it still serves are old, so PVE-UPS treats the UPS as
           unreachable — an alarm, never a shutdown. Restart the NUT driver on that machine.</li>
+          <li><b>The power source object is missing or reports “unknown”</b>: the device
+          answers and other values arrive, but the one object that says whether it runs on
+          mains or on battery (<code>upsOutputSource</code>, on APC
+          <code>upsBasicOutputStatus</code>) does not. Nothing can be concluded from that,
+          so PVE-UPS treats the UPS as unreachable — an alarm, never a shutdown, and a
+          running battery countdown keeps running. Check the MIB setting; if the device
+          genuinely does not implement it, it cannot be used as a shutdown source.</li>
+          <li><b><code>ups.status</code> names neither <code>OL</code> nor <code>OB</code></b>
+          (NUT): the same case on the NUT side. The variable is there, but it carries only
+          something like <code>CHRG</code>, <code>ALARM</code> or <code>RB</code> — or is
+          empty — and none of that says where the power comes from. Treated exactly as
+          above: unreachable, an alarm, never a shutdown, and a running countdown keeps
+          running. Usually a driver quirk; check the driver on the NUT server.</li>
         </ul>
+        <div class="callout info">
+          <span><b>All of these devices answered.</b> PVE-UPS keeps that deliberately apart
+          from a device that has gone silent, because <b>“Shutdown on pure communication
+          loss”</b> (see <a href="#ausloeser">Triggers</a>) fires on silence only. A UPS
+          that answers unusably never arms it — and neither does an entry that was never
+          pollable in the first place, such as a UPS card saved without an address. The
+          alarm says which of the two it is, so it does not send you to a network that is
+          working.</span>
+        </div>
       </section>
 
       <section class="card" id="logik">
         <h2 class="sec"><span class="n">6</span> How it works &amp; logic</h2>
         <p>The engine polls all UPS devices in parallel and evaluates <b>each UPS
-        independently</b>. Per UPS there is a simple state sequence:</p>
+        independently</b>. Each poll carries its own deadline, derived from that
+        device&rsquo;s timeout and retry settings, so one server that accepts a connection
+        and then goes quiet cannot hold up the countdown for the others. Per UPS there is a
+        simple state sequence:</p>
         <p>
           <span class="pill ok">ONLINE</span> on mains &nbsp;→&nbsp;
           <span class="pill warn">ON_BATTERY</span> power outage, UPS on battery &nbsp;→&nbsp;
@@ -591,11 +616,26 @@ proxmox-backup-manager acl update /system/status Admin --auth-id 'ups@pbs!shutdo
         Ceph on its own nodes, read
         <a href="#cluster-ceph">Hyper-converged clusters (Ceph)</a> afterwards — that part is
         a considerably larger intervention, with its own privileges.</p>
-        <p>Tick “Cluster member” in the <i>Proxmox VE cluster</i> box on the host card.
-        Members are grouped automatically by the cluster name read from the API, so no second
-        token and no extra configuration section is needed. Because the grouping is automatic,
-        it does not matter whether you tick one member or all of them — the preparation still
-        runs exactly once per cluster, before its first node goes down.</p>
+        <p>Tick “Cluster member” in the <i>Proxmox VE cluster</i> box on the host card —
+        on <b>every</b> node of the cluster. Members are grouped automatically by the cluster
+        name read from the API, so no second token and no extra configuration section is
+        needed, and the preparation runs exactly once per cluster, before its first node goes
+        down. What the tick decides is <i>who counts as a member</i>: a node without it is
+        prepared around rather than with, it is never taken along by “shut the whole cluster
+        down as a unit”, and its own switches have no say in what the cluster does.
+        What it does <b>not</b> opt the node out of is the preparation itself, which is
+        cluster-wide by nature: HA is disarmed for the whole cluster and, with Ceph, every
+        guest in it is stopped — including the ones running there. Leave the box unticked
+        on one node of a cluster and that machine is left running without HA and without its
+        guests. The scheduled self-test names such a node, so the mismatch is caught before
+        an outage rather than during one.</p>
+        <p>The three switches in this box all act on the <b>whole cluster</b> — Ceph
+        maintenance flags, the HA manager's arm state, and whether the cluster goes down as a
+        unit — even though they are edited per host card. So set each of them the same way on
+        every node of one cluster. Where they disagree, PVE-UPS goes with “at least one node
+        asked for it” (skipping a step that was asked for can cost the storage; running one
+        nobody asked for costs a maintenance flag) and writes a warning naming both sides, so
+        the mismatch shows up at the next self-test rather than during an outage.</p>
         <p>What it does on a plain cluster is one thing a per-node shutdown cannot do:</p>
         <ul>
           <li><b>HA disarm</b> — without it the HA manager recovers services onto nodes that
@@ -912,7 +952,19 @@ pveum role add UpsCluster -privs "Sys.Audit Sys.Console Sys.Modify VM.Audit VM.P
           <li><b>Shutdown after X minutes of pure loss</b> (default off): treats a pure
           communication loss (without previously confirmed battery operation) as an outage
           after X minutes. A deliberate opt-in for environments where a prolonged loss of
-          contact counts as critical.</li>
+          contact counts as critical. It fires on <em>silence</em> only: a device that
+          answers but whose answer cannot be used &mdash; no usable power source, none of
+          the objects of the selected MIB, a <code>ups.status</code> naming neither
+          <code>OL</code> nor <code>OB</code>, or a NUT server replying
+          <code>ERR&nbsp;DATA-STALE</code>, <code>DRIVER-NOT-CONNECTED</code>,
+          <code>ACCESS-DENIED</code> or <code>UNKNOWN-UPS</code> &mdash; is treated as
+          unreachable for every other purpose, but never as a communication loss. The
+          connection is plainly there, so this trigger stays out of it; the alarm says
+          which of the two it is. The same goes for an entry that is not pollable at all
+          (a UPS card saved without an address, e.g. from a backup import): it has never
+          sent a packet, so it has produced no evidence about the power either, and it
+          stays what it is elsewhere &mdash; an alarm and a refusal to shut down the hosts
+          it feeds, not an order to.</li>
         </ul>
         <h3>Case overview</h3>
         <table>
@@ -925,6 +977,7 @@ pveum role add UpsCluster -privs "Sys.Audit Sys.Console Sys.Modify VM.Audit VM.P
             <tr><td>Contact lost after an already fired trigger</td><td>trigger stays latched (no downgrade)</td></tr>
             <tr><td>Pure loss of contact with the opt-in active</td><td>shutdown once the threshold expires</td></tr>
             <tr><td>NUT server answers with stale data</td><td>counts as unreachable (alarm), never as “on mains”</td></tr>
+            <tr><td>UPS answers but reports no usable power source</td><td>counts as unreachable (alarm), never as “on mains”</td></tr>
             <tr><td>Dry-run active</td><td>trigger is detected + logged, nothing is shut down</td></tr>
             <tr><td>Mains returns</td><td>state is reset; a shutdown already sent is
             released after “Re-arm after mains back”</td></tr>
@@ -937,6 +990,49 @@ pveum role add UpsCluster -privs "Sys.Audit Sys.Console Sys.Modify VM.Audit VM.P
         <p><b>One</b> matching condition is enough. All values can be changed in the wizard
         (empty field = condition off); thresholds are set globally and can be overridden per
         UPS.</p>
+        <p><b>How &ldquo;on battery longer than&rdquo; is measured.</b> PVE-UPS times the
+        outage on its own clock, from the poll in which it first saw the UPS switch to
+        battery. It deliberately does <em>not</em> use the elapsed-time counter the UPS
+        reports: the standard defines that value only while the device is on battery, and a
+        card that keeps the previous outage&rsquo;s figure instead of clearing it would make
+        the very first poll of a new outage look like the threshold had already passed. That
+        counter is not read at all. The running timer survives a restart of the service, so
+        an update or a reboot does not lose it; only where that stored timer is unusable
+        (missing, or older than a day) does an appliance starting into an outage already in
+        progress begin counting from zero &mdash; and the runtime, charge and
+        &ldquo;battery low&rdquo; conditions read fresh values and are unaffected. The status
+        page states whether an elapsed time was measured at all.</p>
+        <p><b>A restored timer waits for the UPS to confirm the outage.</b> This appliance
+        shuts its own host down last, so <em>every</em> outage ends with it being
+        restarted &mdash; and it comes back to a stored timer saying &ldquo;on battery
+        since three hours ago&rdquo;. That is exactly the moment a switch is still
+        converging and an SNMP card still coming up, and a timer taken at face value then
+        would shut the machines that had just come back up down again. So nothing read
+        from the stored file shuts anything down until one poll of the restarted service
+        has answered. That answer settles it either way: on mains, everything restored is
+        dropped; still on battery, the trigger is worked out from the <em>full</em>
+        restored time on that same poll. A restart in the middle of an outage therefore
+        costs nothing, because there the UPS is reachable by definition. The only case
+        that loses the countdown is a UPS that never answers again after the restart
+        &mdash; and there the appliance has no evidence the outage is still running at
+        all, which is precisely when it does not act. While a timer is being held the
+        dashboard says so instead of counting down to a shutdown that will not happen.
+        A held timer also does not count as an outage for the checks that stand down during
+        one: the self-test, the start-up checks and <b>&ldquo;Restore cluster&rdquo;</b> stay
+        available, which matters because a UPS still silent after the appliance rebooted is
+        exactly when the cluster left over from the last outage has to be restored.</p>
+        <p><b>If a shutdown request fails</b> &mdash; a busy API, a dropped connection, or a
+        node that simply took too long to answer &mdash; that host is asked again on the
+        following polls, up to three attempts in total, and each one is in the event log.
+        A repeated request to a machine that is already powering down does no harm; not
+        asking again would leave it running until the battery is empty. If mains return
+        while a host is still being retried, the episode is closed like any other: the
+        appliance goes back to <span class="pill ok">ONLINE</span> and writes a critical
+        event saying that this machine never went down and is still running.</p>
+        <p><b>Values outside a sensible range are corrected, not obeyed.</b> A poll interval
+        of zero or a negative timeout falls back to its default and writes an event naming
+        the setting. This is deliberate: refusing to load the configuration instead would
+        mean the appliance no longer starts, which protects nothing at all.</p>
         <table>
           <thead><tr><th>Condition</th><th>Default</th></tr></thead>
           <tbody>
@@ -961,16 +1057,22 @@ pveum role add UpsCluster -privs "Sys.Audit Sys.Console Sys.Modify VM.Audit VM.P
         secrets</b>:</p>
         <ul>
           <li><code>GET /api/status</code> — the complete state: appliance, all UPS devices,
-          hosts, shutdown status, plus the events of the last 48 h including a severity
-          summary.</li>
+          hosts, shutdown status, the notification targets with the outcome of their last
+          delivery (<code>webhooks</code>, deliberately without the URL), plus the events of
+          the last 48 h including a severity summary.</li>
           <li><code>GET /api/health</code> — <code>200</code> when the engine is running
           (with version and UPS reachability), otherwise <code>503</code>. Ideal for uptime
           checks. It also reports the shutdown targets: <code>hosts_total</code>,
           <code>hosts_ok</code> (last self-test confirmed token <i>and</i> privilege),
-          <code>hosts_selftest_ok</code> and <code>hosts_selftest_at</code>. Those are
+          <code>hosts_selftest_ok</code> and <code>hosts_selftest_at</code>, the
+          notification targets (<code>webhooks_total</code>, <code>webhooks_ok</code> —
+          a target counts as ok until a send has provably failed, so one that has never been
+          tried does not read as broken) and <code>dry_run</code>. Those are
           informational — a broken token does <i>not</i> turn the endpoint into
           <code>503</code>, because the appliance itself is still doing its job. Alert on
-          <code>hosts_selftest_ok</code> separately if you want to be told.</li>
+          <code>hosts_selftest_ok</code>, <code>webhooks_ok</code> and <code>dry_run</code>
+          separately if you want to be told: an appliance left in dry-run passes every check
+          here, answers <code>ok</code>, and shuts nothing down.</li>
         </ul>
 <pre><code>curl http://&lt;container-ip&gt;:8080/api/status | jq
 # only critical events of the last 48 h:
@@ -990,6 +1092,14 @@ curl -s http://&lt;container-ip&gt;:8080/api/status \
         card per target, each with its own format, severity filter and test button. The
         sends run in parallel and are reported individually, so one unreachable target does
         not cost the others their notification.</p>
+        <p><b>A target that stops working says so.</b> An expired token or a deleted
+        connector used to fail invisibly, which meant you found out during the outage that
+        never reached you. The first failure after a working send is written to the event
+        log, the webhook card shows the last error until a send succeeds again, and the
+        dashboard&rsquo;s appliance card gains a &ldquo;Notifications&rdquo; line for as
+        long as any target is failing &mdash; the settings page is not where anyone is
+        looking while an outage runs. Notifications remain best-effort throughout: they are
+        never retried, and a failing target never delays or affects a shutdown.</p>
         <p><b>Format</b> — the shape of the payload, matching your target system:</p>
         <table>
           <thead><tr><th>Format</th><th>Sends</th></tr></thead>
@@ -1240,75 +1350,48 @@ systemctl start pve-usv-agent.service</code></pre>
         lives in the <a href="https://github.com/ffind-dev/pve-ups/blob/main/CHANGELOG.md"
         target="_blank" rel="noopener">GitHub repository</a>.</p>
 
+        <div class="cl-ver">4.1.0 <span class="date">2026</span></div>
+        <ul>
+          <li><b>A UPS reporting a stale “time on battery” no longer shuts everything down
+          at once.</b> The appliance measures the outage on its own clock now instead of
+          believing the counter the device reports — a counter the standard defines only
+          <em>while</em> the UPS is on battery and that plenty of cards keep from the last
+          outage. The running timer survives a restart of the service.</li>
+          <li><b>A UPS that answers without saying where its power comes from is an alarm,
+          not an all-clear.</b> For SNMP and NUT alike, such a reading no longer clears a
+          running countdown mid-outage — and it never counts as silence either, so
+          “Shutdown on pure communication loss” does not apply to a device that is
+          answering.</li>
+          <li><b>A shutdown that fails is retried</b> — three attempts instead of one, so a
+          busy Proxmox API or a dropped connection no longer leaves a machine running while
+          the dashboard reports it as handled.</li>
+          <li><b>A cluster only takes along the nodes that asked for it</b>, and the three
+          cluster switches are read once per cluster instead of off whichever node happened
+          to trigger first. See <a href="#cluster">section 6</a>.</li>
+          <li>Also: failed webhook deliveries are reported instead of failing invisibly, an
+          active dry-run says so on the dashboard, entries that cannot do their job (a host
+          without a token, a UPS without an address) are flagged, and no credential can
+          reach the public status endpoint.</li>
+        </ul>
+
         <div class="cl-ver">4.0.0 <span class="date">2026</span></div>
         <ul>
           <li><b>Proxmox VE clusters are prepared before the shutdown</b>
           <span class="pill warn">Beta</span>. Mark a node as a cluster member and PVE-UPS
-          disarms the HA manager — and, if you switch on the Ceph option, stops every guest
-          in the cluster and then sets the maintenance flags — once per cluster, before the
-          first node goes down; each step verified, all of it under hard timeouts. Stopping
-          the guests first is what makes a hyper-converged cluster survivable: node by node
-          the pool falls below <code>min_size</code> while guests are still running, their IO
-          blocks and the last node never powers off. Afterwards a <b>“Restore cluster”</b>
-          button on the dashboard arms HA again and clears the flags. Needs Proxmox VE 9.2 or
-          newer; marked Beta while it gathers field experience, and opt-in throughout. See
-          <a href="#cluster">section 6</a>, which now separates the plain cluster from the
-          <a href="#cluster-ceph">hyper-converged case</a> — the two differ far more, in
-          scope and in the rights they need, than one section could carry.</li>
-          <li><b>A cluster is shut down as a unit</b> (on by default). The preparation is
-          cluster-wide, the shutdown was per host, and when only some UPS devices triggered
-          the cluster ended up in halves: nodes standing there with every guest stopped, HA
-          disarmed and — on a hyper-converged cluster — no monitor quorum left either. Now
-          one node becoming due takes the whole cluster down with it, in the configured
-          order. Turn it off for a plain cluster where HA should move the guests of a single
-          failing node onto the others. The self-test also warns when the nodes of one
-          cluster hang on UPS devices that can trigger independently.</li>
-          <li><b>The installer refuses Ceph-backed storage for the container.</b> It has to
-          outlive the cluster it shuts down, which on Ceph it cannot.
-          <code>--allow-ceph-storage</code> overrides it.</li>
-          <li><b>A self-test runs automatically after the appliance re-arms</b>, so a token
-          that expired during the outage, a node that never came back or a cluster still left
-          prepared shows up right away instead of at the next scheduled slot.</li>
-          <li><b>“Run self-test now” on the dashboard.</b> Saving the settings deliberately
-          does not fire a credential check, and the next scheduled run may be hours away.
-          The button runs the host and cluster checks on the spot and always writes the
-          outcome to the event log.</li>
-          <li><b>The shutdown goes to the machine behind the API URL you entered</b>
-          (<code>/nodes/localhost/status</code>), so a mistyped “Node” can no longer
-          misdirect it — and Proxmox handles that form without consulting the cluster,
-          which is exactly what you want while nodes are dropping. The node name is still
-          checked against the API, because it labels the host everywhere: “Test” offers the
-          right one for a click and fills an empty field, and a name matching no node is
-          marked on the dashboard and reported by the self-test. On a cluster the check
-          goes one step further, since there every member is a name the API knows: where
-          the token may read <code>/cluster/status</code> (<code>Sys.Audit</code>, which the
-          cluster options need anyway), PVE-UPS also knows <i>which</i> member answered this
-          API URL, and a name belonging to a different one is reported as “other node” with
-          the right one offered for a click. Two entries sharing one
-          API URL are the exception in which the name still decides where the shutdown
-          lands — PVE-UPS warns about that on its own. See <a href="#token">section 4</a>.</li>
-          <li><b>Renaming a host no longer discards its API token.</b> Host entries used to
-          be identified by their node name — a field you edit — so correcting it read as “a
-          different host”: the stored token was lost and the test answered “Authentication
-          failed (token invalid?)” for a perfectly valid one. Two entries carrying the same
-          name also shared one shutdown state, which left the second machine running.</li>
+          disarms the HA manager once per cluster — and, with the Ceph option, stops every
+          guest and then sets the maintenance flags — before the first node goes down.
+          A <b>“Restore cluster”</b> button on the dashboard undoes it afterwards. Needs
+          Proxmox VE 9.2 or newer and is opt-in throughout; see
+          <a href="#cluster">section 6</a>.</li>
+          <li><b>A cluster is shut down as a unit</b> (on by default): one node becoming due
+          takes the whole cluster with it, in the configured order, instead of leaving half
+          a cluster standing with HA disarmed. Can be switched off.</li>
           <li><b>Several webhooks instead of one</b>, each with its own format, filter and
-          test button — and new formats for <b>Slack</b>, <b>Discord</b> and <b>ntfy</b>,
-          plus a <b>custom template</b> for anything else. An existing webhook is carried
-          over automatically. See <a href="#webhook">section 9</a>.</li>
-          <li><b>A brief UPS dropout no longer sends a notification.</b> A single lost SNMP
-          packet used to produce an immediate “connection lost” message; the loss is now
-          reported only after the configured number of failed polls in a row. The query
-          timeout, the retry count and that threshold are now all visible in the wizard.</li>
-          <li><b>Uploading a release package works in Safari again.</b> The file picker no
-          longer greys the archive out, and a <code>.tar</code> that Safari unpacked during
-          the download is accepted as well. Packages are now also checked before they are
-          applied, so a damaged upload is rejected with a clear message.</li>
-          <li><b>A browser tab that was open during an update asks to be reloaded</b>
-          instead of running the previous interface against the new backend — and it no
-          longer serves a stale <code>app.js</code> out of its cache after an update.</li>
-          <li>The <b>UPS output load</b> is shown on the status card where the device
-          reports it.</li>
+          test button — plus new formats for <b>Slack</b>, <b>Discord</b> and <b>ntfy</b>
+          and a <b>custom template</b>. See <a href="#webhook">section 9</a>.</li>
+          <li><b>The self-test is more useful</b>: it runs automatically after the appliance
+          re-arms, “Run self-test now” starts it on the spot, and renaming a host no longer
+          discards its API token. See <a href="#token">section 4</a>.</li>
         </ul>
 
         <div class="cl-ver">3.5.0 <span class="date">2026</span></div>

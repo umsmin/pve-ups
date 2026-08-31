@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -26,6 +27,20 @@ from . import __version__, db
 from .config import Notifications, WebhookConfig, WebhookFormat
 
 log = logging.getLogger("pve-usv.notify")
+
+# Total budget for one round of notifications, across all targets. The per-target
+# httpx timeout is 10 s, so this sits just above it: that one should be what normally
+# fires, because its message names the actual failure. Same doctrine (and the same
+# reason) as targets.DEADLINE_GRACE_S and sources.POLL_GRACE_S — this is the backstop
+# for what httpx does not bound, and a read timeout bounds one read, not a server that
+# dribbles a byte at a time.
+#
+# It matters because notify() is awaited from Engine._emit(), which is awaited from the
+# poll loop: from _evaluate_ups() before the hosts are even evaluated, from
+# _prepare_clusters() before the cluster preparation starts, and from _fire_host()
+# inside a shutdown stage — where the next stage, the appliance's own host, waits on it.
+# "Best effort" has to mean bounded, or a dead chat server spends the battery.
+NOTIFY_BUDGET_S = 12.0
 
 # Severity ranking for the "send from this level upwards" filter.
 _RANK = {db.INFO: 0, db.WARNING: 1, db.CRITICAL: 2}
@@ -293,6 +308,106 @@ async def send_webhook(
     return f"HTTP {resp.status_code}"
 
 
+# Last delivery per webhook id. Module level because notify() is a free function on the
+# engine's poll loop and there is one process with one configuration; engine.snapshot()
+# reads it so the UI can show a webhook that stopped working.
+DELIVERY: dict[str, dict] = {}
+
+
+def delivery_state() -> dict[str, dict]:
+    """Copy of the last delivery outcome per webhook id, for /api/status."""
+    return {k: dict(v) for k, v in DELIVERY.items()}
+
+
+def forget_deliveries(keep: set[str]) -> None:
+    """Drop the delivery record of every webhook id not in ``keep``.
+
+    Called when a new configuration arrives. The record is keyed by the webhook id, and
+    an id can come back: assign_webhook_ids() hands out "webhookN" for an entry that has
+    none, so a deleted target's failure would be inherited by an unrelated new one and
+    shown on its card as its own.
+    """
+    for key in list(DELIVERY):
+        if key not in keep:
+            del DELIVERY[key]
+
+
+# Anything that looks like a URL, so a stray one in an exception text cannot travel.
+_URL_RE = re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.-]*://\S+")
+
+
+def safe_error(result) -> str:
+    """One short, URL-free description of a failed send.
+
+    This exists because of where the string ends up. ``/api/status`` is deliberately
+    public and secret-free, and the webhook block is read straight out of it — while a
+    webhook URL IS the credential for Slack, Discord, Teams and ntfy alike. httpx spells
+    its status errors as "Client error '401 Unauthorized' for url '<the whole thing>'",
+    so storing ``str(exc)`` published the secret to anyone who could reach the appliance.
+    The second path is worse: the snapshot travels on as the ``status`` field of every
+    notification, so target A's URL would be POSTed to target B.
+
+    The full text still reaches the journal and the event log, neither of which is public.
+    """
+    if isinstance(result, httpx.HTTPStatusError):
+        # The status code is the whole diagnosis here (401 = token, 404 = deleted
+        # connector, 429 = rate limit) and it carries nothing secret.
+        return f"HTTP {result.response.status_code} {result.response.reason_phrase}".strip()
+    if isinstance(result, (asyncio.TimeoutError, TimeoutError)):
+        return f"No answer within {NOTIFY_BUDGET_S:.0f}s"
+    if isinstance(result, httpx.HTTPError):
+        # Transport failures (DNS, TLS, connect): the class name says which, and httpx
+        # puts the host in the message often enough that the text is not worth the risk.
+        return type(result).__name__
+    # Anything unforeseen: keep the text, but never a URL inside it.
+    return _URL_RE.sub("<url>", str(result) or type(result).__name__)
+
+
+def _record_delivery(hook: WebhookConfig, result) -> None:
+    """Remember how one send went, and say so in the product the first time it fails.
+
+    Until this existed, a failed notification reached exactly one place: a log.warning in
+    journald. Not the event log, not /api/health, not the UI. A webhook whose token had
+    expired therefore stopped working in complete silence, and the outage it was supposed
+    to announce was the moment you found out — while the *shutdown* credentials next door
+    get a scheduled self-test, a dashboard chip and an event of their own.
+
+    Reported once per run of failures, not once per event: during an outage the engine
+    emits steadily, and a dead target would otherwise bury the log it is competing with.
+    """
+    failed = isinstance(result, BaseException)
+    was_ok = DELIVERY.get(hook.id, {}).get("ok")
+    DELIVERY[hook.id] = {
+        "ok": not failed,
+        "at": datetime.now(timezone.utc).isoformat(),
+        # Sanitised, because this one is read out of the public /api/status — see
+        # safe_error(). The full text goes to the journal and the event log below.
+        "error": safe_error(result) if failed else None,
+    }
+    if not failed:
+        return
+    # The journal is the one place the untouched text may go: it is root-readable on the
+    # appliance and reaches no API at all.
+    log.warning("Webhook '%s' failed: %s", hook.label, result)
+    if was_ok is False:
+        return  # already reported for this run of failures
+    try:
+        # db.log_event directly, never through the engine's _emit: that one calls
+        # notify(), and a failing webhook would then notify about itself for ever.
+        #
+        # Sanitised as well, and not by oversight: /api/status ships the last 48 h of the
+        # event log alongside the snapshot, so an event body is exactly as public as the
+        # delivery state above.
+        db.log_event(
+            f"Webhook '{hook.label}' failed",
+            f"{safe_error(result)}. Notifications to this target are not arriving — check "
+            f"the URL, the format and any auth header under Settings -> Notifications.",
+            db.WARNING,
+        )
+    except Exception as exc:  # noqa: BLE001 - the event log must never break a send
+        log.warning("Event log write failed: %s", exc)
+
+
 async def notify(
     notifications: Notifications,
     subject: str,
@@ -300,12 +415,23 @@ async def notify(
     payload: dict,
     severity: str = db.INFO,
 ) -> None:
-    """Fire every configured webhook, swallowing all errors.
+    """Fire every configured webhook, swallowing all errors and never outlasting its budget.
 
     Everything is inside the guard, filter included: this runs on the engine's poll loop,
     which must never be brought down by a notification. The sends run concurrently and
     each is reported on its own, so one target that accepts the connection and then goes
     quiet cannot hold up the others — or the poll loop behind them.
+
+    Bounded as well as guarded, and that half was missing. Engine._emit() awaits this from
+    inside the poll loop: before the hosts are evaluated, before the cluster preparation
+    starts, and between two shutdown stages. Per-target httpx timeouts do not bound the
+    round — a read timeout bounds one read — so a target that answers a byte at a time
+    used to spend the battery while the engine waited. NOTIFY_BUDGET_S is the ceiling;
+    whatever has not answered by then is recorded as a timeout and abandoned.
+
+    Still awaited rather than fired and forgotten, deliberately: the appliance shuts its
+    own host down last and then loses power, so an event that has not been sent by the
+    time we get there is an event nobody ever receives.
     """
     try:
         hooks = [
@@ -315,12 +441,24 @@ async def notify(
         ]
         if not hooks:
             return
+        # Each send carries the ceiling, rather than one wait_for around the gather. The
+        # sends are concurrent, so the round still ends within the budget either way — but
+        # this way a target that answered keeps its real outcome instead of being filed
+        # under the timeout of the one that did not.
         results = await asyncio.gather(
-            *(send_webhook(h, subject, body, severity, payload) for h in hooks),
+            *(_send_bounded(h, subject, body, severity, payload) for h in hooks),
             return_exceptions=True,
         )
         for hook, result in zip(hooks, results):
-            if isinstance(result, BaseException):
-                log.warning("Webhook '%s' failed: %s", hook.label, result)
+            _record_delivery(hook, result)
     except Exception as exc:  # noqa: BLE001
         log.warning("Webhook notification failed: %s", exc)
+
+
+async def _send_bounded(
+    hook: WebhookConfig, subject: str, body: str, severity: str, payload: dict
+) -> str:
+    """One send, never longer than NOTIFY_BUDGET_S. Raises like send_webhook() does."""
+    return await asyncio.wait_for(
+        send_webhook(hook, subject, body, severity, payload), timeout=NOTIFY_BUDGET_S
+    )

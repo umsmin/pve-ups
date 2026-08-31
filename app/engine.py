@@ -48,6 +48,20 @@ SHUTTING_DOWN = "SHUTTING_DOWN"
 STATE_PATH = db.DB_PATH.parent / "engine-state.json"
 STATE_RESTORE_MAX_AGE_H = 24  # discard persisted timers older than this
 
+# How often one host is asked to shut down before the engine gives up on it for this
+# episode. A failure is not proof that the request did not arrive — targets.shutdown()
+# reports one when its deadline expires while the node was merely slow, and a busy
+# pveproxy answers 503 — so a single attempt used to cost the whole machine: it stayed
+# up until the battery died while the dashboard showed the episode as handled. Re-sending
+# to a node that is already going down is harmless.
+#
+# Attempts normally land one poll apart. The exception is the pass _evaluate_hosts runs
+# just before the ``this_host`` stage: nothing follows that stage — the appliance loses
+# power — so a host that failed earlier in the same sweep would otherwise never see its
+# second attempt at all. That one extra stage is the only retry cost shutdown_budget_s()
+# accounts for; see its docstring for why the rest are deliberately left out.
+MAX_SHUTDOWN_ATTEMPTS = 3
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -82,18 +96,134 @@ def _hostname() -> str:
     return name.strip()
 
 
-def shutdown_budget_s(th: Thresholds) -> int:
+@dataclass
+class ShutdownBudget:
     """Worst-case seconds from "trigger fires" to "the last node was told to go".
 
-    Pure, so the self-test warning and the UI hint quote the same number. The guest stop
-    is by far the largest term, which is exactly why it has to be visible next to the
-    battery reserve.
+    A breakdown rather than one number, because the warning that quotes it has to show its
+    working: an operator who is told "raise the trigger" needs to see which term is large.
+    It used to print an arithmetic of its own that no longer matched the total.
     """
-    return (
-        int(th.cluster_prep_timeout_s)
-        + int(th.cluster_guest_shutdown_timeout_s)
-        + int(th.host_shutdown_timeout_s)
+
+    stages: int = 1
+    host_s: int = 0
+    cluster_s: int = 0
+    inspect_s: int = 0
+    notify_s: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.host_s + self.cluster_s + self.inspect_s + self.notify_s
+
+    def explain(self) -> str:
+        """The terms, in the order they run, for the caller to put in parentheses."""
+        parts = []
+        if self.cluster_s:
+            parts.append(f"cluster preparation {self.cluster_s}s")
+        if self.inspect_s:
+            parts.append(f"cluster inspection {self.inspect_s}s")
+        parts.append(f"{self.stages} node stage(s) {self.host_s}s")
+        if self.notify_s:
+            parts.append(f"notifications {self.notify_s}s")
+        return " + ".join(parts)
+
+
+# How many events can be emitted one after another between a trigger firing and the last
+# shutdown stage, NOT counting the stages themselves: the outage notice, the four
+# cluster-preparation events, and the abort or partial-shutdown notice. Engine._emit()
+# AWAITS the notification round (deliberately — the appliance powers itself off last, so
+# an unsent event is an event nobody receives), and notify.NOTIFY_BUDGET_S bounds one
+# round. A dead chat server therefore costs real battery, and the number an operator sizes
+# a reserve against has to say so.
+#
+# Each shutdown stage adds one more round on top of this: every _fire_host() emits its
+# own "shutdown sent", and while the hosts inside one stage emit concurrently, the stages
+# themselves are sequential. shutdown_budget() therefore adds the stage count — a
+# constant alone could not, and understated a four-stage estate by three rounds.
+NOTIFY_EVENTS_ON_PATH = 6
+
+
+def shutdown_budget(cfg: AppConfig) -> ShutdownBudget:
+    """The worst case, broken down. Pure, so every caller quotes the same figures.
+
+    It counts what actually runs in SEQUENCE, which is what it used to get wrong: one
+    host timeout and one cluster preparation, when both are sequential loops. Hosts go in
+    stages — everything sharing an ``order`` at once, the appliance's own host alone at
+    the end — so four distinct order values cost four timeouts, not one. An operator
+    sizes their battery reserve against this figure, and it was several times too small.
+
+    One retry stage is counted, and only one. _evaluate_hosts() gives hosts that failed
+    earlier in the sweep a second attempt immediately before the ``this_host`` stage,
+    because no poll follows that stage to carry the retry. It runs concurrently, so it
+    costs one more host timeout, and it is worth counting for the same reason the stages
+    are: the operator sizes a battery reserve against this number.
+
+    The cluster inspection is counted where a cluster is configured: on a cold start (no
+    self-test since the last restart, or a configuration saved just before the outage) the
+    preparation reads the cluster from inside the shutdown path. Since 4.1.0 that is one
+    read per cluster rather than one per node, which is what makes it a term worth naming
+    instead of an unbounded one.
+
+    The cluster term follows the switches, not just the tick: the guest stop is the
+    largest single number here and it runs only where Ceph was asked for, so it is counted
+    only there. Reading it off ``cluster`` alone charged a plain cluster five minutes for a
+    step that cannot happen — and the battery-reserve warning below quotes this figure.
+
+    Two things it deliberately does not add. The number of clusters, because a pure
+    function over the config cannot know how many distinct clusters those hosts belong to
+    (the names come from the API); one is assumed, and a second one doubles the cluster
+    term. And the remaining attempts from MAX_SHUTDOWN_ATTEMPTS, because those land one
+    poll apart and only after a host has already failed — counting every one of them would
+    inflate the normal case threefold to warn about the abnormal one.
+    """
+    th = cfg.thresholds
+    enabled = [h for h in cfg.hosts if h.enabled]
+    stages = len({(h.this_host, h.order) for h in enabled}) or 1
+    # The pre-this_host retry pass only exists where there is both something to retry and
+    # a final stage to run before: a single stage has nothing ahead of it.
+    if stages > 1 and any(h.this_host for h in enabled):
+        stages += 1
+    clustered = any(h.enabled and getattr(h, "cluster", False) for h in cfg.hosts)
+    # The guest stop is the elastic half of the preparation and by far the largest term,
+    # and it only ever runs with Ceph (see _prepare_clusters: want_guests requires
+    # want_ceph). Counting it for a cluster whose members never ticked the Ceph switch
+    # added five minutes to a step that provably cannot happen — enough on a plain
+    # three-node cluster to push the total past the default 10-minute trigger and warn a
+    # perfectly sized installation that its battery reserve is too short. Still "err on
+    # the high side": _cluster_switches() resolves the switch as "any member asked for
+    # it", and any(cfg.hosts) is the superset of that.
+    ceph = any(h.enabled and getattr(h, "cluster_ceph", False) for h in cfg.hosts)
+    noisy = any(h.enabled and h.url for h in cfg.notifications.webhooks)
+    return ShutdownBudget(
+        stages=stages,
+        # The grace belongs in here: targets.shutdown() bounds a call at the configured
+        # timeout PLUS targets.DEADLINE_GRACE_S — the backstop for everything httpx does
+        # not bound — and it pays that per stage, not once. Left out, the figure was
+        # short by five seconds a stage, and this number exists to be sized against.
+        host_s=int(th.host_shutdown_timeout_s + targets.DEADLINE_GRACE_S) * stages,
+        cluster_s=(
+            int(th.cluster_prep_timeout_s)
+            + (int(th.cluster_guest_shutdown_timeout_s) if ceph else 0)
+            if clustered
+            else 0
+        ),
+        # The grace belongs in here for the same reason it does in host_s: cluster.inspect()
+        # is cut off at its budget PLUS cluster.DEADLINE_GRACE_S, and this figure may only
+        # ever err high. One inspection's time covers any number of nodes since 4.1.0 —
+        # _cold_inspect() runs them concurrently.
+        inspect_s=(
+            int(cluster.INSPECT_BUDGET_S + cluster.DEADLINE_GRACE_S) if clustered else 0
+        ),
+        # Plus one round per stage: see NOTIFY_EVENTS_ON_PATH.
+        notify_s=(
+            int(notify.NOTIFY_BUDGET_S) * (NOTIFY_EVENTS_ON_PATH + stages) if noisy else 0
+        ),
     )
+
+
+def shutdown_budget_s(cfg: AppConfig) -> int:
+    """The worst case as one number, for /api/status and the shutdown preview."""
+    return shutdown_budget(cfg).total
 
 
 def _prep_intent(wanted: bool, effective: bool, why_not: str) -> str:
@@ -134,6 +264,18 @@ class _UpsRuntime:
 
     state: UpsState = field(default_factory=UpsState)
     on_battery_since: Optional[datetime] = None
+    # True while this UPS carries state read off DISK that no poll of this process has
+    # confirmed yet (see _restore_state). Nothing restored may fire a shutdown while it
+    # is set and the device is silent — see _ups_trigger_reason(). Cleared by the first
+    # answer, whatever that answer is.
+    #
+    # The appliance shuts its OWN host down last, so every outage ends with this process
+    # being restarted and finding a state file that says "on battery since T0". If the UPS
+    # then misses the very first poll after that boot — a switch still converging, an SNMP
+    # card still coming up — the blind countdown read hours of elapsed time against a
+    # 600 s threshold and shut the freshly booted nodes down again, during normal
+    # operation, before the device had said a single word.
+    restored_unconfirmed: bool = False
     unreachable_count: int = 0
     unreachable_since: Optional[datetime] = None  # wall clock, for the comms-loss opt-in
     alarm_active: bool = False
@@ -210,9 +352,29 @@ class Engine:
         # fact like cluster_states, so it survives the episode teardown.
         self.cluster_guest_state: dict[str, dict] = {}
         # Hosts pulled into this episode's shutdown because their cluster goes down as
-        # a unit. They have no trigger reason of their own, so without this they would
-        # look "no longer eligible" on the next poll and have their latch released.
-        self.cluster_unit_hosts: set[str] = set()
+        # a unit, mapped to the reason that brought them in. They have no trigger reason
+        # of their own, so without this they would look "no longer eligible" on the next
+        # poll and have their latch released.
+        #
+        # The reason is kept, not just the membership, because it is what lets a failed
+        # attempt be retried. While this was a bare set, a unit host that failed its first
+        # shutdown was skipped on every later poll — the retry MAX_SHUTDOWN_ATTEMPTS
+        # promises never happened for it, and the event said "the next poll tries again"
+        # anyway. _prepare_clusters() cannot re-add it either: the per-episode latch makes
+        # it return before _unit_additions() runs.
+        self.cluster_unit_hosts: dict[str, str] = {}
+        # Hosts whose cluster could not be inspected at outage time. Kept apart from
+        # cluster_prep_failed because that one is keyed by cluster NAME, and the name is
+        # exactly what an unreachable inspection failed to establish.
+        self.cluster_inspect_failed: set[str] = set()
+        # Hosts that answered the inspection and turned out NOT to be a cluster member
+        # at all. A per-episode latch like the two above and for the same reason: without
+        # it the answer is settled but nobody records it, so every poll on which such a
+        # host is still due — a retried shutdown — pays for another full inspection of a
+        # question that cannot change. Kept apart from cluster_inspect_failed because that
+        # one means "we could not look", which is a different verdict with different
+        # consequences (abort-on-failure keys on it; this must never hold a node back).
+        self.cluster_standalone: set[str] = set()
         self._disarm_unsupported_warned: set[str] = set()
         # Set by the automatic re-arm, consumed by _maybe_selftest: right after a
         # re-arm is exactly when a leftover problem (an expired token, a cluster still
@@ -227,6 +389,10 @@ class Engine:
         # self-test report them, and on a process start with a due slot both run in the
         # same iteration — the operator would read the identical warning twice.
         self._dup_url_warned: set[str] = set()
+        self._stale_feed_warned: set[str] = set()
+        self._incomplete_warned: set[str] = set()
+        self._value_corrections_warned: set[str] = set()
+        self._reserve_warned: set[str] = set()
 
         # Daily housekeeping: keep the event log bounded.
         self.last_prune_date = None  # type: ignore[var-annotated]
@@ -243,6 +409,35 @@ class Engine:
         for uid in list(self.ups_rt):
             if uid not in ids:
                 del self.ups_rt[uid]
+
+    def _sync_host_states(self) -> None:
+        """Drop per-host bookkeeping for hosts that are no longer configured.
+
+        The sibling of _sync_runtimes, and it was missing. Both of the places that decide
+        whether an episode is over read these dicts WHOLESALE: _recompute_state() scans
+        every value of host_states, and _evaluate_hosts() ends the episode on
+        ``any(self.host_fired.values())``. A host that had fired and was then deleted
+        therefore kept the appliance on SHUTTING_DOWN and shutdown_triggered for ever —
+        which in turn stands down the self-test, both startup checks and "Restore
+        cluster". With the default re-arm that heals itself after five minutes; with
+        ``rearm_after_mains_min: null`` it does not.
+
+        Disabled hosts are KEPT: they are still configured, ordered_hosts() simply skips
+        them, and dropping their self-test verdict on a temporary untick would lose the
+        one record that says whether their credentials still work.
+        """
+        keys = {h.key for h in self.cfg.hosts}
+        for key in list(self.host_states):
+            if key not in keys:
+                del self.host_states[key]
+        for key in list(self.host_fired):
+            if key not in keys:
+                del self.host_fired[key]
+        for key in list(self.cluster_unit_hosts):
+            if key not in keys:
+                del self.cluster_unit_hosts[key]
+        self.cluster_inspect_failed &= keys
+        self.cluster_standalone &= keys
 
     # -- battery-timer persistence (survives service restarts) ---------------
     def _restore_state(self) -> None:
@@ -267,21 +462,35 @@ class Engine:
                 if now - since > timedelta(hours=STATE_RESTORE_MAX_AGE_H):
                     continue
                 rt.on_battery_since = since
+                # Restored, but HELD until one poll of this process has answered — see
+                # _UpsRuntime.restored_unconfirmed and _ups_trigger_reason(). The timer
+                # itself is kept in full, so the confirming poll re-arms the whole elapsed
+                # time at once and a service restart mid-outage loses nothing.
+                rt.restored_unconfirmed = True
                 # A latched trigger (e.g. battery low before the restart) is re-armed
                 # together with its timer, so the restart cannot demote it back to the
-                # remaining countdown.
+                # remaining countdown — but it is re-armed by that confirming poll, not
+                # here — and it needs nothing parked to be re-armed by it, because the
+                # restored timer comes back in full: with on_battery_seconds set, that
+                # confirming poll re-derives a trigger from an elapsed time already far
+                # past the threshold. Setting rt.triggered from the file instead made the
+                # latch bypass every freshness check there is: the unreachable branch of
+                # _evaluate_ups() deliberately never re-derives a trigger that is already
+                # set, so a latch read off disk fired on the first poll after a boot no
+                # matter what — or whether — the device answered.
                 reason = triggers.get(uid)
-                if isinstance(reason, str) and reason:
-                    rt.triggered = True
-                    rt.trigger_reason = reason
+                if not isinstance(reason, str):
+                    reason = ""
                 self._log_quiet(
                     "On-battery timer restored",
                     f"UPS {uid}: on battery since {ts} (from state file after restart). "
                     + (
-                        f"Latched trigger persists: {reason}."
-                        if rt.triggered
-                        else "The countdown continues."
-                    ),
+                        f"The latched trigger ({reason}) is re-armed"
+                        if reason
+                        else "The countdown continues"
+                    )
+                    + " as soon as this UPS answers a poll — nothing read from the state "
+                    "file shuts anything down on its own.",
                     db.WARNING,
                 )
             self._restore_selftest_slot(data.get("selftest_slot"))
@@ -358,6 +567,35 @@ class Engine:
         """Aggregate alarm: True if any UPS is in alarm state."""
         return any(rt.alarm_active for rt in self.ups_rt.values())
 
+    def _outage_in_progress(self) -> bool:
+        """Whether housekeeping has to stand down: a shutdown episode or a real outage.
+
+        One reading, shared by the two startup checks, the scheduled self-test, the manual
+        self-test and "Restore cluster" — five copies of the same condition, which is how
+        they would drift apart.
+
+        A restored-but-unconfirmed timer deliberately does NOT count. It is set by
+        _restore_state() for every UPS the state file mentions, and it stays set until that
+        UPS answers a poll — so a device that never answers again used to mean "an outage
+        is running" for ever. That is exactly the situation after a real cluster shutdown:
+        this appliance powers its own host off last, comes back up, and the UPS management
+        card is still down. Everything below then stood down permanently — the cluster
+        startup check never ran, so cluster_states stayed empty and the "Restore cluster"
+        button stayed hidden; restore_clusters() would have refused it anyway; and the
+        node check's warnings about incomplete entries, stale feeds, duplicated API URLs,
+        corrected settings and the battery reserve were never written. The one moment the
+        operator needs that button is the one moment they could not reach it.
+
+        Nothing is risked by leaving it out: such a timer cannot fire a shutdown either
+        (see _ups_trigger_reason), so there is no countdown for a self-test to delay. The
+        moment the device answers, this reads "outage" again — or the timer is dropped.
+        """
+        return self.shutdown_triggered or any(
+            rt.state.on_battery
+            or (rt.on_battery_since is not None and not rt.restored_unconfirmed)
+            for rt in self.ups_rt.values()
+        )
+
     # -- lifecycle -----------------------------------------------------------
     def start(self) -> None:
         self._stop.clear()
@@ -385,9 +623,24 @@ class Engine:
         """
         self.cfg = cfg
         self._node_startup_done = False
+        # Re-armed for the same reason, and it was missing: ticking "this is a cluster
+        # member" and saving left the dashboard showing no cluster and hiding the "Restore
+        # cluster" button until the next scheduled slot — a day by default — because both
+        # are driven by cluster_states, which only the self-test and this startup check
+        # fill. One read-only, hard-bounded inspection on the next poll answers it instead.
+        self._cluster_startup_done = False
         # A changed host list is a new question: say it again for whatever is wrong now.
         self._dup_url_warned = set()
+        self._stale_feed_warned = set()
+        self._incomplete_warned = set()
+        self._value_corrections_warned = set()
+        self._reserve_warned = set()
         self._sync_runtimes()
+        # Hosts and webhooks that are gone leave bookkeeping behind that outlives them —
+        # a shutdown latch that keeps the episode open, a delivery record a re-created id
+        # would inherit. Cleared here, where the new configuration arrives.
+        self._sync_host_states()
+        notify.forget_deliveries({h.id for h in cfg.notifications.webhooks})
 
     def _release_shutdown_latches(self) -> None:
         """Un-latch the shutdown episode: the appliance is ready for the next outage.
@@ -404,10 +657,8 @@ class Engine:
         self.shutdown_reason = None
         self.triggered_at = None
         self.host_fired = {}
-        for st in self.host_states.values():
-            for key in ("shutdown_state", "last_action_at", "last_error",
-                        "reachable", "this_host", "order"):
-                st.pop(key, None)
+        for key in list(self.host_states):
+            self._clear_host_shutdown_state(key)
         # Not the discovered cluster facts (those are refreshed by the self-test), only
         # the per-episode latches: a new outage must prepare again, and a preparation
         # that failed last time must not keep holding its nodes back. What was written to
@@ -415,8 +666,27 @@ class Engine:
         self.cluster_prepared = {}
         self.cluster_prep_failed = {}
         self.cluster_prep_steps = {}
-        self.cluster_unit_hosts = set()
+        self.cluster_unit_hosts = {}
+        self.cluster_inspect_failed = set()
+        self.cluster_standalone = set()
         self._mains_ok_since = None
+
+    def _clear_host_shutdown_state(self, key: str) -> None:
+        """Drop one host's per-episode shutdown keys, keeping everything else.
+
+        Only the shutdown keys go — the self-test verdicts and the node-name check live in
+        the same dict and answer a different question. Clearing the whole entry (which the
+        manual reset used to do) made /api/health report "never tested" for every host
+        until the next scheduled slot, hours away.
+        """
+        st = self.host_states.get(key)
+        if not st:
+            return
+        # ``key_name``, not ``field``: dataclasses.field is imported at module level and a
+        # loop variable of that name shadows it for the rest of this scope.
+        for key_name in ("shutdown_state", "shutdown_attempts", "last_action_at",
+                         "last_error", "reachable", "this_host", "order"):
+            st.pop(key_name, None)
 
     def reset(self) -> None:
         """Clear shutdown latches and alarms — the dashboard's "Reset state" button."""
@@ -440,11 +710,23 @@ class Engine:
                 # results to the wrong UPS ids.
                 ups_list = list(self.cfg.ups)
                 if ups_list:
-                    results = await asyncio.gather(*(poll(u) for u in ups_list))
+                    # return_exceptions: sources.poll() is total and bounded, but this is
+                    # the one gather whose failure would cost the whole iteration — the
+                    # countdowns, the host evaluation and the staged shutdown all sit
+                    # behind it. A source that manages to raise anyway becomes what every
+                    # other failed read becomes: unreachable, i.e. an alarm, never a
+                    # shutdown.
+                    results = await asyncio.gather(
+                        *(poll(u) for u in ups_list), return_exceptions=True
+                    )
                     for u, st in zip(ups_list, results):
                         rt = self.ups_rt.get(u.id)
-                        if rt is not None:
-                            rt.state = st
+                        if rt is None:
+                            continue
+                        if isinstance(st, BaseException):
+                            log.warning("Poll of %s raised: %s", u.label, st)
+                            st = UpsState(error=str(st) or type(st).__name__)
+                        rt.state = st
                 await self._evaluate()
                 await self._maybe_cluster_startup_check()
                 await self._maybe_node_startup_check()
@@ -472,6 +754,7 @@ class Engine:
     # -- evaluation ----------------------------------------------------------
     async def _evaluate(self) -> None:
         self._sync_runtimes()
+        self._sync_host_states()
 
         # Phase A: evaluate every UPS independently.
         for u in self.cfg.ups:
@@ -532,12 +815,25 @@ class Engine:
             if not rt.triggered:
                 rt.trigger_reason = self._ups_trigger_reason(u, rt)
                 rt.triggered = rt.trigger_reason is not None
+                # Logged here too, not only on the reachable path. A blind countdown and
+                # the comms-loss opt-in fire real shutdowns, and they fire them in exactly
+                # the situation where the post-mortem has least to go on: the last poll
+                # that answered is the only evidence there is, and nothing was recording
+                # it. What readable_raw() shows is that last good reading, which is the
+                # point — the elapsed time is measured on our clock either way.
+                if rt.triggered:
+                    self._log_trigger_evidence(u, rt)
 
             # A confirmed on-battery outage whose time-based countdown survives a comms loss.
+            # "Confirmed" is load-bearing and used to be assumed: a timer read back from
+            # the state file has been observed by nobody in this process, and while it is
+            # held (see _ups_trigger_reason) this alarm promised a shutdown "when it
+            # expires" that was never going to come.
             shutdown_pending_blind = (
                 th.keep_shutdown_on_comm_loss
                 and th.on_battery_seconds is not None
                 and rt.on_battery_since is not None
+                and not rt.restored_unconfirmed
             )
 
             if rt.unreachable_count >= th.unreachable_alarm_after_polls and not rt.alarm_active:
@@ -554,6 +850,26 @@ class Engine:
                         f"{rt.trigger_reason}.",
                         db.WARNING,
                     )
+                elif rt.restored_unconfirmed and rt.on_battery_since is not None:
+                    # The state file says an outage was running when this process last
+                    # died; this UPS has not answered since, so nothing about that is
+                    # confirmed. Its own wording, because the two neighbouring ones are
+                    # both wrong here: there is no countdown to expire, and "NO shutdown
+                    # will be triggered" would hide a timer that is very much still there
+                    # and re-arms in full the moment the device speaks.
+                    elapsed = self._ups_elapsed_on_battery(rt)
+                    await self._emit(
+                        f"{name} unreachable — restored countdown is on hold",
+                        f"No response for {rt.unreachable_count} polls "
+                        f"({st.error or 'timeout'}). A previous run left an on-battery "
+                        f"timer behind"
+                        + (f" (~{elapsed} s)" if elapsed is not None else "")
+                        + ", but no poll of this run has confirmed the outage is still "
+                        "going, so nothing is shut down on the strength of it. It re-arms "
+                        "in full as soon as this UPS answers — or is dropped if the answer "
+                        "is 'on mains'.",
+                        db.WARNING,
+                    )
                 elif shutdown_pending_blind:
                     remaining = self._ups_countdown_remaining_s(u, rt)
                     await self._emit(
@@ -564,13 +880,44 @@ class Engine:
                         + (f" (~{remaining} s)." if remaining is not None else "."),
                         db.WARNING,
                     )
-                elif th.comm_loss_shutdown_after_min is not None:
+                elif (
+                    th.comm_loss_shutdown_after_min is not None
+                    and not st.answered
+                    # Same guard as the trigger this text announces (see
+                    # _ups_trigger_reason): an entry that cannot be polled at all never
+                    # arms the opt-in, so promising a shutdown "if the loss persists"
+                    # would be the alarm contradicting the engine. It falls through to the
+                    # plain "NO shutdown will be triggered" below, which is the truth —
+                    # and the incomplete entry has a CRITICAL event and a dashboard chip
+                    # of its own saying what to fix.
+                    and not self.cfg.incomplete_ups(u)
+                ):
                     await self._emit(
                         f"{name} unreachable — shutdown on prolonged loss",
                         f"No response for {rt.unreachable_count} polls "
                         f"({st.error or 'timeout'}). No power outage confirmed, but if the "
                         f"communication loss persists, a shutdown will be triggered after "
                         f"{th.comm_loss_shutdown_after_min} min.",
+                        db.WARNING,
+                    )
+                elif st.answered:
+                    # It is answering; what it says cannot be used. "No response for N
+                    # polls" would send the operator to the network, which is the one place
+                    # the fault is not — and with the comms-loss opt-in on, the neighbouring
+                    # wording would promise a shutdown that deliberately never comes.
+                    #
+                    # Source-neutral wording: this branch is no longer SNMP-only. A upsd
+                    # answering ERR DATA-STALE, or one whose ups.status names neither OL
+                    # nor OB, reaches it too — "which objects it implements" would be an
+                    # answer to a question a NUT user never asked.
+                    await self._emit(
+                        f"{name} answers, but cannot be read",
+                        f"{rt.unreachable_count} polls in a row were answered without a "
+                        f"usable reading ({st.error or 'no usable reading'}). The device is "
+                        f"treated as unreachable — an alarm, and NO shutdown, not even "
+                        f"through 'shutdown on pure communication loss': the connection is "
+                        f"plainly there. Use the UPS card's test button to see what it does "
+                        f"deliver.",
                         db.WARNING,
                     )
                 else:
@@ -599,6 +946,14 @@ class Engine:
         rt.unreachable_count = 0
         rt.unreachable_since = None
 
+        # The device has spoken: what came off the state file may act from here on. Placed
+        # before the two branches below so both inherit it — the mains branch clears the
+        # timer, the battery branch re-derives the trigger against the FULL restored
+        # elapsed time and so re-arms it on this very poll. A service restart mid-outage
+        # therefore loses nothing at all, because there the UPS is reachable by definition;
+        # if it were not, there would be no fresh data to act on either way.
+        rt.restored_unconfirmed = False
+
         # --- power restored -----------------------------------------------------
         if not st.on_battery:
             if rt.on_battery_since is not None or rt.triggered:
@@ -622,8 +977,11 @@ class Engine:
                 db.WARNING,
             )
 
+        was_triggered = rt.triggered
         rt.trigger_reason = self._ups_trigger_reason(u, rt)
         rt.triggered = rt.trigger_reason is not None
+        if rt.triggered and not was_triggered:
+            self._log_trigger_evidence(u, rt)
 
     async def _evaluate_hosts(self) -> None:
         """Per-host eligibility (Phase B) and shutdown execution (Phase C).
@@ -635,10 +993,12 @@ class Engine:
         eligible: list[tuple[HostConfig, str]] = []
         for host in self.cfg.ordered_hosts():
             reason = self._host_trigger_reason(host)
-            committed = self.host_states.get(host.key, {}).get("shutdown_state") in (
-                "sent",
-                "failed",
-            )
+            # "sent" only. A failed attempt is deliberately NOT committed any more: it
+            # may still be retried (see _fire_host), and if the outage ends first the
+            # latch should come off like any other uncommitted one. Note this is a
+            # different question from the one _recompute_state asks, which still counts
+            # "failed" as committed — a retry in progress is a shutdown in progress.
+            committed = self.host_states.get(host.key, {}).get("shutdown_state") == "sent"
 
             if reason is None:
                 # A host its cluster took down as a unit never had a reason of its own, so
@@ -646,18 +1006,72 @@ class Engine:
                 # released on the very next poll — in dry-run once per host, with a
                 # misleading "shutdown aborted", and it could never fire again because the
                 # preparation latch is already set.
-                if host.key in self.cluster_unit_hosts:
+                unit_reason = self.cluster_unit_hosts.get(host.key)
+                # ...but only while its cluster's episode is genuinely still running.
+                # Without that second half the branch answered "no reason now" with "then
+                # keep going" unconditionally, and a taken-along node whose first attempt
+                # had failed was re-sent on every following poll — including after mains
+                # had come back. That is a healthy production node powered off during
+                # normal operation, which is the one outcome this appliance exists to
+                # prevent. When the episode is over the host falls through to the release
+                # below instead, where it gets the same verdict as any other node that
+                # never went down.
+                if unit_reason is not None and self._cluster_episode_live(host):
+                    # It does say something about a FAILED attempt, though, and this is
+                    # where the retry has to come from. _prepare_clusters() cannot supply
+                    # it a second time (its per-episode latch returns before
+                    # _unit_additions runs), so while this branch simply skipped, a unit
+                    # host got exactly one attempt — whatever MAX_SHUTDOWN_ATTEMPTS and
+                    # the "the next poll tries again" event both promised.
+                    if self._retry_due(host):
+                        eligible.append((host, unit_reason))
                     continue
                 # No longer eligible (a required feed recovered): release a not-yet-committed
                 # (dry-run) latch so the dashboard can recover. A real, sent shutdown stays.
-                if self.host_fired.get(host.key) and not committed:
+                #
+                # "or failed" is not redundant with the latch, and leaving it out was a
+                # hole: a failed attempt that still has retries left keeps host_fired
+                # False on purpose (see _fire_host), so keying on the latch alone missed
+                # exactly the state the retry created. An outage ending BETWEEN two
+                # attempts then left "failed" in host_states for good — _recompute_state
+                # counts that as committed, so the appliance sat on SHUTTING_DOWN with
+                # mains long back, no abort event was ever written, and _maybe_rearm could
+                # not clean up either because nothing was latched any more.
+                failed = (
+                    self.host_states.get(host.key, {}).get("shutdown_state") == "failed"
+                )
+                if (self.host_fired.get(host.key) or failed) and not committed:
                     self.host_fired[host.key] = False
+                    # A taken-along node loses its membership record here too, and only
+                    # here: this is the moment its cluster's episode is over, so there is
+                    # nothing left to take it along with. _fire_stage() deliberately keeps
+                    # the entry on a raising attempt, which is a different moment.
+                    self.cluster_unit_hosts.pop(host.key, None)
+                    # Also drop the attempt record. Without this a host that had used up
+                    # its retries left "failed" in host_states, which _recompute_state
+                    # counts as committed — the dashboard would sit on SHUTTING_DOWN with
+                    # the outage long over, and the re-arm that used to clean up never
+                    # runs because nothing is latched any more.
+                    self._clear_host_shutdown_state(host.key)
                     await self._emit(
                         f"Host {host.name}: shutdown aborted",
-                        "Feeding UPS device(s) sufficient again — shutdown no longer needed.",
-                        # A withdrawn shutdown is not routine: warning, so it also passes
-                        # the webhook's default severity filter.
-                        db.WARNING,
+                        # Two wordings, because "no longer needed" is false for a machine
+                        # that is still running only because every attempt to shut it down
+                        # failed. Reading that as a clean withdrawal is how an unfinished
+                        # episode gets filed as a finished one.
+                        "Feeding UPS device(s) sufficient again — shutdown no longer needed."
+                        if not failed
+                        else (
+                            "Feeding UPS device(s) sufficient again, so the shutdown is no "
+                            "longer needed — but note it never succeeded: every attempt "
+                            "failed and this machine is still running. Check the host's "
+                            "credentials and the earlier events."
+                        ),
+                        # A withdrawn shutdown is not routine: warning, so it passes the
+                        # webhook's default severity filter. One that never succeeded is
+                        # not merely non-routine — a machine is still running that was
+                        # meant to be off — so it goes out a level higher.
+                        db.CRITICAL if failed else db.WARNING,
                     )
                 continue
 
@@ -683,8 +1097,22 @@ class Engine:
         # awaited inside the poll loop, from stalling the battery countdown as well.
         # ``eligible`` is already sorted by (this_host, order, name), so the groups are
         # contiguous; targets.shutdown() carries a hard deadline, so no stage can outlast it.
-        for _, group in groupby(eligible, key=lambda hr: (hr[0].this_host, hr[0].order)):
-            await asyncio.gather(*(self._fire_host(h, r) for h, r in group))
+        failed_earlier: list[tuple[HostConfig, str]] = []
+        for stage_key, group in groupby(eligible, key=lambda hr: (hr[0].this_host, hr[0].order)):
+            staged = list(group)
+            # Last chance before the appliance powers itself off. Every stage but this one
+            # is followed by another poll in eight seconds, which is where the retry
+            # normally happens — but nothing follows ``this_host``: we lose power. So a
+            # host that failed in an earlier stage of THIS pass gets its next attempt here
+            # rather than in a poll that will never run. That is the case
+            # MAX_SHUTDOWN_ATTEMPTS exists for (a 503 from a busy pveproxy), and it was
+            # precisely the case the poll-based retry could not reach.
+            if stage_key[0] and failed_earlier:
+                retry = [(h, r) for h, r in failed_earlier if self._retry_due(h)]
+                failed_earlier = []
+                if retry:
+                    await self._fire_stage(retry)
+            failed_earlier += await self._fire_stage(staged)
 
         # Clear the aggregate once nothing is pending, committed or still due. The last
         # condition matters for a cluster that is being held back: no host of it is
@@ -699,7 +1127,96 @@ class Engine:
             self.cluster_prepared = {}
             self.cluster_prep_failed = {}
             self.cluster_prep_steps = {}
-            self.cluster_unit_hosts = set()
+            self.cluster_unit_hosts = {}
+            self.cluster_inspect_failed = set()
+            self.cluster_standalone = set()
+
+    def _cluster_episode_live(self, host: HostConfig) -> bool:
+        """Whether the shutdown episode of this host's cluster is still running.
+
+        Asked only about a node that has no trigger of its own — one its cluster took
+        along as a unit. Its own state cannot answer the question: it is "failed", which
+        is exactly why a retry is being considered, and nothing about it says whether the
+        outage that started all this is still on.
+
+        So the peers answer it. One of them having a *sent* shutdown means the cluster
+        really is going down and this node has to follow; one of them still being eligible
+        means the outage has not been withdrawn. Anything else means the episode is over,
+        and a node that is only "due" because of a cluster that is no longer going anywhere
+        must not be shut down — that would be a healthy machine powered off with mains back.
+        Deliberately keyed on "sent" rather than "failed": a peer that never went down is
+        no reason to take this one down either.
+
+        Without a discovered cluster name there are no peers to ask (which
+        _unit_additions() makes unreachable in practice, since it stamps every member), and
+        the answer is then "not live": refusing to shut a machine down is the recoverable
+        half of being wrong here.
+        """
+        name = self.host_states.get(host.key, {}).get("cluster_name")
+        if not name:
+            return False
+        for peer in self.cfg.hosts:
+            if not peer.enabled or peer.key == host.key:
+                continue
+            if self.host_states.get(peer.key, {}).get("cluster_name") != name:
+                continue
+            if self.host_states.get(peer.key, {}).get("shutdown_state") == "sent":
+                return True
+            if self._host_trigger_reason(peer) is not None:
+                return True
+        return False
+
+    def _retry_due(self, host: HostConfig) -> bool:
+        """Whether this host failed a shutdown and still has attempts left.
+
+        One reading of "may try again", shared by the unit-host branch and the extra pass
+        before ``this_host`` — the two used to be the places where a retry either happened
+        or silently did not.
+        """
+        st = self.host_states.get(host.key, {})
+        if st.get("shutdown_state") != "failed" or self.host_fired.get(host.key):
+            return False
+        return int(st.get("shutdown_attempts") or 0) < MAX_SHUTDOWN_ATTEMPTS
+
+    async def _fire_stage(
+        self, staged: list[tuple[HostConfig, str]]
+    ) -> list[tuple[HostConfig, str]]:
+        """Shut down one stage concurrently; return the entries that failed and may retry.
+
+        Split out of _evaluate_hosts so the extra pass before ``this_host`` runs through
+        exactly the same code — a second, slightly different copy of the firing logic is
+        how the two would drift apart.
+        """
+        # return_exceptions, because without it one raising host aborts _evaluate()
+        # entirely: every LATER stage is skipped — the appliance's own host among them
+        # — and _recompute_state()/_persist_state() never run for that iteration.
+        # _fire_host is total in practice; this makes it structural.
+        outcomes = await asyncio.gather(
+            *(self._fire_host(h, r) for h, r in staged), return_exceptions=True
+        )
+        failed: list[tuple[HostConfig, str]] = []
+        for (host, reason), outcome in zip(staged, outcomes):
+            if isinstance(outcome, BaseException):
+                log.exception("Shutdown of %s raised: %s", host.name, outcome)
+                # Nothing may treat this as handled, so the latch comes off — but the
+                # attempt is recorded rather than left blank, which is what turns it into
+                # a retry. cluster_unit_hosts is deliberately KEPT: for a node the cluster
+                # takes down as a unit it is the only record of why it is due at all
+                # (_host_trigger_reason returns None for it, and _prepare_clusters cannot
+                # offer it again behind the per-episode latch). Dropping it here left such
+                # a node silently unshut for the rest of the outage.
+                self.host_fired[host.key] = False
+                st = self.host_states.setdefault(host.key, {})
+                st["shutdown_state"] = "failed"
+                st["shutdown_attempts"] = int(st.get("shutdown_attempts") or 0) + 1
+                st["last_error"] = f"{type(outcome).__name__}: {outcome}"
+                st["last_action_at"] = _now().isoformat()
+                if self._retry_due(host):
+                    failed.append((host, reason))
+                continue
+            if not self.host_fired.get(host.key):
+                failed.append((host, reason))
+        return failed
 
     async def _maybe_rearm(self) -> None:
         """Release a finished shutdown episode once mains have been back long enough.
@@ -793,12 +1310,68 @@ class Engine:
         return "; ".join(f"{_label(uid)}: {rt.trigger_reason}" for uid, rt in fired)
 
     def _ups_elapsed_on_battery(self, rt: _UpsRuntime) -> Optional[int]:
-        """Prefer the UPS counter; fall back to our own timer."""
-        if rt.state.seconds_on_battery is not None:
-            return rt.state.seconds_on_battery
+        """How long this UPS has been on battery, in seconds — our own clock, or nothing.
+
+        ``UpsState.seconds_on_battery`` is deliberately NOT consulted. It is a duration the
+        *device* claims: we never observed it and cannot check it. RFC 1628 defines
+        upsSecondsOnBattery only "if the unit is on battery power" and says nothing about
+        the value while on mains, so a card that keeps the last transfer's figure instead of
+        clearing it breaks no rule — and a number of them do exactly that. Trusting it meant
+        the very first poll of a fresh outage already read a value past ``on_battery_seconds``
+        and fired the shutdown before any time had actually passed (issue #25). The mirror
+        image was just as bad: a card reporting a permanent 0 pinned the elapsed time at zero
+        and disabled the time trigger altogether — the only trigger that still works while
+        the UPS is unreachable.
+
+        The timer normally survives a restart through the state file (see _restore_state),
+        which covers the case that would otherwise argue for the device counter. Where it
+        does not — the file is missing, unreadable or older than STATE_RESTORE_MAX_AGE_H —
+        the price is deliberate: an appliance that starts cold into a running outage begins
+        counting at zero and therefore fires the time trigger late. Runtime, charge and
+        battery_low all read fresh data and are unaffected, and they are the ones that
+        matter when the battery is actually running out.
+        """
         if rt.on_battery_since is not None:
             return int((_now() - rt.on_battery_since).total_seconds())
         return None
+
+    def _ups_elapsed_source(self, rt: _UpsRuntime) -> Optional[str]:
+        """Which clock _ups_elapsed_on_battery() answered from, or None for no answer.
+
+        Reported next to the figure so "we measured this" can never be mistaken for a number
+        the device handed us. Never the device's own counter, by construction — see above.
+
+        "own-unconfirmed" is the same measurement carrying one caveat: it was read back
+        from the state file and no poll of this process has confirmed the outage is still
+        running, so it is displayed but cannot fire anything (see _ups_trigger_reason).
+        Its own value rather than a silent "own", because the difference is the whole
+        question an operator has at that moment — the number is real, the conclusion is not.
+        """
+        if rt.on_battery_since is None:
+            return None
+        return "own-unconfirmed" if rt.restored_unconfirmed else "own"
+
+    def _log_trigger_evidence(self, u: UpsBase, rt: _UpsRuntime) -> None:
+        """Record the readings that armed this UPS, once, at the moment it happens.
+
+        Without this an unexpected shutdown cannot be reconstructed afterwards: the reason
+        line says what the engine concluded, never what it read, and the manual test button
+        can only answer about a later and different state. Quiet on purpose — this belongs
+        in the event log for the post-mortem, not in every chat channel.
+        """
+        parts = [f"Reason: {rt.trigger_reason}."]
+        elapsed = self._ups_elapsed_on_battery(rt)
+        if elapsed is not None:
+            parts.append(
+                f"Elapsed on battery: {elapsed} s "
+                f"(from {self._ups_elapsed_source(rt)} clock)."
+            )
+        raw = rt.state.readable_raw()
+        if raw:
+            parts.append(f"Readings: {raw}")
+        self._log_quiet(
+            f"{u.label} armed the shutdown trigger", " ".join(parts), db.WARNING
+        )
 
     def _ups_trigger_reason(self, u: UpsBase, rt: _UpsRuntime) -> Optional[str]:
         """Whether (and why) a single UPS currently demands a shutdown.
@@ -811,11 +1384,48 @@ class Engine:
         th = self.cfg.effective_thresholds(u)
         st = rt.state
 
+        # Nothing read off disk may shut anything down before the device has answered once.
+        # Every branch below that can fire while unreachable does so from state this
+        # process never observed — the restored on_battery_since, or an unreachable_since
+        # that a restart resets — and the appliance restarts at the END of every outage,
+        # because it shuts its own host down last. A UPS that then missed the first poll
+        # after the boot (switch still converging, SNMP card still coming up) presented
+        # hours of restored elapsed time against a 600 s threshold, and the machines that
+        # had just come back up were shut down again during normal operation.
+        #
+        # Placed above the comms-loss branch so it covers that opt-in too, and phrased
+        # against `reachable` rather than the flag alone: a device that has answered has
+        # confirmed or refuted the whole restored picture in one poll (see _evaluate_ups),
+        # so this can only ever hold back the case where there is no fresh evidence at all.
+        if not st.reachable and rt.restored_unconfirmed:
+            return None
+
         # Opt-in: a prolonged *pure* comms loss is treated as an outage (independent of battery).
         # Wall clock, not poll count: the loop cadence varies (battery interval), so counting
         # polls would misestimate the elapsed time.
+        #
+        # ``not st.answered`` is the load-bearing half and it used to be missing. A source
+        # can be unreachable while demonstrably talking to us: an SNMP card that answers
+        # but names no usable power source, one that implements none of the profile's
+        # objects, a upsd without ups.status. All three are correctly reachable=False —
+        # the state machine has nothing to go on — but none of them is a *communication*
+        # loss, and this branch shuts the whole estate down on one. Reading them as silence
+        # fired a real shutdown during normal operation, minutes after the opt-in's
+        # threshold, on a device that had never stopped answering.
+        # ``incomplete_ups`` is the third half of the same idea and it was missing. An
+        # entry stored without an address is never polled at all — poll() returns "not
+        # configured" without touching the network — so it is unreachable and silent by
+        # construction, for ever. This release describes exactly that state as fail safe
+        # ("a standing refusal to shut down every host it feeds", see
+        # _warn_about_incomplete_entries), and with the opt-in on it did the opposite: a
+        # configuration mistake, a backup import or a hand-edited config.yaml shut down
+        # every host that entry feeds, minutes later, during normal operation and without
+        # a single packet having been sent. A trigger needs evidence about the power, and
+        # an entry that was never asked has produced none.
         if (
             not st.reachable
+            and not st.answered
+            and not self.cfg.incomplete_ups(u)
             and th.comm_loss_shutdown_after_min is not None
             and rt.unreachable_since is not None
         ):
@@ -845,7 +1455,11 @@ class Engine:
 
         # Reachable and on battery: the full threshold set.
         if th.on_battery_low and st.battery_low:
-            return f"UPS reports '{st.battery_status}'"
+            # Name what the device actually said, not only the normalised word: "low"
+            # covers an empty battery and a defective one, and both fire this trigger in
+            # the first second of an outage. Told apart here or nowhere.
+            detail = f" ({st.battery_status_detail})" if st.battery_status_detail else ""
+            return f"UPS reports '{st.battery_status}'{detail}"
 
         if th.runtime_below_minutes is not None and st.runtime_remaining_min is not None:
             if st.runtime_remaining_min <= th.runtime_below_minutes:
@@ -875,6 +1489,11 @@ class Engine:
             return None
         if not rt.state.on_battery and rt.on_battery_since is None:
             return None
+        # Held for the same reason the trigger is (see _ups_trigger_reason): a restored
+        # timer that no poll has confirmed cannot fire, so counting it down to zero on the
+        # dashboard would promise a shutdown that is not going to happen.
+        if not rt.state.reachable and rt.restored_unconfirmed:
+            return None
         elapsed = self._ups_elapsed_on_battery(rt)
         if elapsed is None:
             return None
@@ -886,6 +1505,18 @@ class Engine:
         if th.comm_loss_shutdown_after_min is None or rt.comm_loss_fired:
             return None
         if rt.state.reachable or rt.unreachable_since is None:
+            return None
+        # Same gate as the trigger it counts down to (see _ups_trigger_reason): a device
+        # that answers but cannot be read is not a communication loss, so there is nothing
+        # to count down to. Showing a countdown for a shutdown that will never fire is the
+        # dashboard telling the operator the opposite of what the engine will do.
+        if rt.state.answered:
+            return None
+        # And the same for an entry that is never polled at all: the trigger refuses it
+        # (see _ups_trigger_reason), so a countdown here would be the card promising the
+        # one thing the engine has decided not to do. The "incomplete" chip next to it is
+        # what that card should be saying instead.
+        if self.cfg.incomplete_ups(u):
             return None
         elapsed_s = (_now() - rt.unreachable_since).total_seconds()
         return max(0, int(th.comm_loss_shutdown_after_min * 60 - elapsed_s))
@@ -941,19 +1572,14 @@ class Engine:
         if not self.cluster_states:
             return "No cluster has been inspected yet - run the self-test first."
 
-        th = self.cfg.thresholds
         ap = self.cfg.appliance
         own_hostname = _hostname()
         lines = []
         for name, info in self.cluster_states.items():
-            members = [
-                h for h in self.cluster_hosts()
-                if self.host_states.get(h.key, {}).get("cluster_name") == name
-            ]
-            want_ceph = any(h.cluster_ceph for h in members) and not info.ceph_unavailable
-            want_disarm = (
-                any(h.cluster_ha_disarm for h in members) and not info.disarm_unavailable
-            )
+            members = self._cluster_members(info, name)
+            ask_ceph, ask_disarm, _ask_all = self._cluster_switches(members)
+            want_ceph = ask_ceph and not info.ceph_unavailable
+            want_disarm = ask_disarm and not info.disarm_unavailable
             steps = []
             if want_disarm:
                 steps.append("HA disarm")
@@ -963,9 +1589,11 @@ class Engine:
             if want_ceph and not info.guests_unreadable and (
                 self_guest is not None or ap.self_external
             ):
-                targets = cluster.stop_targets(info.guests, self_guest, own_hostname)
+                # Not named ``targets``: that is the module this engine shuts down
+                # through, and a local of the same name shadows it for the whole function.
+                stop_list = cluster.stop_targets(info.guests, self_guest, own_hostname)
                 steps.append(
-                    f"stop {len(targets)} of {len(info.running_guests)} running guests"
+                    f"stop {len(stop_list)} of {len(info.running_guests)} running guests"
                     + (f" (sparing {self_guest.label})" if self_guest else "")
                 )
             if want_ceph:
@@ -982,9 +1610,11 @@ class Engine:
                 + (f" -> nodes {order}" if order else "")
                 + (" (* carries a Ceph MON and should go last)"
                    if any(h.name in info.mon_nodes for h in members) else "")
-                + f" Up to {shutdown_budget_s(th)}s in total."
             )
-        return " ".join(lines)
+        # Once, at the end. The figure is estate-wide (see shutdown_budget), so repeating
+        # it on every cluster line read as a per-cluster cost — three clusters looked like
+        # three times the budget they actually share.
+        return " ".join(lines) + f" Up to {shutdown_budget_s(self.cfg)}s in total."
 
     def _maybe_prune(self) -> None:
         """Trim the event log once per day so events.db stays bounded over months."""
@@ -1015,10 +1645,7 @@ class Engine:
         """
         if self._cluster_startup_done:
             return
-        if self.shutdown_triggered or any(
-            rt.on_battery_since is not None or rt.state.on_battery
-            for rt in self.ups_rt.values()
-        ):
+        if self._outage_in_progress():
             return  # no latch: try again on the next iteration, once mains are back
         if not self.cluster_hosts():
             self._cluster_startup_done = True
@@ -1062,25 +1689,46 @@ class Engine:
         """
         if self._node_startup_done:
             return
-        if self.shutdown_triggered or any(
-            rt.on_battery_since is not None or rt.state.on_battery
-            for rt in self.ups_rt.values()
-        ):
+        if self._outage_in_progress():
             return  # no latch: try again on the next iteration, once mains are back
         hosts = [
             h for h in self.cfg.hosts if isinstance(h, PveHostConfig) and h.enabled
         ]
         self._node_startup_done = True
+        # First, and outside the node check entirely. These three are pure config
+        # questions and have nothing to do with node names, but they used to sit at the
+        # BOTTOM of this method, behind two returns: an estate of Proxmox Backup Servers
+        # has no PveHostConfig at all, so "if not hosts: return" skipped them — including
+        # the stale-feed warning, which the appliance's own comments call the one failure
+        # that is otherwise completely silent. It then waited for the next scheduled
+        # self-test, up to a day away, instead of the poll after the save that caused it.
+        await self._warn_about_duplicate_api_urls()
+        await self._warn_about_stale_feeds()
+        await self._warn_about_incomplete_entries()
+        await self._warn_about_corrected_values()
+        await self._warn_about_battery_reserve()
         if not hosts:
             return
+        # return_exceptions, for the same reason _fire_stage carries it: targets.verify_node
+        # is total in practice, and this makes it structural. Without it one host that
+        # manages to raise takes the whole round with it, and every other host loses its
+        # verdict over a fault that was not theirs.
         try:
             verdicts = await asyncio.gather(
-                *(targets.verify_node(h) for h in hosts)
+                *(targets.verify_node(h) for h in hosts), return_exceptions=True
             )
         except Exception as exc:  # noqa: BLE001 - never break the loop over a health read
             log.warning("Node name startup check failed: %s", exc)
             return
         for host, verdict in zip(hosts, verdicts):
+            if isinstance(verdict, BaseException):
+                log.warning("Node check of %s raised: %s", host.name, verdict)
+                # "unverified" is the honest answer to a check that did not happen — and
+                # _node_name_ok() reads it as "no verdict", never as a broken target.
+                verdict = targets.NodeVerdict(
+                    state="unverified",
+                    detail=f"The node name could not be verified: {verdict}",
+                )
             self.host_states.setdefault(host.key, {})["node_state"] = verdict.state
             if verdict.state in ("ok", "unverified"):
                 continue
@@ -1101,7 +1749,6 @@ class Engine:
                 ),
                 db.CRITICAL if load_bearing else db.WARNING,
             )
-        await self._warn_about_duplicate_api_urls()
 
     async def _maybe_selftest(self) -> None:
         """Run the credential self-test once per scheduled slot (see selftest_slot())."""
@@ -1111,10 +1758,7 @@ class Engine:
         # Never spend the poll budget on credential checks during an outage: every host
         # costs up to 10 s and the battery countdown has to stay responsive. No latch is
         # set, so the test runs at the next slot once mains are back.
-        if self.shutdown_triggered or any(
-            rt.on_battery_since is not None or rt.state.on_battery
-            for rt in self.ups_rt.values()
-        ):
+        if self._outage_in_progress():
             return
 
         # A re-arm asked for one run, off-schedule. Cleared only when it actually runs,
@@ -1147,10 +1791,7 @@ class Engine:
         Refused during an outage for the same reason _maybe_selftest skips then — every
         host costs up to 10 s and the battery countdown has to stay responsive.
         """
-        if self.shutdown_triggered or any(
-            rt.on_battery_since is not None or rt.state.on_battery
-            for rt in self.ups_rt.values()
-        ):
+        if self._outage_in_progress():
             return False, "Not while a power outage is in progress."
         if not self.cfg.hosts:
             return False, "No hosts configured."
@@ -1182,6 +1823,161 @@ class Engine:
         if node_state in ("ok", "unverified"):
             return True
         return self.cfg.api_url_is_unique(host)
+
+    async def _warn_about_corrected_values(self) -> None:
+        """Report settings that were out of range and had to be pulled back.
+
+        config._repair() corrects rather than refuses, because load_config() is called
+        from the lifespan without a guard: rejecting a stored value would mean the service
+        no longer starts, which is a far worse failure than the value. Correcting silently
+        would be worse again — the operator would be running thresholds nobody chose — so
+        the loudness lives here. Once per distinct correction and configuration.
+        """
+        for line in self.cfg.value_corrections():
+            if line in self._value_corrections_warned:
+                continue
+            self._value_corrections_warned.add(line)
+            await self._emit(
+                "Setting out of range — corrected",
+                f"{line}. Check it under Settings; the appliance is running with the "
+                f"value named here, not with the one that was stored.",
+                db.WARNING,
+            )
+
+    async def _warn_about_battery_reserve(self) -> None:
+        """Warn when the shutdown takes longer than the runtime its trigger waits for.
+
+        Warned about, never acted on: lowering someone's trigger for them is not this
+        appliance's decision.
+
+        It used to live inside _check_self_guest(), which _check_clusters() only calls for
+        a Ceph cluster — so the majority of installations (standalone nodes, Backup Servers,
+        clusters without Ceph) never saw the one warning that says "your trigger fires later
+        than your shutdown lasts". The terms differ per estate; the question does not, since
+        the stages, the host timeout and the notification round apply everywhere.
+
+        Once per distinct wording and configuration, the same rule as the warnings next
+        door: repeating an unchanged one every self-test trains the operator to skip the feed.
+        """
+        # The SMALLEST effective trigger in the estate, not the global one alone. The
+        # threshold is overridable per UPS (see AppConfig.effective_thresholds), and an
+        # override is precisely where a reserve too short for the shutdown gets set — a
+        # global 30 min said nothing about the one device configured to fire at 2.
+        candidates: list[tuple[int, str]] = []
+        for u in self.cfg.ups:
+            value = self.cfg.effective_thresholds(u).runtime_below_minutes
+            if value is None:
+                continue
+            # Named only where it really is this device's own value; naming the UPS for an
+            # inherited number would send the operator to the wrong field.
+            own = u.overrides.runtime_below_minutes is not None
+            candidates.append((int(value), u.label if own else ""))
+        if not self.cfg.ups and self.cfg.thresholds.runtime_below_minutes is not None:
+            # No UPS configured yet: the question is still about the estate, and the
+            # wizard is exactly where this is worth reading.
+            candidates.append((int(self.cfg.thresholds.runtime_below_minutes), ""))
+        if not candidates:
+            return
+        reserve, source = min(candidates, key=lambda c: c[0])
+        budget = shutdown_budget(self.cfg)
+        if reserve * 60 >= budget.total:
+            return
+        body = (
+            f"The shutdown trigger fires at {reserve} min ({reserve * 60}s) of estimated "
+            f"runtime"
+            + (f" (set on {source})" if source else "")
+            + f", but shutting this estate down can take up to {budget.total}s "
+            f"({budget.explain()}). Raise the trigger, shorten the timeouts, or give fewer "
+            f"hosts distinct shutdown orders."
+        )
+        if body in self._reserve_warned:
+            return
+        self._reserve_warned.add(body)
+        await self._emit("Battery reserve is shorter than the shutdown", body, db.WARNING)
+
+    async def _warn_about_stale_feeds(self) -> None:
+        """Name hosts pointing at UPS devices that are not configured any more.
+
+        The one failure in this appliance that is completely silent: feed_ids_for() drops
+        unknown ids, _host_trigger_reason() returns None on an empty feed list, and the
+        host is then never eligible — no event, no alarm, no failed test. It looks exactly
+        like a host waiting for an outage that has not come.
+
+        Deliberately not left to the scheduled self-test alone. That one stands down for
+        the whole duration of an outage (and rightly so), which is precisely when this
+        would matter; both callers here run on the poll after a configuration is saved,
+        which is when the operator actually caused it. Said once per host and config, the
+        same rule as the duplicate-URL warning next door.
+        """
+        for host in self.cfg.hosts:
+            if not host.enabled:
+                continue
+            stale = self.cfg.stale_feed_ids(host)
+            if not stale or host.key in self._stale_feed_warned:
+                continue
+            self._stale_feed_warned.add(host.key)
+            remaining = self.cfg.feed_ids_for(host)
+            if remaining:
+                tail = (
+                    f"It still has {len(remaining)} of {len(host.ups_ids)} feeds, so with "
+                    f"policy '{host.ups_policy}' it now acts on those alone — the "
+                    f"redundancy this entry was configured for is gone."
+                )
+            else:
+                tail = (
+                    "It has no feeding UPS left at all, which means this host will NEVER "
+                    "be shut down. Re-assign it under Settings -> Hosts."
+                )
+            await self._emit(
+                f"Host {host.name}: unknown UPS assignment",
+                f"Assigned to {', '.join(stale)}, which no longer exists. {tail}",
+                db.CRITICAL,
+            )
+
+    async def _warn_about_incomplete_entries(self) -> None:
+        """Name entries that are stored but cannot do their job (see incomplete_entries()).
+
+        The server-side half of the browser's ``incompleteCards()``, and it is needed
+        because the two paths where this actually happens never pass a form: a backup
+        import and a hand-edited config.yaml. An enabled host without an API URL or a
+        token is stored, renders complete on the dashboard, and fails during the outage —
+        while targets.verify_node() answers "unverified" for an entry it cannot even
+        address, which _node_name_ok() correctly reads as *no verdict* rather than as a
+        fault. Until this existed, the first real signal was the next scheduled self-test.
+
+        CRITICAL for the two that break the shutdown, WARNING for a webhook (an alarm that
+        cannot be delivered is not a machine that stays up). Said once per distinct finding
+        and configuration, the same rule as the warnings next door.
+        """
+        for kind, label, missing in self.cfg.incomplete_entries():
+            line = f"{kind} {label}: {missing}"
+            if line in self._incomplete_warned:
+                continue
+            self._incomplete_warned.add(line)
+            if kind == "Webhook":
+                tail = (
+                    "Nothing is sent to this target. Complete it or switch it off under "
+                    "Settings -> Notifications."
+                )
+                sev = db.WARNING
+            elif kind == "UPS":
+                tail = (
+                    "This device is never polled, so it counts as permanently unreachable "
+                    "— which is an alarm and, being fail safe, a standing refusal to shut "
+                    "down every host it feeds. Complete it under Settings -> UPS."
+                )
+                sev = db.CRITICAL
+            else:
+                tail = (
+                    "The shutdown cannot reach this host and will only fail during an "
+                    "outage. Complete it, or untick 'active', under Settings -> Hosts."
+                )
+                sev = db.CRITICAL
+            await self._emit(
+                f"{kind} {label}: incomplete configuration",
+                f"Stored with {missing}. {tail}",
+                sev,
+            )
 
     async def _warn_about_duplicate_api_urls(self) -> None:
         """One warning per self-test run for URLs serving more than one enabled entry.
@@ -1220,7 +2016,20 @@ class Engine:
         hosts = self.cfg.ordered_hosts()
         # Concurrently: sequentially, five unreachable hosts would stall the poll loop for
         # 5 x 10 s. gather preserves the order, so the events stay in host order.
-        results = await asyncio.gather(*(targets.test_connection(h) for h in hosts))
+        # return_exceptions like the shutdown stages: targets.test_connection is total in
+        # practice, and this makes it structural. One host that raises would otherwise
+        # abort the whole round — every other host keeps a stale verdict, no failure event
+        # is written, and the exception travels up into _loop()'s catch-all, which costs
+        # this iteration its housekeeping too.
+        results = await asyncio.gather(
+            *(targets.test_connection(h) for h in hosts), return_exceptions=True
+        )
+        results = [
+            r
+            if not isinstance(r, BaseException)
+            else targets.TestResult(False, f"Connection error: {r}")
+            for r in results
+        ]
         today = _local_now().date()
         # At a 15-minute cadence a quiet "ok" per host and run would be ~100 events per
         # host per day and drown the 48 h event feed. Write one per day, plus whenever the
@@ -1261,7 +2070,24 @@ class Engine:
             self.last_selftest_ok_logged = today
         self.last_selftest_ok = ok_all
         self.last_selftest_at = _now()
+        # The one thing a green self-test does not say. Every host can be reachable, every
+        # token valid and every privilege in place while the master switch means none of it
+        # is ever used — and dry_run defaults to on, so this is the state a half-finished
+        # commissioning leaves behind. Quiet and on the same daily cadence as the "ok"
+        # lines (log_ok), because it is a standing condition, not an incident.
+        if self.cfg.dry_run and self.cfg.configured and log_ok:
+            self._log_quiet(
+                "Dry-run is on — nothing will be shut down",
+                "The credential check above says the shutdown targets are ready, but the "
+                "master safety switch is still set: the engine only logs what it would do. "
+                "Switch dry-run off under Settings once the configuration is tested.",
+                db.WARNING,
+            )
         await self._warn_about_duplicate_api_urls()
+        await self._warn_about_stale_feeds()
+        await self._warn_about_incomplete_entries()
+        await self._warn_about_corrected_values()
+        await self._warn_about_battery_reserve()
         # Cluster health rides along with the credential check: same schedule, and it is
         # suspended during an outage for the same reason (see _maybe_selftest).
         await self._check_clusters(log_ok=log_ok)
@@ -1293,22 +2119,88 @@ class Engine:
         # Hosts pulled in because their cluster goes down as a unit. Collected here and
         # merged once at the end, so the canonical ordering is rebuilt exactly once.
         extra: list[tuple[HostConfig, str]] = []
+        cold = await self._cold_inspect(candidates)
 
         for host, reason in candidates:
-            name = self.host_states.get(host.key, {}).get("cluster_name") or ""
-            info = self.cluster_states.get(name) if name else None
-            # The name may be unknown when no self-test has run yet — read it now, from
-            # the node we are about to shut down, and KEEP that reading: it already
+            # Already established this episode that its cluster cannot be reached. The
+            # latch is what keeps this from repeating: with abort-on-failure the host is
+            # filtered out below, so it never fires, stays eligible, and comes back here
+            # on the next poll — every eight seconds on battery, each round paying for a
+            # full inspection and sending another CRITICAL. That is the same knot 4.0.0
+            # untied for the preparation itself; this branch had been left out of it.
+            # Cleared with the other per-episode latches, so a re-arm inspects afresh.
+            if host.key in self.cluster_inspect_failed or host.key in self.cluster_standalone:
+                continue
+            # The stamp, or a cluster inspected earlier in THIS loop that names this node.
+            # Only _inspect_clusters() writes the stamp, and that one stands down for the
+            # whole duration of an outage — so on a cold start every candidate used to fall
+            # through to its own inspect() below. Shared with _cold_inspect() so the
+            # pre-pass reads exactly the set this loop will ask for.
+            name, info = self._known_cluster(host)
+            # The name may still be unknown when no self-test has run yet — read it now,
+            # from the node we are about to shut down, and KEEP that reading: it already
             # carries the feature detection the writes below depend on. Re-fetching from
             # cluster_states instead would throw it away and fall back to guessing.
             if info is None:
-                discovered = await cluster.inspect(host)
+                # From the concurrent pre-pass above, never a fresh sequential read: a
+                # cluster whose API is down answers nothing, so nothing gets stamped, and
+                # every remaining candidate used to pay its own inspect() — three nodes
+                # meant three times inspect()'s full budget, spent before the first
+                # machine (cluster or not) was asked to shut down.
+                discovered = cold.get(host.key)
+                if discovered is None:
+                    continue
                 if not discovered.reachable or not discovered.is_cluster:
+                    if not discovered.reachable:
+                        # Silent before, and that silence defeated the opt-in: no event,
+                        # no cluster_prep_failed entry, and — because the name was never
+                        # established — nothing for the abort filter to key on. Someone
+                        # who ticked "abort on failure" got their nodes powered off with
+                        # HA still armed and no Ceph flags, and the log said nothing.
+                        self.cluster_inspect_failed.add(host.key)
+                        await self._emit(
+                            f"Cluster of {host.name}: not reachable for preparation",
+                            "The cluster could not be inspected, so HA was not disarmed "
+                            "and no Ceph flags were set. "
+                            + (
+                                "'Abort on failure' is on, so this node is held back."
+                                if th.cluster_abort_on_prep_failure
+                                else "The node is shut down anyway, unprepared."
+                            ),
+                            db.CRITICAL,
+                        )
+                    else:
+                        # Reachable, and settled: this host is not a cluster member at
+                        # all. Latched for the episode because the answer cannot change
+                        # within it, and without the latch every poll on which this host
+                        # is still due — a retried shutdown — paid for another full
+                        # inspection (up to INSPECT_BUDGET_S plus the grace) off the
+                        # battery, for a question already answered. Said once as well:
+                        # the "this host belongs to a cluster" tick does nothing here,
+                        # and nothing else in the product would ever mention it.
+                        self.cluster_standalone.add(host.key)
+                        self._log_quiet(
+                            f"{host.name}: cluster preparation does not apply",
+                            "This host is marked as a cluster member, but its API "
+                            "reports a standalone node — no cluster record, so there is "
+                            "no HA manager to disarm and no Ceph flags to set. It is "
+                            "shut down normally. Untick 'this host belongs to a cluster' "
+                            "on its card to say so.",
+                            db.INFO,
+                        )
                     continue
                 name = discovered.name or host.name
-                self.host_states.setdefault(host.key, {})["cluster_name"] = name
                 self.cluster_states.setdefault(name, discovered)
-                info = discovered
+                info = self.cluster_states[name]
+                # Stamped on every member, not only on the node that happened to answer.
+                # _cluster_members() matches against the node list this reading just
+                # brought back, which is what saves the other candidates their own
+                # inspect() — and it is also the entry the abort-on-failure filter below
+                # keys on, so a held-back cluster now covers all of its nodes on a cold
+                # start too.
+                for member in self._cluster_members(info, name):
+                    self.host_states.setdefault(member.key, {})["cluster_name"] = name
+                self.host_states.setdefault(host.key, {})["cluster_name"] = name
 
             if self.cluster_prepared.get(name):
                 continue
@@ -1329,8 +2221,14 @@ class Engine:
             # attempts the write instead of silently skipping it. Without this, a cluster
             # without Ceph reported a FAILED preparation on every single outage, and with
             # abort-on-failure it held every node back over a component that is not there.
-            want_ceph = host.cluster_ceph and not info.ceph_unavailable
-            want_disarm = host.cluster_ha_disarm and not info.disarm_unavailable
+            #
+            # What is WANTED comes from the cluster's members, not from the node that
+            # happened to trigger first (see _cluster_switches): the preview and the
+            # self-test have always read it that way, and reading it differently here is
+            # what made them promise steps the preparation then skipped.
+            ask_ceph, ask_disarm, _ask_all = self._cluster_switches(members)
+            want_ceph = ask_ceph and not info.ceph_unavailable
+            want_disarm = ask_disarm and not info.disarm_unavailable
 
             # The cluster-wide guest stop rides on the Ceph switch and has none of its
             # own. On a hyper-converged cluster it is not an option but the first step of
@@ -1358,13 +2256,13 @@ class Engine:
             want_guests = want_ceph and not guest_block
 
             def _guest_clause() -> str:
-                return _prep_intent(host.cluster_ceph, want_guests, guest_block)
+                return _prep_intent(ask_ceph, want_guests, guest_block)
 
             if self.cfg.dry_run:
                 await self._emit(
                     f"DRY-RUN: cluster {name} would be prepared",
                     f"HA disarm: "
-                    f"{_prep_intent(host.cluster_ha_disarm, want_disarm, 'needs PVE 9.2+')}; "
+                    f"{_prep_intent(ask_disarm, want_disarm, 'needs PVE 9.2+')}; "
                     f"guest shutdown: {_guest_clause()}"
                     + (
                         f" ({len(cluster.stop_targets(info.guests, self_guest, own_hostname))} "
@@ -1374,7 +2272,7 @@ class Engine:
                         if want_guests
                         else ""
                     )
-                    + f"; Ceph flags: {_prep_intent(host.cluster_ceph, want_ceph, 'no Ceph')}"
+                    + f"; Ceph flags: {_prep_intent(ask_ceph, want_ceph, 'no Ceph')}"
                     + self._unit_clause(host, members, due)
                     + ". NOTHING is changed.",
                     db.WARNING,
@@ -1389,9 +2287,9 @@ class Engine:
                 self._log_quiet(
                     f"Cluster {name}: nothing to prepare",
                     f"HA disarm: "
-                    f"{_prep_intent(host.cluster_ha_disarm, False, 'needs PVE 9.2+')}; "
+                    f"{_prep_intent(ask_disarm, False, 'needs PVE 9.2+')}; "
                     f"guest shutdown: {_guest_clause()}; "
-                    f"Ceph flags: {_prep_intent(host.cluster_ceph, False, 'no Ceph')}. "
+                    f"Ceph flags: {_prep_intent(ask_ceph, False, 'no Ceph')}. "
                     f"The nodes are shut down normally.",
                     db.INFO,
                 )
@@ -1411,7 +2309,7 @@ class Engine:
             await self._emit(
                 f"Cluster {name}: preparing for shutdown",
                 f"HA disarm: "
-                f"{_prep_intent(host.cluster_ha_disarm, want_disarm, 'needs PVE 9.2+')}; "
+                f"{_prep_intent(ask_disarm, want_disarm, 'needs PVE 9.2+')}; "
                 f"guest shutdown: {_guest_clause()}"
                 + (
                     f" ({len(cluster.stop_targets(info.guests, self_guest, own_hostname))} "
@@ -1421,7 +2319,7 @@ class Engine:
                     if want_guests
                     else ""
                 )
-                + f"; Ceph flags: {_prep_intent(host.cluster_ceph, want_ceph, 'no Ceph')}."
+                + f"; Ceph flags: {_prep_intent(ask_ceph, want_ceph, 'no Ceph')}."
                 + self._unit_clause(host, members, due)
                 + f" The nodes of this cluster wait up to {budget}s for this"
                 + (
@@ -1503,7 +2401,7 @@ class Engine:
             # the maintenance flags set, and on a hyper-converged cluster their storage is
             # gone too once the monitors follow. Said out loud rather than left to be
             # discovered afterwards.
-            if not host.cluster_shutdown_all and len(due) < len(members):
+            if not _ask_all and len(due) < len(members):
                 await self._emit(
                     f"Cluster {name}: only part of the cluster is shut down",
                     f"{len(due)} of {len(members)} nodes triggered, and 'shut the whole "
@@ -1534,31 +2432,155 @@ class Engine:
         if not th.cluster_abort_on_prep_failure:
             return eligible
         blocked = {name for name, failed in self.cluster_prep_failed.items() if failed}
-        if not blocked:
+        if not blocked and not self.cluster_inspect_failed:
             return eligible
         return [
             (host, reason)
             for host, reason in eligible
             if self.host_states.get(host.key, {}).get("cluster_name") not in blocked
+            and host.key not in self.cluster_inspect_failed
         ]
 
+    def _known_cluster(
+        self, host: HostConfig
+    ) -> tuple[str, Optional["cluster.ClusterInfo"]]:
+        """This host's cluster as far as anything already knows it: (name, info).
+
+        Two ways in, and both matter. The ``cluster_name`` stamp is written by
+        _inspect_clusters() and by the preparation's own cold path; the node list of a
+        cluster inspected earlier in the same pass names members that were never stamped.
+        ``info`` is None exactly when somebody still has to read the cluster — which is the
+        one question _cold_inspect() and _prepare_clusters() must answer identically, or
+        the pre-pass inspects the wrong set and the loop falls through with nothing.
+        """
+        name = self.host_states.get(host.key, {}).get("cluster_name") or ""
+        if not name:
+            name = next(
+                (n for n, i in self.cluster_states.items() if host.name in i.nodes), ""
+            )
+        return name, (self.cluster_states.get(name) if name else None)
+
+    async def _cold_inspect(
+        self, candidates: list[tuple[HostConfig, str]]
+    ) -> dict[str, "cluster.ClusterInfo"]:
+        """Read the cluster for every candidate that still has none — one read where one
+        read is enough, concurrently where it is not.
+
+        The cold start: only _inspect_clusters() writes the ``cluster_name`` stamp, and it
+        stands down for the whole duration of an outage — so an outage arriving before the
+        first self-test (a restart, a configuration saved moments earlier) leaves the
+        preparation to read the cluster from inside the shutdown path.
+
+        One reading normally answers for the whole cluster, because it brings back the node
+        list and the caller stamps every member from it. That is the 4.1.0 behaviour and it
+        is kept exactly: the first candidate is read alone, and whatever its answer covers
+        is not read again.
+
+        What it does not cover was the hole. A cluster whose API is down names nobody, so
+        every remaining candidate fell through to its own sequential read of up to
+        INSPECT_BUDGET_S plus the grace — three nodes meant close to a minute, spent before
+        the first machine was asked to shut down, cluster member or not. Those go together
+        now, so the rest of the phase costs one reading's time however many are left. Two
+        genuinely distinct clusters take the same path, for the same reason.
+
+        Read-only and total: cluster.inspect() never raises and never outlasts its budget,
+        and _inspect_one() makes that structural rather than a promise — which is why the
+        gather below needs no return_exceptions of its own.
+        """
+        pending = [
+            host
+            for host, _reason in candidates
+            if host.key not in self.cluster_inspect_failed
+            and host.key not in self.cluster_standalone
+            and self._known_cluster(host)[1] is None
+        ]
+        if not pending:
+            return {}
+        out: dict[str, "cluster.ClusterInfo"] = {}
+        first, rest = pending[0], pending[1:]
+        out[first.key] = await self._inspect_one(first)
+        # Everything the first reading names is answered by it — the caller stamps those
+        # members and never asks again. Only what it leaves open is read, and then at once.
+        covered = set(out[first.key].nodes)
+        rest = [h for h in rest if h.name not in covered]
+        if rest:
+            results = await asyncio.gather(*(self._inspect_one(h) for h in rest))
+            out.update(zip((h.key for h in rest), results))
+        return out
+
+    async def _inspect_one(self, host: PveHostConfig) -> "cluster.ClusterInfo":
+        """One read-only inspection that cannot raise, for the cold-start pre-pass.
+
+        cluster.inspect() is total and bounded already; this makes the guarantee structural
+        at the one call site that is on the shutdown path with no other net under it.
+        """
+        try:
+            return await cluster.inspect(host)
+        except Exception as exc:  # noqa: BLE001 - never break the shutdown over a read
+            log.warning("Cluster inspection of %s raised: %s", host.name, exc)
+            # Unreachable is the honest reading of an inspection that did not happen, and
+            # it is the one the caller already handles: a critical event and, with "abort
+            # on failure", the node held back.
+            return cluster.ClusterInfo(reachable=False, error=str(exc))
+
     def _cluster_members(self, info: "cluster.ClusterInfo", name: str) -> list[PveHostConfig]:
-        """Every enabled PVE host belonging to this cluster.
+        """Every enabled PVE host that asked for cluster handling and belongs to this one.
 
         Two ways to match, because a shutdown can happen before any self-test has run:
         the discovered cluster name in host_states, or the node list the API just gave us.
         The second is the same verbatim name comparison cluster.node_coverage() makes —
         the shutdown call uses the name literally, so anything looser would be a lie.
+
+        ``h.cluster`` is part of the question, and leaving it out was a hole. This list is
+        what _unit_additions() shuts down as a unit, so a node that merely appears in the
+        API's node list — with the cluster switch deliberately NOT ticked, its own UPS
+        perfectly happy — was powered off by another node's outage. It was also the half
+        that silenced the warning meant to catch exactly that: _check_cluster_feeds() did
+        filter on ``h.cluster`` and returned early below two members, so the one
+        configuration in which the action over-reached was the one in which nothing said
+        so. One membership rule now, shared by the preparation, the unit additions, the
+        preview and the health checks.
+
+        cluster.node_coverage() is deliberately NOT affected: it counts over every enabled
+        PVE target, because its question is "who will nobody shut down", not "who takes
+        part in the preparation".
         """
         nodes = {n for n in info.nodes if n}
         found: dict[str, PveHostConfig] = {}
         for h in self.cfg.hosts:
-            if not isinstance(h, PveHostConfig) or not h.enabled:
+            if not isinstance(h, PveHostConfig) or not h.enabled or not h.cluster:
                 continue
             known = self.host_states.get(h.key, {}).get("cluster_name")
             if (name and known == name) or h.name in nodes:
                 found[h.key] = h
         return list(found.values())
+
+    @staticmethod
+    def _cluster_switches(members: list[PveHostConfig]) -> tuple[bool, bool, bool]:
+        """The three cluster switches as ONE answer per cluster: (ceph, disarm, all).
+
+        They are edited per host card because that is where a host is configured, but
+        every one of them describes something cluster-wide: Ceph maintenance flags, the
+        HA manager's arm state, and whether the cluster goes down as a unit. Nothing
+        stops them from being ticked differently on two nodes of the same cluster.
+
+        Answered in one place because the answer used to depend on who was asking. The
+        preparation read them off the candidate that happened to trigger first, while the
+        shutdown preview and the scheduled health check both read ``any(member)`` — so
+        with the switches set unevenly, the self-test promised Ceph flags and an HA disarm
+        that the real preparation then skipped, and which of the two was right depended on
+        which node's UPS failed. ``any`` is the safe reading of the three: preparing a
+        cluster nobody asked to prepare costs a maintenance flag, skipping one that was
+        asked for costs the storage.
+
+        _check_cluster_feeds() reports a cluster whose members disagree, so this never
+        silently papers over a configuration mistake.
+        """
+        return (
+            any(h.cluster_ceph for h in members),
+            any(h.cluster_ha_disarm for h in members),
+            any(h.cluster_shutdown_all for h in members),
+        )
 
     def _unit_clause(
         self, host: PveHostConfig, members: list[PveHostConfig], due: list[PveHostConfig]
@@ -1566,12 +2588,13 @@ class Engine:
         """The "n of m nodes" half-sentence for the preparation events."""
         if len(members) <= 1:
             return ""
+        _ceph, _disarm, want_all = self._cluster_switches(members)
         part = f" {len(due)} of {len(members)} nodes triggered"
         if len(due) == len(members):
             return part + "."
         return part + (
             "; the rest are shut down with them."
-            if host.cluster_shutdown_all
+            if want_all
             else "; the rest keep running ('shut the whole cluster down' is off)."
         )
 
@@ -1587,22 +2610,25 @@ class Engine:
         leaves the others without guests, without HA and (once the monitors follow)
         without storage. This is what keeps the two halves in step.
         """
-        if not host.cluster_shutdown_all:
+        if not self._cluster_switches(members)[2]:
             return []
         taken = {h.key for h, _ in eligible} | {h.key for h, _ in extra}
         out = []
         for member in members:
             if member.key in taken or self.host_fired.get(member.key):
                 continue
-            self.cluster_unit_hosts.add(member.key)
+            # Kept, not just noted: this is the reason _evaluate_hosts hands back to
+            # _fire_host when a first attempt failed. Written once and used in both
+            # places, so a retry cannot end up in the event log worded differently from
+            # the attempt it repeats.
+            unit_reason = f"cluster {name} is shut down as a unit ({reason})"
+            self.cluster_unit_hosts[member.key] = unit_reason
             # Record the membership we just established. On a cold start these hosts were
             # matched through the API's node list, not through host_states — and the
             # abort-on-failure filter below keys on exactly that entry, so without this a
             # held-back cluster would still shut its taken-along nodes down.
             self.host_states.setdefault(member.key, {})["cluster_name"] = name
-            out.append(
-                (member, f"cluster {name} is shut down as a unit ({reason})")
-            )
+            out.append((member, unit_reason))
         return out
 
     # -- cluster awareness (read-only part) ----------------------------------
@@ -1679,10 +2705,7 @@ class Engine:
         nodes are powering off would undo the preparation at the one moment it is doing
         its job. The confirmation dialog alone is too soft a guard for that.
         """
-        if self.shutdown_triggered or any(
-            rt.on_battery_since is not None or rt.state.on_battery
-            for rt in self.ups_rt.values()
-        ):
+        if self._outage_in_progress():
             return False, []
 
         infos = await self._inspect_clusters()
@@ -1742,13 +2765,13 @@ class Engine:
 
         for name, info in infos.items():
             warned = 0
-            wants_disarm = any(
-                h.cluster_ha_disarm for h in self.cluster_hosts()
-                if self.host_states.get(h.key, {}).get("cluster_name") == name
-            )
-            wants_ceph = any(
-                h.cluster_ceph for h in self.cluster_hosts()
-                if self.host_states.get(h.key, {}).get("cluster_name") == name
+            # Through the same membership rule and the same switch reading the
+            # preparation uses, so "the self-test says Ceph flags will be set" and "the
+            # preparation sets Ceph flags" cannot disagree. This used to match on the
+            # host_states stamp alone, which the preparation's cold path fills from the
+            # API's node list instead.
+            wants_ceph, wants_disarm, _wants_all = self._cluster_switches(
+                self._cluster_members(info, name)
             )
 
             missing = cluster.missing_privileges(
@@ -1767,6 +2790,10 @@ class Engine:
             # How the nodes are fed decides whether a partial outage is possible at
             # all — and that question stands whether or not Ceph is involved.
             warned += await self._check_cluster_feeds(name, info, wants_ceph)
+
+            # And the mirror image of that question: a node the preparation reaches but
+            # the shutdown never takes along.
+            warned += await self._check_cluster_optout(name, info, wants_ceph)
 
             # --- the appliance's own guest ------------------------------------
             # Everything below only matters once the guest stop is in play, i.e. with
@@ -1905,12 +2932,19 @@ class Engine:
         the "as a unit" switch, and both outcomes are worth knowing in advance — which is
         why this is said at self-test time rather than discovered during an outage.
         """
-        members = [h for h in self._cluster_members(info, name) if h.cluster]
+        members = self._cluster_members(info, name)
         if len(members) < 2:
             return 0
+        # Uneven switches first, because that question does not depend on the feeds and
+        # the answer to it changes what the paragraph below even means. All three are
+        # cluster-wide in effect while being edited per host card, so the appliance reads
+        # each of them as "any member asked for it" (see _cluster_switches) — which is the
+        # safe reading, not the obvious one, and therefore worth saying out loud.
+        warned = await self._check_cluster_switch_agreement(name, members)
+
         feeds = {h.key: frozenset(self.cfg.feed_ids_for(h)) for h in members}
         if len(set(feeds.values())) < 2:
-            return 0
+            return warned
 
         unit = [h.cluster_shutdown_all for h in members]
         if all(unit):
@@ -1929,10 +2963,12 @@ class Engine:
                 "or feed every node from UPS devices that fail together."
             )
         else:
+            # The disagreement itself is reported by _check_cluster_switch_agreement
+            # above; here it only decides how to describe the feeds.
             body = (
                 "'Shut the whole cluster down as a unit' is also set on some nodes of "
-                "this cluster and not on others, so what happens depends on which node "
-                "happens to trigger first. Set it the same way everywhere."
+                "this cluster and not on others. The appliance goes with 'as a unit' "
+                "because any node asked for it, but set it the same way everywhere."
             )
         await self._emit(
             f"Cluster {name}: its nodes are fed by different UPS devices",
@@ -1947,6 +2983,113 @@ class Engine:
             + " Note also that a UPS which goes unreachable instead of reporting battery "
             "(a management switch on the failing UPS) never triggers at all - see "
             "'Shutdown on pure communication loss after (min)'.",
+            db.WARNING,
+        )
+        return warned + 1
+
+    async def _check_cluster_switch_agreement(
+        self, name: str, members: list[PveHostConfig]
+    ) -> int:
+        """Warn when one cluster's nodes disagree about the three cluster switches.
+
+        They are edited per host card but every one of them acts on the whole cluster, so
+        "ticked on pve01, not on pve02" is not two settings but one contradiction. The
+        appliance resolves it with ``any`` (see _cluster_switches) — deliberately, because
+        preparing a cluster nobody asked to prepare costs a maintenance flag while
+        skipping one that was asked for costs the storage — but resolving it silently
+        would leave an operator reading their own configuration wrongly.
+
+        Only the two that were unreported: the "as a unit" split is described in context
+        by the feeds warning next door, which is where it changes what actually happens.
+        """
+        if len(members) < 2:
+            return 0
+        warned = 0
+        for label, field, effect in (
+            ("Set Ceph maintenance flags", "cluster_ceph",
+             "the flags are set and every guest in the cluster is stopped first"),
+            ("Disarm HA", "cluster_ha_disarm",
+             "the HA manager is disarmed for the whole cluster"),
+            ("Shut the whole cluster down as a unit", "cluster_shutdown_all",
+             "every node of the cluster is shut down as soon as one is due"),
+        ):
+            on = [h.name for h in members if getattr(h, field)]
+            off = [h.name for h in members if not getattr(h, field)]
+            if not on or not off:
+                continue
+            warned += 1
+            await self._emit(
+                f"Cluster {name}: '{label}' is not set the same on every node",
+                f"On: {', '.join(on)}. Off: {', '.join(off)}. This switch acts on the "
+                f"whole cluster, so it cannot be half on: {effect}, because at least one "
+                f"node asked for it. Set it the same way on every node of this cluster so "
+                f"the configuration says what happens.",
+                db.WARNING,
+            )
+        return warned
+
+    async def _check_cluster_optout(
+        self, name: str, info: "cluster.ClusterInfo", wants_ceph: bool
+    ) -> int:
+        """Warn about a node the preparation acts on but the shutdown leaves behind.
+
+        The counterpart of the membership rule _cluster_members() enforces, and it has to
+        exist because that rule is right: a node whose "cluster member" box is deliberately
+        unticked must not be powered off by another node's outage. What the tick does NOT
+        opt it out of is the preparation, which is cluster-wide by nature — the HA manager
+        is disarmed for the whole cluster, and with Ceph every guest in it is stopped,
+        including the ones running on that node.
+
+        So it is left standing without HA, without its guests and, on a hyper-converged
+        cluster, without storage once the monitors follow — and nothing said so. Every
+        neighbouring check looks past it by construction: _unit_additions() and the
+        "only part of the cluster is shut down" event count over ``members`` (ticked
+        only), _check_cluster_switch_agreement() compares within ``members``, and
+        cluster.node_coverage() sees a perfectly well configured, enabled target and
+        counts it as covered.
+
+        A warning, never an action: which of the two ticks is the wrong one is the
+        operator's call, and both answers are legitimate.
+        """
+        members = self._cluster_members(info, name)
+        if not members:
+            return 0
+        nodes = {n for n in info.nodes if n}
+        member_names = {m.name for m in members}
+        outsiders = [
+            h.name
+            for h in self.cfg.hosts
+            if isinstance(h, PveHostConfig)
+            and h.enabled
+            and not h.cluster
+            and h.name in nodes
+            and h.name not in member_names
+        ]
+        if not outsiders:
+            return 0
+        await self._emit(
+            # Deliberately not worded "not every node ...": the coverage warning
+            # above already opens that way, and two events whose subjects differ only
+            # after the sixth word are two events nobody tells apart in a feed.
+            f"Cluster {name}: some nodes are left out of the cluster handling",
+            f"{', '.join(outsiders)} "
+            + ("is" if len(outsiders) == 1 else "are")
+            + f" configured and active here, and the API reports "
+            + ("it" if len(outsiders) == 1 else "them")
+            + f" as a member of cluster {name}, but 'this host belongs to a cluster' is "
+            f"not ticked on "
+            + ("its card" if len(outsiders) == 1 else "their cards")
+            + ". The preparation another node triggers still acts on the whole cluster: "
+            "HA is disarmed cluster-wide"
+            + (", and every guest in the cluster is stopped — including the ones running "
+               "there" if wants_ceph else "")
+            + ". The shutdown, however, stops at the ticked nodes, so "
+            + ("that machine keeps" if len(outsiders) == 1 else "those machines keep")
+            + " running without HA"
+            + (", without guests and with the Ceph maintenance flags set"
+               if wants_ceph else "")
+            + ". Tick the option there as well, or untick it on the other nodes of this "
+            "cluster.",
             db.WARNING,
         )
         return 1
@@ -2051,25 +3194,6 @@ class Engine:
             await self._emit(f"Cluster {name}: MON nodes are not shut down last",
                              report, db.WARNING)
 
-        # The whole sequence now holds the battery for far longer than a bare node
-        # shutdown. Warned about, never acted on: lowering someone's trigger for them is
-        # not this appliance's decision.
-        th = self.cfg.thresholds
-        budget = shutdown_budget_s(th)
-        reserve = th.runtime_below_minutes
-        if reserve is not None and reserve * 60 < budget:
-            warned += 1
-            await self._emit(
-                f"Cluster {name}: battery reserve is shorter than the shutdown",
-                f"The shutdown trigger fires at {reserve} min ({reserve * 60}s) of "
-                f"estimated runtime, but preparing this cluster and shutting it down can "
-                f"take up to {budget}s (HA disarm "
-                f"{th.cluster_prep_timeout_s}s + guests "
-                f"{th.cluster_guest_shutdown_timeout_s}s + nodes "
-                f"{th.host_shutdown_timeout_s}s). Raise the trigger or lower the guest "
-                f"timeout.",
-                db.WARNING,
-            )
         return warned
 
     def _log_quiet(self, subject: str, body: str, severity: str) -> None:
@@ -2087,13 +3211,13 @@ class Engine:
         Runs concurrently with its stage peers (see _evaluate_hosts), so it must not
         assume it is alone: state is merged into host_states, never replaced.
         """
-        self.host_fired[host.key] = True
         if not self.shutdown_triggered:
             self.shutdown_triggered = True
             self.triggered_at = _now()
         self.shutdown_reason = f"{host.name}: {reason}"
 
         if self.cfg.dry_run:
+            self.host_fired[host.key] = True
             await self._emit(
                 "DRY-RUN: shutdown would be triggered",
                 f"Host {host.name} — reason: {reason}. NOTHING will be shut down.",
@@ -2109,10 +3233,18 @@ class Engine:
             # them apart, so there the configured name has to stay in the path.
             use_localhost=self.cfg.api_url_is_unique(host),
         )
+        # Latch on success; on failure only once the attempts are used up. The latch used
+        # to be set before the call, so one transient failure took the machine out of the
+        # episode for good.
+        state = self.host_states.setdefault(host.key, {})
+        attempts = int(state.get("shutdown_attempts") or 0) + 1
+        done = ok or attempts >= MAX_SHUTDOWN_ATTEMPTS
+        self.host_fired[host.key] = done
         # Merge, so the last self-test result stays visible next to the shutdown result.
-        self.host_states.setdefault(host.key, {}).update(
+        state.update(
             {
                 "shutdown_state": "sent" if ok else "failed",
+                "shutdown_attempts": attempts,
                 "last_action_at": _now().isoformat(),
                 "last_error": None if ok else msg,
                 "reachable": ok,
@@ -2120,12 +3252,25 @@ class Engine:
                 "order": host.order,
             }
         )
-        await self._emit(
-            f"Host {host.name}: shutdown {'sent' if ok else 'FAILED'}",
-            f"Reason: {reason}. {msg}",
-            # An executed shutdown is not routine either (see "shutdown aborted" above).
-            db.WARNING if ok else db.CRITICAL,
-        )
+        if ok:
+            subject = f"Host {host.name}: shutdown sent"
+            body = f"Reason: {reason}. {msg}"
+            severity = db.WARNING  # not routine either (see "shutdown aborted" above)
+        elif not done:
+            subject = f"Host {host.name}: shutdown failed — retrying"
+            body = (
+                f"Reason: {reason}. {msg} Attempt {attempts} of {MAX_SHUTDOWN_ATTEMPTS}; "
+                f"the next poll tries again."
+            )
+            severity = db.WARNING
+        else:
+            subject = f"Host {host.name}: shutdown FAILED"
+            body = (
+                f"Reason: {reason}. {msg} Gave up after {attempts} attempts — this "
+                f"machine is still running."
+            )
+            severity = db.CRITICAL
+        await self._emit(subject, body, severity)
 
     # -- notifications + event log ------------------------------------------
     async def _emit(self, subject: str, body: str, severity: str) -> None:
@@ -2146,7 +3291,9 @@ class Engine:
     # -- status snapshot for the REST API -----------------------------------
     def _ups_snapshot(self, u: UpsBase, rt: _UpsRuntime) -> dict:
         st = rt.state
-        th = self.cfg.effective_thresholds(u)
+        # "On battery" in the same sense the rest of the engine uses it: the device says so,
+        # or we watched it go and have not seen it come back (which covers a blind outage).
+        _on_battery = st.on_battery or rt.on_battery_since is not None
         return {
             "id": u.id,
             "name": u.label,
@@ -2158,9 +3305,13 @@ class Engine:
             "manufacturer": st.manufacturer,
             "model": st.model,
             "last_poll": st.last_poll.isoformat() if st.last_poll else None,
+            # From _on_battery, not from st.on_battery: the loop picks its cadence the
+            # same way (see _loop), so reading only what the device says reported the
+            # 30 s normal interval throughout a blind outage — the one situation in which
+            # someone is actually watching this number — while polling ran at 8 s.
             "poll_interval_s": (
                 self.cfg.thresholds.poll_interval_battery_s
-                if st.on_battery
+                if _on_battery
                 else self.cfg.thresholds.poll_interval_normal_s
             ),
             "power_source": st.power_source,
@@ -2168,12 +3319,23 @@ class Engine:
             "runtime_remaining_min": st.runtime_remaining_min,
             "battery_charge_pct": st.battery_charge_pct,
             "load_pct": st.load_pct,
-            "seconds_on_battery": self._ups_elapsed_on_battery(rt),
+            # Both only while the UPS really is on battery. This used to be passed through
+            # whatever the state, so a card holding on to the last transfer's counter read
+            # as a multi-day outage on a UPS sitting happily on mains.
+            "seconds_on_battery": (
+                self._ups_elapsed_on_battery(rt) if _on_battery else None
+            ),
+            "elapsed_source": self._ups_elapsed_source(rt) if _on_battery else None,
             "triggered": rt.triggered,
             "trigger_reason": rt.trigger_reason,
             "countdown_remaining_s": self._ups_countdown_remaining_s(u, rt),
             "comm_loss_remaining_s": self._ups_comm_loss_remaining_s(u, rt),
             "alarm": rt.alarm_active,
+            # What keeps this entry from being polled at all, or None. Told apart from
+            # "error" on purpose: that one is why the last read failed, this one is why
+            # there was never a read to fail. Without it the two are indistinguishable on
+            # the dashboard — both render as a device that is simply not answering.
+            "incomplete": self.cfg.incomplete_ups(u) or None,
             "error": st.error,
         }
 
@@ -2237,6 +3399,14 @@ class Engine:
                     "ups_ids": list(h.ups_ids),
                     "ups_policy": h.ups_policy,
                     "feeds": feeds,
+                    # Ids this host names that no longer exist. Live, because the event
+                    # is written once per config while this stays true until it is fixed.
+                    "stale_ups_ids": self.cfg.stale_feed_ids(h),
+                    # What this entry is missing to be usable at all, or None. Live for
+                    # the same reason, and next to the chip above because it is the same
+                    # class of fault: configured, rendered complete, and unable to shut
+                    # anything down when it is asked to.
+                    "incomplete": self.cfg.incomplete_host(h) or None,
                     "eligible": self._host_trigger_reason(h) is not None,
                     "pending_reason": self._host_trigger_reason(h),
                     "reachable": st.get("reachable"),
@@ -2280,7 +3450,7 @@ class Engine:
                 # tell. Everything is None until one has run — the UI must show "not
                 # established", never a confident "not on Ceph".
                 "self_guest": self._self_guest_snapshot(),
-                "shutdown_budget_s": shutdown_budget_s(self.cfg.thresholds),
+                "shutdown_budget_s": shutdown_budget_s(self.cfg),
             },
             "ups": ups_list,
             "shutdown": {
@@ -2292,7 +3462,25 @@ class Engine:
             },
             "hosts": hosts,
             "clusters": self.cluster_snapshot(),
+            # How the notification targets themselves are doing. The shutdown credentials
+            # have had a self-test and a chip for releases; these had a journald line.
+            "webhooks": self._webhook_snapshot(),
         }
+
+    def _webhook_snapshot(self) -> list[dict]:
+        """Per-webhook delivery state. Everything is None until a target has been tried."""
+        seen = notify.delivery_state()
+        return [
+            {
+                "id": h.id,
+                "name": h.label,
+                "enabled": h.enabled,
+                "last_delivery_ok": seen.get(h.id, {}).get("ok"),
+                "last_delivery_at": seen.get(h.id, {}).get("at"),
+                "last_delivery_error": seen.get(h.id, {}).get("error"),
+            }
+            for h in self.cfg.notifications.webhooks
+        ]
 
     def _self_guest_snapshot(self) -> dict:
         """The appliance's own guest as the last inspection saw it, across all clusters.

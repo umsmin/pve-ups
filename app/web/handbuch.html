@@ -167,7 +167,7 @@
   <header class="topbar">
     <span class="brand">
       <svg class="mark icon-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 5v6c0 5 3.4 8.5 8 11 4.6-2.5 8-6 8-11V5l-8-3z"/></svg>
-      PVE-UPS <span class="sub">Benutzerhandbuch · v4.0.0</span>
+      PVE-UPS <span class="sub">Benutzerhandbuch · v4.1.0</span>
     </span>
     <span class="spacer"></span>
     <a class="btn" href="https://github.com/ffind-dev/pve-ups" target="_blank"
@@ -536,12 +536,38 @@ proxmox-backup-manager acl update /system/status Admin --auth-id 'ups@pbs!shutdo
           Kontakt zur USV verloren. Die noch gelieferten Werte sind alt, deshalb gilt die USV
           als nicht erreichbar — Alarm, nie ein Shutdown. Den NUT-Treiber auf der Maschine
           neu starten.</li>
+          <li><b>Das Objekt für die Stromquelle fehlt oder meldet „unknown"</b>: Das Gerät
+          antwortet, andere Werte kommen an, aber genau das Objekt, das sagt, ob es am Netz
+          oder auf Akku läuft (<code>upsOutputSource</code>, bei APC
+          <code>upsBasicOutputStatus</code>), liefert nichts Brauchbares. Daraus lässt sich
+          nichts folgern, deshalb gilt die USV als nicht erreichbar — Alarm, nie ein
+          Shutdown, und ein laufender Akku-Countdown läuft weiter. Die MIB-Einstellung
+          prüfen; implementiert das Gerät das Objekt wirklich nicht, taugt es nicht als
+          Shutdown-Quelle.</li>
+          <li><b><code>ups.status</code> nennt weder <code>OL</code> noch <code>OB</code></b>
+          (NUT): derselbe Fall auf der NUT-Seite. Die Variable ist da, trägt aber nur etwas
+          wie <code>CHRG</code>, <code>ALARM</code> oder <code>RB</code> — oder ist leer —,
+          und nichts davon sagt, woher der Strom kommt. Behandlung genau wie oben: nicht
+          erreichbar, Alarm, nie ein Shutdown, ein laufender Countdown läuft weiter.
+          Meistens eine Treiber-Eigenheit; den Treiber auf dem NUT-Server prüfen.</li>
         </ul>
+        <div class="callout info">
+          <span><b>All diese Geräte haben geantwortet.</b> PVE-UPS hält das bewusst von
+          einem Gerät auseinander, das verstummt ist, denn <b>„Shutdown bei reinem
+          Kommunikationsverlust"</b> (siehe <a href="#ausloeser">Auslöser</a>) greift nur
+          bei Stille. Eine USV, die unbrauchbar antwortet, löst ihn nie aus — und ein
+          Eintrag, der von vornherein gar nicht abfragbar ist, etwa eine ohne Adresse
+          gespeicherte USV-Karte, ebenso wenig. Der Alarm sagt, welcher der beiden Fälle
+          vorliegt, und schickt einen so nicht in ein Netz, das funktioniert.</span>
+        </div>
       </section>
 
       <section class="card" id="logik">
         <h2 class="sec"><span class="n">6</span> Funktion &amp; Logik</h2>
         <p>Die Engine fragt alle USVs parallel ab und wertet <b>jede USV unabhängig</b> aus.
+        Jede Abfrage hat eine eigene Frist, abgeleitet aus den Timeout- und
+        Wiederholungseinstellungen des jeweiligen Geräts — ein Server, der die Verbindung
+        annimmt und dann verstummt, kann den Countdown der anderen also nicht aufhalten.
         Pro USV gibt es eine einfache Zustandsabfolge:</p>
         <p>
           <span class="pill ok">ONLINE</span> Netzbetrieb &nbsp;→&nbsp;
@@ -612,11 +638,27 @@ proxmox-backup-manager acl update /system/status Admin --auth-id 'ups@pbs!shutdo
         <a href="#cluster-ceph">Hyperkonvergente Cluster (Ceph)</a> — dieser Teil ist ein
         erheblich größerer Eingriff, mit eigenen Rechten.</p>
         <p>Auf der Host-Karte im Kasten <i>Proxmox-VE-Cluster</i> „Cluster-Mitglied"
-        ankreuzen. Die Zuordnung erfolgt automatisch über den per API gelesenen
-        Cluster-Namen — ein zweites Token oder ein eigener Konfigurationsabschnitt ist nicht
-        nötig. Weil die Zuordnung automatisch geschieht, spielt es keine Rolle, ob Sie den
-        Haken bei einem Mitglied oder bei allen setzen: Die Vorbereitung läuft trotzdem genau
-        einmal je Cluster, bevor dessen erster Knoten heruntergefahren wird.</p>
+        ankreuzen — bei <b>jedem</b> Knoten des Clusters. Die Zuordnung erfolgt automatisch
+        über den per API gelesenen Cluster-Namen — ein zweites Token oder ein eigener
+        Konfigurationsabschnitt ist nicht nötig, und die Vorbereitung läuft genau einmal je
+        Cluster, bevor dessen erster Knoten heruntergefahren wird. Der Haken entscheidet
+        darüber, <i>wer als Mitglied zählt</i>: Ein Knoten ohne ihn wird umgangen statt
+        einbezogen, er wird von „Ganzen Cluster als Einheit herunterfahren" nie mitgenommen,
+        und seine eigenen Schalter haben kein Mitspracherecht. Was der Haken <b>nicht</b>
+        abw&auml;hlt, ist die Vorbereitung selbst — die wirkt naturgem&auml;&szlig; auf den
+        ganzen Cluster: HA wird clusterweit entwaffnet und mit Ceph wird jeder Gast im
+        Cluster gestoppt, auch die auf diesem Knoten. Bleibt der Haken auf einem Knoten aus,
+        steht diese Maschine also ohne HA und ohne ihre G&auml;ste da. Der geplante
+        Selbsttest benennt einen solchen Knoten, damit der Widerspruch vor einem Stromausfall
+        auff&auml;llt und nicht w&auml;hrenddessen.</p>
+        <p>Alle drei Schalter in diesem Kasten wirken auf den <b>gesamten Cluster</b> —
+        Ceph-Wartungsflags, Armierungszustand des HA-Managers und ob der Cluster als Einheit
+        heruntergefahren wird — obwohl sie je Host-Karte eingestellt werden. Setzen Sie jeden
+        davon deshalb bei allen Knoten eines Clusters gleich. Wo sie sich widersprechen, geht
+        PVE-UPS von „mindestens ein Knoten hat es verlangt" aus (einen verlangten Schritt
+        auszulassen kann den Storage kosten, einen ungefragten auszuführen kostet ein
+        Wartungsflag) und schreibt eine Warnung, die beide Seiten benennt — so fällt der
+        Widerspruch beim nächsten Selbsttest auf und nicht erst im Ausfall.</p>
         <p>Auf einem einfachen Cluster erledigt sie das eine, was ein Shutdown je Knoten nicht
         leisten kann:</p>
         <ul>
@@ -958,7 +1000,19 @@ pveum role add UpsCluster -privs "Sys.Audit Sys.Console Sys.Modify VM.Audit VM.P
           <li><b>Shutdown nach X Minuten reinem Verlust</b> (Standard aus): Behandelt einen
           reinen Kommunikationsverlust (ohne vorher bestätigten Akkubetrieb) nach X Minuten
           doch als Ausfall. Bewusstes Opt-in für Umgebungen, in denen ein längerer
-          Kontaktverlust als kritisch gilt.</li>
+          Kontaktverlust als kritisch gilt. Er greift nur bei <em>Stille</em>: Ein Gerät,
+          das antwortet, dessen Antwort aber unbrauchbar ist &mdash; keine verwertbare
+          Stromquelle, keines der Objekte der gewählten MIB, ein <code>ups.status</code>,
+          der weder <code>OL</code> noch <code>OB</code> nennt, oder ein NUT-Server, der
+          mit <code>ERR&nbsp;DATA-STALE</code>, <code>DRIVER-NOT-CONNECTED</code>,
+          <code>ACCESS-DENIED</code> oder <code>UNKNOWN-UPS</code> antwortet &mdash;, gilt
+          für alles andere als nicht erreichbar, aber nie als Kommunikationsverlust. Die
+          Verbindung steht ja sichtbar; der Alarm sagt, welcher der beiden Fälle vorliegt.
+          Dasselbe gilt für einen Eintrag, der gar nicht abgefragt werden kann (eine
+          USV-Karte ohne Adresse, etwa aus einem Backup-Import): Sie hat nie ein Paket
+          geschickt, also auch keinen Hinweis auf den Strom geliefert, und bleibt, was sie
+          überall sonst ist &mdash; ein Alarm und eine Verweigerung, die von ihr
+          versorgten Hosts herunterzufahren, kein Befehl dazu.</li>
         </ul>
         <h3>Übersicht der Fälle</h3>
         <table>
@@ -971,6 +1025,7 @@ pveum role add UpsCluster -privs "Sys.Audit Sys.Console Sys.Modify VM.Audit VM.P
             <tr><td>Kontaktverlust nach bereits ausgelöstem Trigger</td><td>Auslösung bleibt bestehen (keine Rückstufung)</td></tr>
             <tr><td>Reiner Kontaktverlust mit aktivem Opt-in</td><td>Shutdown nach Ablauf der Schwelle</td></tr>
             <tr><td>NUT-Server liefert veraltete Daten</td><td>gilt als nicht erreichbar (Alarm), nie als „Netzbetrieb"</td></tr>
+            <tr><td>USV antwortet, meldet aber keine brauchbare Stromquelle</td><td>gilt als nicht erreichbar (Alarm), nie als „Netzbetrieb"</td></tr>
             <tr><td>Dry-Run aktiv</td><td>Auslöser wird erkannt + protokolliert, nichts wird heruntergefahren</td></tr>
             <tr><td>Netz kehrt zurück</td><td>Zustand wird zurückgesetzt; ein bereits
             gesendeter Shutdown nach „Wieder scharf nach Netzrückkehr"</td></tr>
@@ -983,6 +1038,53 @@ pveum role add UpsCluster -privs "Sys.Audit Sys.Console Sys.Modify VM.Audit VM.P
         <p>Es genügt <b>eine</b> zutreffende Bedingung. Alle Werte sind im Wizard änderbar
         (Feld leeren = Bedingung aus); Schwellen lassen sich global setzen und pro USV
         überschreiben.</p>
+        <p><b>Wie „länger auf Akku als“ gemessen wird.</b> PVE-UPS misst den Ausfall mit der
+        eigenen Uhr, ab dem Poll, in dem die Umschaltung auf Akku erstmals gesehen wurde.
+        Der Zähler, den die USV selbst meldet, wird bewusst <em>nicht</em> verwendet: Der
+        Standard legt diesen Wert nur für den Akkubetrieb fest, und eine Karte, die den Wert
+        des vorigen Ausfalls behält statt ihn zu löschen, ließe den allerersten Poll eines
+        neuen Ausfalls so aussehen, als wäre die Schwelle längst überschritten. Der
+        Gerätezähler wird gar nicht gelesen. Der laufende Timer übersteht einen Neustart des
+        Dienstes, geht bei einem Update oder Reboot also nicht verloren; nur wenn dieser
+        gespeicherte Timer unbrauchbar ist (fehlt oder älter als ein Tag), beginnt eine
+        Appliance, die in einen bereits laufenden Ausfall startet, bei null zu zählen — und
+        Restlaufzeit, Ladung und „Akku leer“ lesen frische Werte und sind davon nicht
+        betroffen. Die Statusseite nennt, ob überhaupt eine Zeit gemessen werden konnte.</p>
+        <p><b>Ein wiederhergestellter Timer wartet auf die Bestätigung der USV.</b> Diese
+        Appliance fährt ihren eigenen Host zuletzt herunter, <em>jeder</em> Ausfall endet
+        also mit ihrem Neustart &mdash; und sie findet einen gespeicherten Timer vor, der
+        &bdquo;seit drei Stunden auf Akku&ldquo; sagt. Genau dann konvergiert ein Switch
+        noch und fährt eine SNMP-Karte noch hoch, und ein ungeprüft übernommener Timer
+        würde die eben erst wieder gestarteten Maschinen sofort erneut herunterfahren.
+        Deshalb löst nichts, was aus der Zustandsdatei kommt, einen Shutdown aus, bevor ein
+        Poll des neu gestarteten Dienstes geantwortet hat. Diese Antwort klärt beides: Bei
+        Netzbetrieb wird alles Wiederhergestellte verworfen, bei weiterhin Akkubetrieb wird
+        der Auslöser aus der <em>vollen</em> wiederhergestellten Zeit im selben Poll
+        bestimmt. Ein Neustart mitten im Ausfall kostet damit nichts, denn dort ist die USV
+        per Definition erreichbar. Verloren geht der Countdown nur, wenn sich die USV nach
+        dem Neustart nie wieder meldet &mdash; und dann hat die Appliance keinerlei Beleg
+        dafür, dass der Ausfall überhaupt noch läuft, also handelt sie nicht. Solange ein
+        Timer zurückgehalten wird, sagt das Dashboard das, statt auf einen Shutdown
+        herunterzuzählen, der nicht kommt. Ein zurückgehaltener Timer gilt außerdem nicht
+        als laufender Ausfall für die Prüfungen, die während eines Ausfalls pausieren:
+        Selbsttest, Startprüfungen und <b>&bdquo;Cluster wiederherstellen&ldquo;</b> bleiben
+        verfügbar &mdash; und genau darauf kommt es an, denn eine nach dem Neustart der
+        Appliance noch stumme USV ist der Moment, in dem der vom letzten Ausfall
+        vorbereitete Cluster zurückgeholt werden muss.</p>
+        <p><b>Schlägt eine Shutdown-Anfrage fehl</b> — ausgelastete API, abgebrochene
+        Verbindung oder ein Knoten, der schlicht zu lange zum Antworten braucht —, wird
+        dieser Host in den folgenden Polls erneut angefragt, insgesamt dreimal, und jeder
+        Versuch steht im Eventlog. Eine wiederholte Anfrage an eine Maschine, die ohnehin
+        herunterfährt, schadet nicht; nicht erneut zu fragen ließe sie bis zum leeren Akku
+        weiterlaufen. Kehrt der Netzstrom zurück, während ein Host noch wiederholt wird,
+        wird die Episode wie jede andere abgeschlossen: Die Appliance geht zurück auf
+        <span class="pill ok">ONLINE</span> und schreibt ein kritisches Ereignis, das
+        festhält, dass diese Maschine nie heruntergefahren wurde und noch läuft.</p>
+        <p><b>Werte außerhalb eines sinnvollen Bereichs werden korrigiert, nicht befolgt.</b>
+        Ein Poll-Intervall von null oder ein negativer Timeout fällt auf den Standard zurück
+        und erzeugt ein Ereignis, das die Einstellung benennt. Das ist Absicht: Die
+        Konfiguration stattdessen abzulehnen hieße, dass die Appliance nicht mehr startet —
+        und damit gar nichts mehr schützt.</p>
         <table>
           <thead><tr><th>Bedingung</th><th>Standard</th></tr></thead>
           <tbody>
@@ -1007,16 +1109,23 @@ pveum role add UpsCluster -privs "Sys.Audit Sys.Console Sys.Modify VM.Audit VM.P
         Verfügung:</p>
         <ul>
           <li><code>GET /api/status</code> — kompletter Zustand: Appliance, alle USVs, Hosts,
-          Shutdown-Status sowie die Ereignisse der letzten 48 h inkl. Severity-Zusammenfassung.</li>
+          Shutdown-Status, die Benachrichtigungsziele samt Ergebnis ihrer letzten Zustellung
+          (<code>webhooks</code>, bewusst ohne die URL) sowie die Ereignisse der letzten 48 h
+          inkl. Severity-Zusammenfassung.</li>
           <li><code>GET /api/health</code> — <code>200</code>, wenn die Engine läuft (mit
           Version und Erreichbarkeit der USVs), sonst <code>503</code>. Ideal für
           Uptime-Checks. Zusätzlich werden die Shutdown-Ziele gemeldet:
           <code>hosts_total</code>, <code>hosts_ok</code> (letzter Selbsttest hat Token
           <i>und</i> Recht bestätigt), <code>hosts_selftest_ok</code> und
-          <code>hosts_selftest_at</code>. Diese Werte sind rein informativ — ein kaputtes
-          Token macht aus dem Endpunkt <i>keine</i> <code>503</code>, weil die Appliance
-          selbst ja weiterarbeitet. Wer darauf alarmieren will, wertet
-          <code>hosts_selftest_ok</code> separat aus.</li>
+          <code>hosts_selftest_at</code>, die Benachrichtigungsziele
+          (<code>webhooks_total</code>, <code>webhooks_ok</code> — ein Ziel gilt als ok,
+          bis ein Versand nachweislich fehlgeschlagen ist, ein nie versuchtes liest sich
+          also nicht als defekt) sowie <code>dry_run</code>. Diese Werte sind rein
+          informativ — ein kaputtes Token macht aus dem Endpunkt <i>keine</i>
+          <code>503</code>, weil die Appliance selbst ja weiterarbeitet. Wer darauf
+          alarmieren will, wertet <code>hosts_selftest_ok</code>, <code>webhooks_ok</code>
+          und <code>dry_run</code> separat aus: Eine Appliance im Trockenlauf besteht hier
+          jede Pr&uuml;fung, antwortet <code>ok</code> und f&auml;hrt nichts herunter.</li>
         </ul>
 <pre><code>curl http://&lt;container-ip&gt;:8080/api/status | jq
 # nur kritische Ereignisse der letzten 48 h:
@@ -1036,6 +1145,15 @@ curl -s http://&lt;container-ip&gt;:8080/api/status \
         anlegen — eine Karte je Ziel, jeweils mit eigenem Format, eigenem Schweregrad-Filter
         und eigener Testschaltfläche. Der Versand läuft parallel und wird einzeln gemeldet;
         ein nicht erreichbares Ziel kostet den anderen also nicht ihre Benachrichtigung.</p>
+        <p><b>Ein Ziel, das nicht mehr funktioniert, sagt das.</b> Ein abgelaufenes Token
+        oder ein gelöschter Connector scheiterte bisher unsichtbar — man erfuhr davon bei
+        dem Ausfall, über den man nicht informiert wurde. Der erste Fehlschlag nach einem
+        erfolgreichen Versand steht jetzt im Eventlog, die Webhook-Karte zeigt den letzten
+        Fehler an, bis ein Versand wieder gelingt, und die Appliance-Karte auf dem Dashboard
+        bekommt eine Zeile „Benachrichtigungen“, solange irgendein Ziel gestört ist &mdash;
+        auf die Einstellungsseite schaut während eines Ausfalls niemand. Benachrichtigungen
+        bleiben durchgehend „best effort“: Sie werden nie wiederholt, und ein fehlschlagendes
+        Ziel verzögert oder beeinflusst niemals einen Shutdown.</p>
         <p><b>Format</b> — Aufbau der Nutzlast, passend zum Zielsystem:</p>
         <table>
           <thead><tr><th>Format</th><th>Sendet</th></tr></thead>
@@ -1306,87 +1424,49 @@ systemctl start pve-usv-agent.service</code></pre>
         Verlauf steht im <a href="https://github.com/ffind-dev/pve-ups/blob/main/CHANGELOG.md"
         target="_blank" rel="noopener">Changelog des GitHub-Repositories</a>.</p>
 
+        <div class="cl-ver">4.1.0 <span class="date">2026</span></div>
+        <ul>
+          <li><b>Eine USV mit veraltetem „Zeit auf Akku“-Zähler löst keinen sofortigen
+          Shutdown mehr aus.</b> Die Appliance misst den Ausfall jetzt mit der eigenen Uhr,
+          statt dem Zähler zu glauben, den die USV meldet — den der Standard nur für den
+          Akkubetrieb festlegt und den etliche Karten aus dem letzten Ausfall behalten. Der
+          laufende Timer übersteht einen Neustart des Dienstes.</li>
+          <li><b>Eine USV, die antwortet, ohne ihre Stromquelle zu nennen, ist ein Alarm und
+          keine Entwarnung.</b> Bei SNMP wie bei NUT löscht eine solche Messung mitten im
+          Ausfall keinen laufenden Countdown mehr — und sie gilt auch nicht als Stille,
+          „Shutdown bei reinem Kommunikationsverlust“ greift also nicht bei einem Gerät, das
+          antwortet.</li>
+          <li><b>Ein fehlgeschlagener Shutdown wird wiederholt</b> — drei Versuche statt
+          einem, damit eine ausgelastete Proxmox-API oder eine abgebrochene Verbindung keine
+          Maschine mehr laufen lässt, während das Dashboard sie als erledigt zeigt.</li>
+          <li><b>Ein Cluster nimmt nur die Knoten mit, die das auch wollten</b>, und die drei
+          Cluster-Schalter werden einmal je Cluster gelesen statt von dem Knoten, der
+          zufällig zuerst auslöste. Siehe <a href="#cluster">Abschnitt 6</a>.</li>
+          <li>Außerdem: Webhook-Fehler werden gemeldet, statt unsichtbar zu scheitern, ein
+          aktiver Testmodus sagt das auf dem Dashboard, Einträge, die ihre Aufgabe nicht
+          erfüllen können (Host ohne Token, USV ohne Adresse), werden gekennzeichnet, und
+          kein Geheimnis erreicht mehr den öffentlichen Status-Endpunkt.</li>
+        </ul>
+
         <div class="cl-ver">4.0.0 <span class="date">2026</span></div>
         <ul>
-          <li><b>Der Installer lehnt Ceph-gestützten Storage für den Container ab.</b>
-          Er muss den Cluster überleben, den er herunterfährt, und auf Ceph kann er das
-          nicht. <code>--allow-ceph-storage</code> setzt sich darüber hinweg.</li>
-          <li><b>Nach dem automatischen Wiederarmieren läuft sofort ein Selbsttest</b>,
-          damit ein während des Ausfalls abgelaufenes Token, ein nicht zurückgekehrter Knoten
-          oder ein noch vorbereiteter Cluster gleich auffällt statt erst beim nächsten
-          geplanten Termin.</li>
           <li><b>Proxmox-VE-Cluster werden vor dem Shutdown vorbereitet</b>
           <span class="pill warn">Beta</span>. Wird ein Knoten als Cluster-Mitglied markiert,
-          disarmt PVE-UPS einmal je Cluster den HA-Manager — und stoppt, wenn Sie die
-          Ceph-Option einschalten, zuerst alle Gäste des Clusters und setzt danach die
-          Wartungsflags —, bevor der erste Knoten heruntergefahren wird; jeder Schritt
-          überprüft, alles unter harten Zeitlimits. Dass die Gäste zuerst gestoppt werden,
-          macht einen hyperkonvergenten Cluster überhaupt erst überlebensfähig: Knoten für
-          Knoten fällt der Pool unter <code>min_size</code>, während noch Gäste laufen, deren
-          IO blockiert und der letzte Knoten nie ausgeht. Danach armiert die Schaltfläche
-          <b>„Cluster wiederherstellen"</b> im Dashboard HA wieder und löscht die Flags.
-          Setzt Proxmox VE 9.2 oder neuer voraus; als Beta gekennzeichnet, solange
-          Praxiserfahrung gesammelt wird, und durchgehend opt-in. Siehe
-          <a href="#cluster">Abschnitt 6</a>, der jetzt den einfachen Cluster vom
-          <a href="#cluster-ceph">hyperkonvergenten Fall</a> trennt — beide unterscheiden
-          sich in Tragweite und benötigten Rechten weit mehr, als ein Abschnitt tragen
-          konnte.</li>
-          <li><b>Ein Cluster wird als Einheit heruntergefahren</b> (standardmäßig an). Die
-          Vorbereitung wirkte clusterweit, der Shutdown hostweise — lösten nur einzelne USVs
-          aus, blieb ein halbierter Cluster zurück: Knoten mit gestoppten Gästen, disarmtem
-          HA und, auf einem hyperkonvergenten Cluster, ohne Monitor-Quorum. Jetzt nimmt ein
-          fälliger Knoten den gesamten Cluster mit, in der konfigurierten Reihenfolge. Für
-          einen einfachen Cluster, bei dem HA die Gäste eines einzelnen ausfallenden Knotens
-          übernehmen soll, lässt sich das abschalten. Der Selbsttest warnt außerdem, wenn die
-          Knoten eines Clusters an USVs hängen, die unabhängig voneinander auslösen
-          können.</li>
-          <li><b>„Selbsttest jetzt ausführen" im Dashboard.</b> Das Speichern der
-          Einstellungen löst bewusst keine Prüfung der Anmeldedaten aus, und der nächste
-          geplante Lauf kann Stunden entfernt sein. Die Schaltfläche führt die Host- und
-          Cluster-Prüfungen sofort aus und schreibt das Ergebnis immer ins Eventlog.</li>
-          <li><b>Der Shutdown geht an die Maschine hinter der eingetragenen API-URL</b>
-          (<code>/nodes/localhost/status</code>); ein vertippter „Knoten" kann ihn also
-          nicht mehr fehlleiten — und Proxmox behandelt diese Form ohne Rückfrage beim
-          Cluster, was genau dann zählt, wenn Knoten wegbrechen. Der Knotenname wird
-          weiterhin gegen die API geprüft, denn er beschriftet den Host überall: „Test"
-          bietet den richtigen zum Anklicken an und füllt ein leeres Feld, und ein Name,
-          zu dem kein Knoten passt, wird im Dashboard markiert und vom Selbsttest gemeldet.
-          Im Cluster geht die Prüfung einen Schritt weiter, denn dort ist jeder Mitgliedsname
-          ein Name, den die API kennt: Darf das Token <code>/cluster/status</code> lesen
-          (<code>Sys.Audit</code>, das die Cluster-Optionen ohnehin brauchen), weiß PVE-UPS
-          auch, <i>welches</i> Mitglied hinter dieser API-URL antwortet — ein Name, der zu
-          einem anderen gehört, wird als „anderer Knoten" gemeldet und der richtige zum
-          Anklicken angeboten.
-          Zwei Einträge auf derselben API-URL sind die Ausnahme, in der der Name weiterhin
-          entscheidet, wo der Shutdown landet — davor warnt PVE-UPS von sich aus. Siehe
-          <a href="#token">Abschnitt 4</a>.</li>
-          <li><b>Das Umbenennen eines Hosts verwirft nicht mehr sein API-Token.</b>
-          Host-Einträge wurden bisher über ihren Knotennamen identifiziert — ein Feld, das
-          man bearbeitet —, sodass eine Korrektur als „anderer Host" gelesen wurde: Das
-          gespeicherte Token ging verloren, und der Test meldete „Authentication failed
-          (token invalid?)" für ein völlig gültiges. Zwei Einträge mit demselben Namen
-          teilten sich zudem einen Shutdown-Zustand, wodurch die zweite Maschine
-          weiterlief.</li>
+          disarmt PVE-UPS einmal je Cluster den HA-Manager — und stoppt mit der Ceph-Option
+          zuvor alle Gäste und setzt danach die Wartungsflags —, bevor der erste Knoten
+          heruntergefahren wird. Die Schaltfläche <b>„Cluster wiederherstellen“</b> im
+          Dashboard macht das danach rückgängig. Setzt Proxmox VE 9.2 oder neuer voraus und
+          ist durchgehend opt-in; siehe <a href="#cluster">Abschnitt 6</a>.</li>
+          <li><b>Ein Cluster wird als Einheit heruntergefahren</b> (standardmäßig an): Ein
+          fälliger Knoten nimmt den gesamten Cluster mit, in der konfigurierten Reihenfolge,
+          statt einen halbierten Cluster mit disarmtem HA zurückzulassen. Abschaltbar.</li>
           <li><b>Mehrere Webhooks statt nur einem</b>, jeder mit eigenem Format, Filter und
           Test — dazu neue Formate für <b>Slack</b>, <b>Discord</b> und <b>ntfy</b> sowie
-          eine <b>eigene Vorlage</b> für alles Weitere. Ein vorhandener Webhook wird
-          automatisch übernommen. Siehe <a href="#webhook">Abschnitt 9</a>.</li>
-          <li><b>Ein kurzer USV-Aussetzer löst keine Benachrichtigung mehr aus.</b> Ein
-          einzelnes verlorenes SNMP-Paket erzeugte bisher sofort eine Meldung
-          „Verbindung verloren“; der Verlust wird jetzt erst nach der eingestellten Anzahl
-          fehlgeschlagener Polls in Folge gemeldet. Zeitlimit, Wiederholungen und diese
-          Schwelle sind nun alle im Assistenten sichtbar.</li>
-          <li><b>Das Hochladen eines Release-Pakets funktioniert wieder in Safari.</b> Die
-          Dateiauswahl graut das Archiv nicht mehr aus, und eine von Safari beim Download
-          entpackte <code>.tar</code>-Datei wird ebenfalls angenommen. Pakete werden nun
-          zudem vor dem Anwenden geprüft, sodass ein beschädigter Upload mit einer klaren
-          Meldung abgelehnt wird.</li>
-          <li><b>Ein Browser-Tab, der während eines Updates offen war, bietet das Neuladen
-          an</b>, statt die alte Oberfläche gegen das neue Backend laufen zu lassen — und
-          er liefert nach einem Update kein veraltetes <code>app.js</code> mehr aus dem
-          Cache.</li>
-          <li>Die <b>Auslastung der USV</b> wird auf der Statuskarte angezeigt, sofern das
-          Gerät sie meldet.</li>
+          eine <b>eigene Vorlage</b>. Siehe <a href="#webhook">Abschnitt 9</a>.</li>
+          <li><b>Der Selbsttest ist nützlicher geworden</b>: Er läuft automatisch nach dem
+          Wiederarmieren, „Selbsttest jetzt ausführen“ startet ihn sofort, und das Umbenennen
+          eines Hosts verwirft sein API-Token nicht mehr. Siehe
+          <a href="#token">Abschnitt 4</a>.</li>
         </ul>
 
         <div class="cl-ver">3.5.0 <span class="date">2026</span></div>

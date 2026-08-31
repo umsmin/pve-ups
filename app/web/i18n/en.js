@@ -43,6 +43,7 @@ I18N.en = {
   "dash.appliance": "Appliance",
   "dash.state": "State",
   "dash.mode": "Mode",
+  "dash.notif": "Notifications",
   "dash.trig": "Shutdown triggered",
   "dash.reason": "Reason",
   "dash.countdown": "Countdown",
@@ -95,6 +96,8 @@ I18N.en = {
   "mode.armed": "ARMED",
 
   // UPS status cards (dashboard)
+  "ups.incomplete": "incomplete",
+  "ups.incompleteTitle": "This UPS is stored with {what}, so it is never polled and counts as permanently unreachable. Being fail safe, that also means every host it feeds is refused a shutdown. Complete it under Settings -> UPS.",
   "ups.srcMains": "Mains",
   "ups.srcBattery": "Battery",
   "ups.tipUnreach": "unreachable",
@@ -124,6 +127,8 @@ I18N.en = {
   "banner.unreachCountdown": "UPS unreachable — on-battery countdown continues, shutdown when it expires ({s}).",
   "banner.unreachCommLoss": "UPS unreachable — shutdown on prolonged loss in {s}.",
   "banner.unreachAlarm": "UPS unreachable — alarm (no shutdown).",
+  "banner.restoredUnconfirmed": "{names}: an on-battery timer was restored after a restart, but the UPS has not answered yet. It is held until one poll confirms the outage — no shutdown until then.",
+  "banner.dryRun": "Dry-run is on — the appliance only logs what it would do and shuts nothing down. Switch it off under Settings once the configuration is tested.",
 
   // shown when the service restarted into a new version while this tab stayed open
   "reload.newVersion": "Version v{v} has been installed — reload the page so the interface matches the running service.",
@@ -134,6 +139,10 @@ I18N.en = {
   "chip.unreach": "UPS unreachable",
 
   // dashboard hosts table
+  "hosts.staleFeed": "no UPS",
+  "hosts.incomplete": "incomplete",
+  "hosts.incompleteTitle": "This host is stored with {what}, so a shutdown cannot reach it — and that only shows during an outage. Complete it, or untick “active”, under Settings -> Hosts.",
+  "hosts.staleFeedTitle": "This host is assigned to UPS devices that no longer exist ({ids}). Unless it has another feed left, it will never be shut down. Fix it under Settings -> Hosts.",
   "hosts.allUps": "all UPS",
   "hosts.policyAnd": "AND",
   "hosts.policyOr": "OR",
@@ -249,6 +258,9 @@ I18N.en = {
   "notif.doc": "Read in the manual: Webhook notifications",
   "notif.webhook": "Webhook",
   "notif.webhookTitle": "Send an HTTP POST to a URL on every notable event (e.g. to a ticket/chat/monitoring system).",
+  "notif.lastFailed": "The last notification to this target failed: {err}",
+  "notif.deadChip": "{n} webhook(s) failing",
+  "notif.deadChipTitle": "The last notification to {names} did not arrive. Notifications are best-effort and never affect a shutdown, but an alarm nobody receives is one nobody acts on. Check it under Settings -> Notifications.",
   "notif.url": "URL",
   "notif.urlTitle": "Target URL for the webhook. Receives a POST in the selected format on every event.",
   "notif.format": "Format",
@@ -353,6 +365,15 @@ I18N.en = {
   "pw.change": "Change",
 
   // save bar
+  "save.cardNo": "card {n}",
+  "save.needHostName": "Host {who} has no node name — fill it in or remove the card. Saving would discard it, API token included.",
+  "save.needHostUrl": "Host {who} has no API URL — fill it in, remove the card, or untick “active”. Without it the shutdown has nowhere to go, and that only shows during an outage.",
+  "save.needHostToken": "Host {who} has no token ID — fill it in, remove the card, or untick “active”. Without it the shutdown is refused, and that only shows during an outage.",
+  "save.needHostSecret": "New host {who} has no token secret — fill it in, remove the card, or untick “active”. It would be stored empty and rejected with 401, which only shows during an outage.",
+  "save.needUps": "UPS {who} has neither an address nor a name — fill one in or remove the card. Saving would discard it, stored passwords included.",
+  "save.needUpsHost": "UPS {who} has no address — fill it in or remove the card. Without it the device is never polled, is reported as permanently unreachable, and every host it feeds is refused a shutdown for safety.",
+  "save.needUpsName": "UPS {who} has no UPS name — fill in the section name from the NUT server's ups.conf, or remove the card. Without it the device is never polled, is reported as permanently unreachable, and every host it feeds is refused a shutdown for safety.",
+  "save.needWebhookUrl": "Webhook {who} has no URL — fill it in or remove the card.",
   "save.btn": "Save configuration",
   "save.title": "Saves all settings to the configuration file and applies them to the running engine immediately (no restart). Empty password fields mean “unchanged”.",
 
@@ -475,6 +496,7 @@ I18N.en = {
   "host.tokenSecretTitle": "Secret token value (UUID). Stored securely and never returned.",
   "host.tokenSecretPh": "Secret",
   "host.feeds": "Fed by",
+  "host.feedsAllHint": "Nothing ticked = fed by every configured UPS. Tick boxes only to narrow it down.",
   "host.feedsTitle": "Which UPS device(s) feed this host. With redundant power supplies tick several.",
   "host.policy": "Logic",
   "host.policyTitle": "AND = shut down only when ALL ticked UPS are critical (redundant power supplies). OR = shut down as soon as ONE is critical (split, non-redundant load).",

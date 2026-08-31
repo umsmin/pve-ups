@@ -333,6 +333,11 @@ table.mini td { border: none; padding: 5px 6px; }
 /* Node name that does not match the API behind the host entry (see proxmox.NODE_STATES).
    Same colours as .chip.beta, a different name so the two can drift apart later. */
 .chip.warn { color: var(--warn); border-color: var(--warn-bd); background: var(--warn-soft); }
+/* A host whose UPS assignments have gone stale (see engine._warn_about_stale_feeds): with
+   no feed left it is never eligible and simply never shut down. Without this rule the chip
+   inherited the neutral base style and read like the "★ this" marker next to it — the
+   quietest failure in the appliance, rendered as the quietest chip on the page. */
+.chip.crit { color: var(--crit); border-color: var(--crit-bd); background: var(--crit-soft); }
 /* The three cluster switches as one set-apart group inside the host card. The card is
    --surface-2, so --surface reads as a quiet inset rather than another box. */
 .clusterbox {
@@ -416,6 +421,9 @@ details[open] > summary::before { transform: rotate(90deg); }
 /* ---------- Config cards: collapsible UPS + Host editors ---------------------- */
 /* breathing room between the section help text and the first card */
 #upsList, #hostRows { margin-top: 14px; }
+/* A card the save refused because it is missing the one field that would otherwise make
+   it — and its stored secret — vanish on the next reload. */
+.ups-cfg.invalid, .host-cfg.invalid { border-color: var(--crit-bd); box-shadow: 0 0 0 1px var(--crit-bd); }
 .ups-cfg, .host-cfg { border: 1px solid var(--border); border-radius: var(--r); padding: 14px; margin-bottom: 12px; background: var(--surface-2); }
 .ups-cfg .u_over { margin-top: 6px; }
 /* card summary header (the generic details>summary rule supplies the chevron + layout) */

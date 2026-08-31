@@ -17,7 +17,14 @@ from pathlib import Path
 from typing import Annotated, Literal, Optional, Union
 
 import yaml
-from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    PrivateAttr,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 
 # Location can be overridden for tests / local runs.
 CONFIG_PATH = Path(os.environ.get("PVE_USV_CONFIG", "/etc/pve-usv/config.yaml"))
@@ -72,6 +79,27 @@ class SnmpPrivProto(str, Enum):
     aes256 = "aes256"
 
 
+# Ranges outside which a number is not a setting but a fault. Applied by _repair() below.
+#
+# CORRECTED, never rejected. That is the same rule _clamp_selftest_hour() already follows,
+# and here it is load-bearing: load_config() does not catch ValidationError and app.main
+# calls it straight from the lifespan, so a stored value outside these ranges would stop
+# the service from starting at all. An appliance that does not come up protects nothing;
+# a corrected one that says so loudly does. The correction is always to the field's own
+# default rather than to the nearest bound — "poll every 1 s" and "shut down at 100 %
+# charge" are technically in range and still not what anyone meant.
+def _repair(model, field: str, lo=None, hi=None) -> None:
+    """Pull one field back to its default if it left the sane range. Records the change."""
+    value = getattr(model, field, None)
+    if value is None:  # "off" / "inherit" — never a fault
+        return
+    if (lo is None or value >= lo) and (hi is None or value <= hi):
+        return
+    default = type(model).model_fields[field].get_default(call_default_factory=True)
+    setattr(model, field, default)
+    model._corrections.append(f"{field}={value!r} is out of range, using {default!r}")
+
+
 class UpsThresholdOverride(BaseModel):
     """Optional per-UPS override of the global trigger thresholds.
 
@@ -86,6 +114,23 @@ class UpsThresholdOverride(BaseModel):
     on_battery_low: Optional[bool] = None
     comm_loss_shutdown_after_min: Optional[int] = None
     keep_shutdown_on_comm_loss: Optional[bool] = None
+
+    _corrections: list[str] = PrivateAttr(default_factory=list)
+
+    @model_validator(mode="after")
+    def _repair_ranges(self) -> "UpsThresholdOverride":
+        # The same bounds as Thresholds below, at BOTH ends. An override is exactly where
+        # a slipped digit goes unnoticed — it is edited on one card among several and
+        # nothing else in the interface shows the resulting number — so leaving the
+        # ceilings out here made the correction the release advertises apply to every
+        # threshold except the ones set per device. Correcting to the field default
+        # (None = "inherit the global value") is the safe direction: the estate-wide
+        # setting takes over, and value_corrections() names what happened.
+        _repair(self, "on_battery_seconds", lo=1, hi=86400)
+        _repair(self, "runtime_below_minutes", lo=1, hi=1440)
+        _repair(self, "charge_below_percent", lo=0, hi=100)
+        _repair(self, "comm_loss_shutdown_after_min", lo=1, hi=1440)
+        return self
 
 
 class UpsBase(BaseModel):
@@ -160,6 +205,16 @@ class SnmpConfig(UpsBase):
     def secret_fields(cls) -> dict[str, str]:
         return {"community": "public", "v3_auth_pass": "", "v3_priv_pass": ""}
 
+    _corrections: list[str] = PrivateAttr(default_factory=list)
+
+    @model_validator(mode="after")
+    def _repair_ranges(self) -> "SnmpConfig":
+        _repair(self, "port", lo=1, hi=65535)
+        # A non-positive timeout or a negative retry count goes straight into pysnmp.
+        _repair(self, "timeout_s", lo=0.5)
+        _repair(self, "retries", lo=0, hi=10)
+        return self
+
 
 class NutConfig(UpsBase):
     """A UPS read from a Network UPS Tools server (``upsd``) over TCP.
@@ -189,6 +244,14 @@ class NutConfig(UpsBase):
     @classmethod
     def secret_fields(cls) -> dict[str, str]:
         return {"password": ""}
+
+    _corrections: list[str] = PrivateAttr(default_factory=list)
+
+    @model_validator(mode="after")
+    def _repair_ranges(self) -> "NutConfig":
+        _repair(self, "port", lo=1, hi=65535)
+        _repair(self, "timeout_s", lo=0.5)
+        return self
 
 
 # Discriminated union of every supported source. Adding a type means: a model here, a
@@ -441,6 +504,34 @@ class Thresholds(BaseModel):
     # value is also handed to Proxmox as the shutdown call's own timeout, so the kill
     # still happens if we lose the network right after asking.
     cluster_guest_force_after_s: Optional[int] = 120
+
+    _corrections: list[str] = PrivateAttr(default_factory=list)
+
+    @model_validator(mode="after")
+    def _repair_ranges(self) -> "Thresholds":
+        # Bounded at BOTH ends. The lower bounds are the older half and the obvious one: a
+        # poll interval <= 0 makes asyncio.wait_for() in the engine loop return
+        # immediately, which is a hot loop hammering the UPS on a core of its own.
+        #
+        # The upper bounds close the mirror image, which is the same class of fault and
+        # just as reachable by a slipped digit. Every timeout here is awaited inside the
+        # poll loop, so "6000" where "60" was meant does not misconfigure a detail — it
+        # parks the decision engine for 100 minutes per shutdown stage while the battery
+        # drains. The ceilings are set well above any sane value, so they only ever catch
+        # a typo; anything a real estate needs still passes untouched.
+        _repair(self, "poll_interval_normal_s", lo=1, hi=3600)
+        _repair(self, "poll_interval_battery_s", lo=1, hi=300)
+        _repair(self, "on_battery_seconds", lo=1, hi=86400)
+        _repair(self, "runtime_below_minutes", lo=1, hi=1440)
+        _repair(self, "charge_below_percent", lo=0, hi=100)
+        _repair(self, "unreachable_alarm_after_polls", lo=1, hi=1000)
+        _repair(self, "comm_loss_shutdown_after_min", lo=1, hi=1440)
+        _repair(self, "host_shutdown_timeout_s", lo=1, hi=900)
+        _repair(self, "rearm_after_mains_min", lo=0, hi=1440)
+        _repair(self, "cluster_prep_timeout_s", lo=5, hi=1800)
+        _repair(self, "cluster_guest_shutdown_timeout_s", lo=5, hi=3600)
+        _repair(self, "cluster_guest_force_after_s", lo=1, hi=3600)
+        return self
 
 
 class WebhookFormat(str, Enum):
@@ -701,6 +792,102 @@ class AppConfig(BaseModel):
             return [i for i in host.ups_ids if self.ups_by_id(i) is not None]
         return [u.id for u in self.ups]
 
+    def value_corrections(self) -> list[str]:
+        """Every out-of-range number this config carried, as "where: what happened".
+
+        Collected rather than raised (see _repair): the engine reports these once at
+        startup and after every save, so a corrected value is loud without a config that
+        cannot be loaded at all.
+        """
+        out = [f"thresholds: {c}" for c in self.thresholds._corrections]
+        for u in self.ups:
+            out += [f"UPS {u.label}: {c}" for c in u._corrections]
+            out += [f"UPS {u.label} override: {c}" for c in u.overrides._corrections]
+        return out
+
+    def stale_feed_ids(self, host: HostConfig) -> list[str]:
+        """UPS ids this host names that no longer exist.
+
+        Pure, like duplicate_api_urls(), so the self-test, the startup check and the API
+        all describe the same problem in the same words.
+
+        It matters because feed_ids_for() drops them silently. A host whose ids have ALL
+        gone stale ends up with no feeds at all, and engine._host_trigger_reason() then
+        never fires for it — that machine is simply never shut down, with nothing anywhere
+        saying so. Losing only some of them is quieter still: with ups_policy "all" the
+        redundancy requirement is satisfied by whatever happens to be left, so a host that
+        was configured to wait for both of its feeds starts acting on one.
+        """
+        return [i for i in host.ups_ids if self.ups_by_id(i) is None]
+
+    def incomplete_entries(self) -> list[tuple[str, str, str]]:
+        """Enabled entries stored in a state in which they cannot do their job.
+
+        ``(kind, label, what is missing)`` per finding, in the order the UI shows the
+        cards. Pure, like stale_feed_ids() and duplicate_api_urls() next door, so the
+        startup check, the self-test and the API all describe the same problem in the
+        same words.
+
+        It exists because the browser's own check (``incompleteCards()`` in app.js) is not
+        reachable from the two paths that matter most: ``POST /api/config/import`` and a
+        hand-edited ``config.yaml`` never pass a form. An enabled host stored without an
+        API URL or a token looks complete on the dashboard and fails during the outage —
+        and nothing else catches it in time, because targets.verify_node() answers
+        "unverified" for an entry it cannot even address, which _node_name_ok() reads as
+        *no verdict* rather than as a fault. The first real signal was the next scheduled
+        self-test, up to a day away.
+
+        Enabled entries only, exactly as in the UI: a disabled entry shuts nothing down
+        (ordered_hosts() skips it), so none of its fields can fail during an outage, and
+        an installation upgrading from a release that stored such entries happily must not
+        be told its configuration is broken.
+        """
+        out: list[tuple[str, str, str]] = []
+        for u in self.ups:
+            missing = self.incomplete_ups(u)
+            if missing:
+                out.append(("UPS", u.label, missing))
+        for h in self.hosts:
+            missing = self.incomplete_host(h)
+            if missing:
+                out.append(("Host", h.name or h.id, missing))
+        for w in self.notifications.webhooks:
+            if w.enabled and not w.url.strip():
+                out.append(("Webhook", w.label, "no URL"))
+        return out
+
+    @staticmethod
+    def incomplete_ups(ups: UpsBase) -> str:
+        """What keeps this UPS from being polled at all, or "" when nothing does.
+
+        ``UpsBase.configured`` IS this question, per source type — an SNMP entry needs an
+        address, a NUT entry an address and the section name from ups.conf. Asked through
+        the property rather than restated here, so a new source type inherits the check by
+        declaring what "pollable" means for it.
+        """
+        return "" if ups.configured else "no address to poll"
+
+    @staticmethod
+    def incomplete_host(host: HostConfig) -> str:
+        """What keeps a shutdown from reaching this host, or "" when nothing does.
+
+        Disabled entries always answer "": they shut nothing down (ordered_hosts() skips
+        them), so none of their fields can fail during an outage.
+
+        Its own method so ``snapshot()`` can ask about one host directly and get the same
+        answer, in the same words, that the event log will use.
+        """
+        if not host.enabled:
+            return ""
+        missing = []
+        if not host.api_url.strip():
+            missing.append("no API URL")
+        if not host.token_id.strip():
+            missing.append("no API token ID")
+        if not host.token_secret.get_secret_value():
+            missing.append("no API token secret")
+        return ", ".join(missing)
+
     def ordered_hosts(self) -> list[HostConfig]:
         """Enabled hosts in shutdown order; the appliance's own host always last."""
         active = [h for h in self.hosts if h.enabled]
@@ -742,61 +929,54 @@ def _slugify(text: str, fallback: str = "ups") -> str:
     return slug or fallback
 
 
-def assign_ups_ids(ups: list[UpsBase]) -> None:
-    """Fill empty UPS ids with stable, collision-free slugs (in place)."""
-    taken = {u.id for u in ups if u.id}
-    for i, u in enumerate(ups, start=1):
-        if u.id:
+def _assign_unique_ids(items, base_for) -> None:
+    """Give every entry a unique, stable id (in place).
+
+    Two jobs, and the second one used to be missing. Filling an EMPTY id is the obvious
+    one. Splitting a DUPLICATE is the one that matters: the id is the runtime key — the
+    engine latches shutdowns on HostConfig.key (= the id) and keys one _UpsRuntime per
+    UPS id — so two entries sharing an id share a latch. Two hosts then get one shutdown
+    between them, and two UPS devices overwrite each other's reading in the same poll.
+    Nothing else in the system deduplicates, and an imported or hand-edited file never
+    passes the UI that would have kept them apart.
+
+    The FIRST holder of an id keeps it, always. Anything else would move a stored secret
+    (main._merge_config matches on the id) or a live latch to a different entry.
+    """
+    taken = {x.id for x in items if x.id}
+    used: set[str] = set()
+    for i, x in enumerate(items, start=1):
+        if x.id and x.id not in used:
+            used.add(x.id)
             continue
-        base = _slugify(u.name) if u.name else f"ups{i}"
+        base = x.id or base_for(x, i)
         candidate = base
         n = 2
-        while candidate in taken or candidate == "":
+        while candidate in taken or candidate in used or not candidate:
             candidate = f"{base}-{n}"
             n += 1
-        u.id = candidate
+        x.id = candidate
         taken.add(candidate)
+        used.add(candidate)
+
+
+def assign_ups_ids(ups: list[UpsBase]) -> None:
+    """Fill empty UPS ids and split duplicates with stable slugs (in place)."""
+    _assign_unique_ids(ups, lambda u, i: _slugify(u.name) if u.name else f"ups{i}")
 
 
 def assign_host_ids(hosts: list[HostConfig]) -> None:
-    """Fill empty host ids with stable, collision-free slugs (in place).
-
-    Same job as assign_ups_ids, and needed for the same reason: the id is what the UI's
-    per-card secret reconcile matches on, and what the engine latches shutdowns against —
-    so it has to survive renaming, reordering, and two entries carrying the same name.
-    """
-    taken = {h.id for h in hosts if h.id}
-    for i, h in enumerate(hosts, start=1):
-        if h.id:
-            continue
-        base = _slugify(h.name, f"host{i}") if h.name else f"host{i}"
-        candidate = base
-        n = 2
-        while candidate in taken or candidate == "":
-            candidate = f"{base}-{n}"
-            n += 1
-        h.id = candidate
-        taken.add(candidate)
+    """Same job as assign_ups_ids, and needed for the same reason: the id is what the
+    UI's per-card secret reconcile matches on, and what the engine latches shutdowns
+    against — so it has to survive renaming, reordering, and two entries carrying the
+    same name."""
+    _assign_unique_ids(hosts, lambda h, i: _slugify(h.name, f"host{i}") if h.name
+                       else f"host{i}")
 
 
 def assign_webhook_ids(hooks: list[WebhookConfig]) -> None:
-    """Fill empty webhook ids with stable, collision-free slugs (in place).
-
-    Same job as assign_ups_ids: the id is what the UI's per-card secret reconcile matches
-    on, so it has to survive renaming and reordering.
-    """
-    taken = {h.id for h in hooks if h.id}
-    for i, h in enumerate(hooks, start=1):
-        if h.id:
-            continue
-        base = _slugify(h.name) if h.name else f"webhook{i}"
-        candidate = base
-        n = 2
-        while candidate in taken or candidate == "":
-            candidate = f"{base}-{n}"
-            n += 1
-        h.id = candidate
-        taken.add(candidate)
+    """Same job again: the id is what the per-card secret reconcile matches on."""
+    _assign_unique_ids(hooks, lambda h, i: _slugify(h.name) if h.name else f"webhook{i}")
 
 
 def _to_serialisable(cfg: AppConfig) -> dict:
@@ -832,6 +1012,12 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
     # be polled and its answer then dropped — the device would simply never trigger.
     assign_ups_ids(cfg.ups)
     assign_host_ids(cfg.hosts)
+    # Webhooks for the third time, and it was the one missing here. The id keys the
+    # per-target delivery state (notify.DELIVERY) and the masked-secret reconcile, so two
+    # entries without one — a hand-written file, a backup from a foreign version — share
+    # a single record: each overwrites the other's "last delivery", and the settings page
+    # offers one of them the other's auth header.
+    assign_webhook_ids(cfg.notifications.webhooks)
     return cfg
 
 
@@ -840,7 +1026,23 @@ def save_config(cfg: AppConfig, path: Path = CONFIG_PATH) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     data = _to_serialisable(cfg)
-    with tmp.open("w", encoding="utf-8") as fh:
+    # Created 0600 from the start. chmod *after* writing, which is what this did, left a
+    # file containing every plaintext secret at the default 0644 for the length of the
+    # write. Deliberately NOT O_EXCL: a .tmp left behind by an earlier crash would then
+    # block every future save for good.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # The mode argument above only applies when open() CREATES the file, so the crash
+    # leftover the missing O_EXCL deliberately allows would be reused with whatever
+    # permissions it already had — 0644, if it predates this code. fchmod on the open
+    # descriptor covers both cases and cannot be raced through the path.
+    try:
+        os.fchmod(fd, 0o600)
+    except (AttributeError, OSError):  # noqa: BLE001 - not on every platform (Windows dev box)
+        pass
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
         yaml.safe_dump(data, fh, default_flow_style=False, sort_keys=False, allow_unicode=True)
-    os.chmod(tmp, 0o600)
+        fh.flush()
+        # On an appliance whose whole purpose is surviving a power cut, "the rename landed
+        # but the bytes never did" is the one outcome that must not be possible.
+        os.fsync(fh.fileno())
     os.replace(tmp, path)

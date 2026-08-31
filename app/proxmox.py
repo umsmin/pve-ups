@@ -170,8 +170,16 @@ async def verify_node(
 
 async def test_connection(host: HostConfig, timeout: float = 10.0) -> TestResult:
     """Validate URL, token, the power-management privilege and the node name."""
+    # A SLICE of the caller's budget, not the whole of it, and for each of the two
+    # requests below. targets.test_connection() cuts the call off at timeout +
+    # DEADLINE_GRACE_S, so at the full timeout each these two alone could reach it —
+    # before verify_node() had even started. A host that is merely slow (a loaded
+    # pveproxy, a WAN link) then came back as "gave up", which the self-test writes up as
+    # a CRITICAL failure for a target whose credentials are perfectly fine. Same
+    # arithmetic list_nodes() already does with per_call.
+    per_call = max(2.0, timeout / 3)
     try:
-        async with _client(host, timeout) as client:
+        async with _client(host, per_call) as client:
             # Version endpoint confirms reachability + token validity.
             resp = await client.get("/version")
             if resp.status_code == 401:
@@ -204,10 +212,10 @@ async def test_connection(host: HostConfig, timeout: float = 10.0) -> TestResult
     # would add its own timeout to the wait. Done HERE rather than in the web layer so the
     # scheduled self-test inherits it through targets.test_connection() — the node name is
     # the one setting nothing else validates, and it decides whether a shutdown lands.
-    # A smaller slice than the caller's own: with /version and /access/permissions
+    # The last slice, sized like the two above: with /version and /access/permissions
     # already done, three full timeouts would overrun the deadline in targets.py and turn
     # a slow-but-alive host into "gave up" instead of a real verdict.
-    verdict = await verify_node(host, timeout=min(timeout, 5.0))
+    verdict = await verify_node(host, timeout=min(per_call, 5.0))
     message = "Connection and 'Sys.PowerMgmt' privilege ok."
     if verdict.state != "ok":
         message = f"{message} {verdict.detail}"
@@ -245,7 +253,14 @@ async def shutdown_node(
     attempts = [first] if first == second else [first, second]
     errors = []
     try:
-        async with _client(host, timeout) as client:
+        # The budget is shared between the attempts, not handed to each of them.
+        # targets.shutdown() cuts the whole call off at timeout + DEADLINE_GRACE_S, so a
+        # first form that HANGS rather than answering (connection accepted, then silence)
+        # used to leave the second one five seconds — and the retry that this whole
+        # routine exists for never happened, reporting a bare "gave up" instead. The
+        # normal failures it covers (400/500 for a misspelled name, 403 for a
+        # node-scoped privilege) answer at once and are unaffected either way.
+        async with _client(host, timeout / len(attempts)) as client:
             for node in attempts:
                 resp = await client.post(
                     f"/nodes/{node}/status", data={"command": "shutdown"}

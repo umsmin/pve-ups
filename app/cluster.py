@@ -673,9 +673,16 @@ async def _inspect(
     return info
 
 
+# The default budget for one inspection. A module constant rather than a bare default
+# argument because engine.shutdown_budget_s() has to add it up: on a cold start the
+# preparation inspects the cluster from inside the shutdown path, and an operator sizing a
+# battery reserve should not have to guess what that costs.
+INSPECT_BUDGET_S = 12.0
+
+
 async def inspect(
-    host: PveHostConfig, timeout: float = 12.0, *, self_vmid: Optional[int] = None,
-    self_node: str = "", hostname: str = "",
+    host: PveHostConfig, timeout: float = INSPECT_BUDGET_S, *,
+    self_vmid: Optional[int] = None, self_node: str = "", hostname: str = "",
 ) -> ClusterInfo:
     """Read-only inspection of the cluster this host belongs to.
 
@@ -718,6 +725,22 @@ _MARGIN_S = 1.0
 _GUEST_POLL_INTERVAL_S = 5.0
 # Share of the guest budget spent waiting for a graceful stop before anything is killed.
 _GUEST_GRACE_SHARE = 0.7
+# Kept back from the guest phase so the Ceph step that runs AFTER it still has both of its
+# verification passes. The guest stop is the elastic part of the sequence; the flags are
+# not, and a flag step that runs out of budget reports a failed preparation for work it
+# almost certainly completed — which, with "abort on failure", holds back a whole cluster.
+_CEPH_RESERVE_S = _CEPH_VERIFY_BUDGET_S * 2 + _MARGIN_S
+
+
+def _ceph_reserve(overall_deadline: float) -> float:
+    """What to keep back from the guest phase for the Ceph step behind it.
+
+    A share, never the flat ceiling: on a cluster configured with small budgets — five
+    seconds each, which the tests use and nothing forbids — a fixed thirteen seconds would
+    put the guest deadline in the past and force-stop every guest instantly. Same shape as
+    _ceph_budget() for exactly the same reason.
+    """
+    return min(_CEPH_RESERVE_S, _remaining(overall_deadline) * _CEPH_SHARE)
 
 
 def _remaining(deadline: float) -> float:
@@ -800,12 +823,14 @@ async def _read_ceph_flags(client: httpx.AsyncClient) -> dict[str, bool]:
 
 
 async def _set_ceph_flags(
-    client: httpx.AsyncClient, value: bool, steps: list[str], budget_s: float
+    client: httpx.AsyncClient, value: bool, steps: list[str], deadline: float
 ) -> bool:
     """Set or clear the maintenance flags and VERIFY the result by reading them back.
 
-    ``budget_s`` bounds ONE verification pass (the caller carves it out of its deadline,
-    see _ceph_budget); the fallback below gets its own, freshly measured share.
+    Takes the caller's absolute ``deadline``, not a pre-computed budget: each of the two
+    verification passes then measures its own share off what is actually left. Handing the
+    same number to both — which is what happened while this took a ``budget_s`` — promised
+    a "freshly measured share" in the comment and delivered twice the ceiling in the code.
 
     The bulk PUT is asynchronous — its answer is a worker UPID and says nothing about
     whether the flags took effect — so success is only ever concluded from a GET. If the
@@ -821,7 +846,9 @@ async def _set_ceph_flags(
     )
     if err:
         steps.append(f"bulk flag update rejected ({err}), falling back to single flags")
-    elif await _verify(reached, lambda: _read_ceph_flags(client), budget_s):
+    elif await _verify(
+        reached, lambda: _read_ceph_flags(client), _ceph_budget(deadline, False)
+    ):
         steps.append(f"Ceph flags {'set' if value else 'cleared'}: "
                      f"{', '.join(CEPH_MAINTENANCE_FLAGS)}")
         return True
@@ -832,7 +859,9 @@ async def _set_ceph_flags(
         err = await _put(client, f"/cluster/ceph/flags/{flag}", data={"value": int(value)})
         if err:
             steps.append(f"{flag}: {err}")
-    if await _verify(reached, lambda: _read_ceph_flags(client), budget_s):
+    if await _verify(
+        reached, lambda: _read_ceph_flags(client), _ceph_budget(deadline, False)
+    ):
         steps.append(f"Ceph flags {'set' if value else 'cleared'} individually")
         return True
 
@@ -860,8 +889,13 @@ async def _verify(matches, read, budget_s: float, interval_s: Optional[float] = 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + budget_s
     while True:
+        left = deadline - loop.time()
         try:
-            if matches(await read()):
+            # Bounded by what is left, not by the client's timeout. Without this the very
+            # first read is unbounded and every later one too, so an endpoint that stops
+            # answering spends CONNECT_TIMEOUT_S per attempt — a 2 s budget could cost 12 s
+            # and eat the share the caller carved out for the step after this one.
+            if matches(await asyncio.wait_for(read(), timeout=max(0.5, left))):
                 return True
         except Exception as exc:  # noqa: BLE001
             log.debug("Verification read failed: %s", exc)
@@ -876,11 +910,30 @@ async def _verify(matches, read, budget_s: float, interval_s: Optional[float] = 
             return False
 
 
-async def _read_running_vmids(client: httpx.AsyncClient) -> set[int]:
-    """VMIDs currently reported as running. Never raises — an unreadable list is empty."""
-    data, _ = await _get(client, "/cluster/resources?type=vm")
+async def _read_running_vmids(
+    client: httpx.AsyncClient, timeout: float = CONNECT_TIMEOUT_S
+) -> Optional[set[int]]:
+    """VMIDs currently reported as running, or None when the list could not be read.
+
+    None rather than an empty set, and the distinction decides whether a shutdown is
+    called successful: ``down()`` in _shutdown_guests concludes "every guest has stopped"
+    from an empty answer, so an unreadable list used to be indistinguishable from a
+    cluster that had finished stopping — the preparation then reported success on no
+    evidence at all, in the one module whose whole doctrine is that a write is confirmed
+    by a read or not at all.
+
+    ``timeout`` is the caller's REMAINING budget, not the client's: three of these reads
+    sit between the grace period and the return, and at CONNECT_TIMEOUT_S each they could
+    overrun prepare()'s outer bound and cost the Ceph step behind them its reserve.
+    """
+    try:
+        data, _ = await asyncio.wait_for(
+            _get(client, "/cluster/resources?type=vm"), timeout=max(0.5, timeout)
+        )
+    except Exception:  # noqa: BLE001 - a read that did not happen is "unknown", not "none"
+        return None
     if not isinstance(data, list):
-        return set()
+        return None
     return {
         int(e["vmid"])
         for e in data
@@ -921,11 +974,29 @@ async def _shutdown_guests(
         if force_after_s is not None:
             data = {"timeout": int(force_after_s), "forceStop": 1}
         async with sem:
+            # The same guard the force round below carries, and it belongs here just as
+            # much: this round runs BEFORE ``grace`` is computed, so time spent in it is
+            # taken straight off the graceful wait.
+            if _remaining(deadline) <= 0:
+                return
             err = await _post(client, f"{guest.path}/status/shutdown", data=data)
         if err:
             rejected.append(f"{guest.label}: {err}")
 
-    await asyncio.gather(*(ask(g) for g in targets))
+    # Bounded as a round, not only per request. Each _post is limited by the client's
+    # timeout alone, so a control plane that accepts connections and then goes quiet cost
+    # CONNECT_TIMEOUT_S per batch of _GUEST_CONCURRENCY — on a large cluster more than the
+    # whole guest budget, spent before a single guest had been given a chance to stop.
+    # ``grace`` below is measured from what is left, so that collapsed it to zero and
+    # force-stopped every guest at once instead of asking it: exactly the failure the
+    # deadline rework removed one step earlier, at the HA disarm.
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(ask(g) for g in targets)),
+            timeout=max(0.5, _remaining(deadline) - _MARGIN_S),
+        )
+    except (asyncio.TimeoutError, TimeoutError):
+        steps.append("shutdown requests were cut short by the guest deadline")
     steps.append(
         f"shutdown requested for {len(targets)} guests"
         + (f" ({len(rejected)} rejected)" if rejected else "")
@@ -938,8 +1009,27 @@ async def _shutdown_guests(
     wanted = {g.vmid for g in targets}
     by_id = {g.vmid: g for g in targets}
 
-    def down(running: set[int]) -> bool:
-        return not (wanted & running)
+    def down(running: Optional[set[int]]) -> bool:
+        # An unreadable list is not a stopped cluster. See _read_running_vmids.
+        return running is not None and not (wanted & running)
+
+    async def still_running() -> list[GuestInfo]:
+        """The targets we cannot see stopped, bounded by what is left of the deadline.
+
+        An unreadable list yields every target rather than none: we asked all of them to
+        stop and can confirm none of them, so "all of them may still be up" is the only
+        reading that does not invent evidence. Force-stopping a guest that is already down
+        costs one rejected request, which is logged; skipping one that is still up costs
+        the cluster its orderly shutdown.
+        """
+        running = await _read_running_vmids(client, _remaining(deadline))
+        if running is None:
+            steps.append(
+                "the guest list could not be re-read, so it is unknown which guests are "
+                "still running - treating all of them as running"
+            )
+            return list(targets)
+        return [by_id[v] for v in sorted(wanted & running)]
 
     # Wait at most what the setting promises, and never more than the share of the budget
     # that still leaves room to kill the stragglers. Waiting the full share regardless
@@ -948,28 +1038,50 @@ async def _shutdown_guests(
     grace = max(0.0, (_remaining(deadline) - _MARGIN_S) * _GUEST_GRACE_SHARE)
     if force_after_s is not None:
         grace = min(grace, float(force_after_s))
-    if await _verify(down, lambda: _read_running_vmids(client), grace, _GUEST_POLL_INTERVAL_S):
+    if await _verify(
+        down, lambda: _read_running_vmids(client, _remaining(deadline)),
+        grace, _GUEST_POLL_INTERVAL_S,
+    ):
         steps.append(f"all {len(targets)} guests stopped")
         return True, []
 
-    left = [by_id[v] for v in sorted(wanted & await _read_running_vmids(client))]
+    left = await still_running()
     if force_after_s is None:
         steps.append(f"still running, and force-stop is disabled: {_name_list(left)}")
         return False, left
 
     steps.append(f"force-stopping {len(left)} guests that did not stop: {_name_list(left)}")
-    for guest in left:
-        err = await _post(client, f"{guest.path}/status/stop")
+
+    # Concurrently and under the same semaphore as the graceful round above, not one after
+    # another: a sequential loop was bounded only by the client's timeout, so a control
+    # plane that had stopped answering spent CONNECT_TIMEOUT_S per straggler. Twenty of
+    # them outlasted prepare()'s outer wait_for, and the whole preparation then came back
+    # as a bare "gave up" - taking the Ceph step, whose reserve exists precisely for this,
+    # with it.
+    async def kill(guest: GuestInfo) -> None:
+        async with sem:
+            if _remaining(deadline) <= 0:
+                return
+            err = await _post(client, f"{guest.path}/status/stop")
         if err:
             steps.append(f"{guest.label}: {err}")
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(kill(g) for g in left)),
+            timeout=max(0.5, _remaining(deadline) - _MARGIN_S),
+        )
+    except (asyncio.TimeoutError, TimeoutError):
+        steps.append("force-stop requests were cut short by the preparation deadline")
+
     if await _verify(
-        down, lambda: _read_running_vmids(client),
+        down, lambda: _read_running_vmids(client, _remaining(deadline)),
         max(0.0, _remaining(deadline) - _MARGIN_S), _GUEST_POLL_INTERVAL_S,
     ):
         steps.append("all guests stopped (some had to be forced)")
         return True, []
 
-    survivors = [by_id[v] for v in sorted(wanted & await _read_running_vmids(client))]
+    survivors = await still_running()
     steps.append(f"guests still running after force-stop: {_name_list(survivors)}")
     return False, survivors
 
@@ -1009,7 +1121,7 @@ async def _prepare(
     host: PveHostConfig, want_ceph: bool, want_disarm: bool, want_guests: bool,
     guests: list[GuestInfo], self_guest: Optional[GuestInfo], guest_needs_disarm: bool,
     hostname: str, force_after_s: Optional[int], steps: list[str],
-    deadline: float, guest_deadline: float,
+    deadline: float, overall_deadline: float, guest_timeout: float,
 ) -> ActionResult:
     """The three preparation steps, in the only order that works.
 
@@ -1095,6 +1207,19 @@ async def _prepare(
                 else:
                     spared = f", sparing {self_guest.label}" if self_guest else ""
                     steps.append(f"stopping {len(targets)} guests{spared}")
+                    # Measured from HERE, not from the start of prepare(). The disarm
+                    # runs first and legitimately takes tens of seconds, and it used to
+                    # spend those out of the guests' budget: a disarm longer than
+                    # guest_timeout left grace = 0, which force-stopped every guest at
+                    # once instead of asking it to shut down. Capped against the overall
+                    # deadline so the Ceph step keeps its reserve and the sequence stays
+                    # inside prepare()'s outer bound — otherwise a guest stop that used
+                    # exactly its configured time would be cut off as a bare "gave up".
+                    guest_deadline = min(
+                        loop.time() + guest_timeout,
+                        overall_deadline - (_ceph_reserve(overall_deadline)
+                                            if want_ceph else 0.0),
+                    )
                     stopped, _left = await _shutdown_guests(
                         client, targets, steps,
                         deadline=guest_deadline, force_after_s=force_after_s,
@@ -1105,9 +1230,7 @@ async def _prepare(
         if want_ceph:
             # Set even when the guest step failed: the flags cost nothing, still stop the
             # rebalancing, and leaving them off would give the worst of both worlds.
-            if not await _set_ceph_flags(
-                client, True, steps, _ceph_budget(deadline, want_disarm=False)
-            ):
+            if not await _set_ceph_flags(client, True, steps, overall_deadline):
                 ok = False
     return ActionResult(ok, "; ".join(steps) or "nothing to do", steps)
 
@@ -1136,15 +1259,20 @@ async def prepare(
     """
     steps: list[str] = []
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    guest_deadline = loop.time() + guest_timeout
     total = timeout + (guest_timeout if want_guests else 0.0)
+    # Two deadlines, and they answer different questions. ``deadline`` is the control
+    # plane's: it is what the HA disarm waits out, measured in CRM/LRM rounds.
+    # ``overall_deadline`` is the whole sequence's, and it is what the guest phase and the
+    # Ceph step measure against — the Ceph step runs last and used to budget itself off
+    # the control-plane deadline, which a long guest stop had exhausted long before.
+    deadline = loop.time() + timeout
+    overall_deadline = loop.time() + total
     try:
         return await asyncio.wait_for(
             _prepare(
                 host, want_ceph, want_disarm, want_guests, guests or [], self_guest,
                 guest_needs_disarm, hostname, force_after_s, steps, deadline,
-                guest_deadline,
+                overall_deadline, guest_timeout,
             ),
             timeout=total,
         )
@@ -1182,9 +1310,7 @@ async def _restore(host: PveHostConfig, steps: list[str], deadline: float) -> Ac
 
         flags = await _read_ceph_flags(client)
         if any(flags.get(f) for f in CEPH_MAINTENANCE_FLAGS):
-            if not await _set_ceph_flags(
-                client, False, steps, _ceph_budget(deadline, want_disarm=False)
-            ):
+            if not await _set_ceph_flags(client, False, steps, deadline):
                 ok = False
     return ActionResult(ok, "; ".join(steps) or "nothing to restore", steps)
 

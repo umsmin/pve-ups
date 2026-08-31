@@ -118,6 +118,56 @@ async def test_missing_status_variable_is_unreachable():
     assert "ups.status" in state.error
 
 
+@pytest.mark.parametrize("status", ["", "CHRG", "ALARM", "RB"])
+async def test_status_without_ol_or_ob_is_unreachable_not_mains(status):
+    """A status that names no power source says nothing — and "nothing" is not "mains".
+
+    ``UpsState.on_battery`` is ``power_source == "battery"``, so a reachable reading with
+    power_source "unknown" falls into the MAINS branch: mid-outage that clears the running
+    on-battery timer, drops a latched trigger and logs "mains power restored". The SNMP
+    poller refuses exactly this (ups._map_state); the two sources have to agree.
+    """
+    async with FakeUpsd({"ups.status": status, "battery.charge": "80"}) as srv:
+        state = await nut.poll(_cfg(srv.port))
+    assert state.power_source == "unknown"
+    assert not state.reachable
+    assert not state.on_battery
+    # It answered, though — which is what keeps the comms-loss opt-in off it.
+    assert state.answered
+    assert "OL" in state.error and "OB" in state.error
+
+
+async def test_a_protocol_error_still_counts_as_an_answer():
+    """ERR DATA-STALE is upsd talking to us, not upsd going quiet.
+
+    engine._ups_trigger_reason() shuts the whole estate down on a *silent* source when
+    ``comm_loss_shutdown_after_min`` is set. Filing a wedged driver, a wrong password or a
+    mistyped ups_name under silence fired that during normal operation, on a server that
+    never stopped answering.
+    """
+    for err in ("DATA-STALE", "DRIVER-NOT-CONNECTED", "ACCESS-DENIED"):
+        async with FakeUpsd(error=err) as srv:
+            state = await nut.poll(_cfg(srv.port))
+        assert not state.reachable, err
+        assert state.answered, err
+
+    async with FakeUpsd(ups_name="other") as srv:  # ERR UNKNOWN-UPS
+        state = await nut.poll(_cfg(srv.port))
+    assert not state.reachable and state.answered
+
+
+async def test_a_transport_failure_is_not_an_answer():
+    """The other half of the distinction: nobody home really is nobody home."""
+    with socket.socket() as probe:  # a port nothing listens on
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    state = await nut.poll(_cfg(port))
+    assert not state.reachable and not state.answered
+
+    state = await nut.poll(NutConfig(id="u"))  # never pollable at all
+    assert not state.reachable and not state.answered
+
+
 async def test_unknown_ups_name_is_reported():
     async with FakeUpsd(ups_name="other") as srv:
         state = await nut.poll(_cfg(srv.port))

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -81,6 +82,17 @@ class MibProfile:
         """OID -> trigger, in the order the wizard lists them."""
         return {o.oid: o.trigger for o in self.objects if o.trigger}
 
+    @property
+    def source_object(self) -> Optional[MibObject]:
+        """The object that says whether the UPS runs on mains or on battery.
+
+        Named rather than assumed, because _map_state() has to be able to tell "the
+        device did not answer this one" apart from every other missing object: every
+        other field degrades into a threshold that simply cannot fire, while this one
+        decides the whole state machine. Every profile has exactly one.
+        """
+        return next((o for o in self.objects if o.field == "power_source"), None)
+
 
 # --- RFC 1628 UPS-MIB --------------------------------------------------------
 OID_IDENT_MANUFACTURER = "1.3.6.1.2.1.33.1.1.1.0"     # upsIdentManufacturer
@@ -97,7 +109,14 @@ OID_OUTPUT_LOAD = "1.3.6.1.2.1.33.1.4.4.1.5.1"        # upsOutputPercentLoad.1
 
 # upsOutputSource enum -> normalised power source string
 _OUTPUT_SOURCE = {
-    1: "other",
+    # other(1) is the MIB's own "none of the below", i.e. a device saying it cannot
+    # classify its output — which is the same statement as unknown, and has to be read the
+    # same way (see _map_state): unreachable, an alarm, never a shutdown, and a running
+    # on-battery timer left alone. Mapped to "other" it was simply "not battery", so a
+    # card that fell back to it mid-outage cleared the timer and logged "mains power
+    # restored". Only the RFC 1628 table: APC's own enum uses "other" for rebooting(8),
+    # which is a definite state and stays one.
+    1: "unknown",
     2: "none",
     3: "mains",     # normal
     4: "bypass",
@@ -257,14 +276,61 @@ _MISSING_SENTINELS = {
 }
 
 
+# Keys whose VALUE must never be recorded, whatever the source produced them.
+#
+# Not a theoretical precaution. readable_raw() below is written into the event log by
+# engine._log_trigger_evidence(), and /api/status serves 48 h of that log without
+# authentication — while NUT hands back its entire ``LIST VAR`` answer, which for a number
+# of drivers includes driver.parameter.password, .authPassword, .privPassword and
+# .community. That is the same class of leak this release closed for the webhook URL in
+# notify.safe_error(), on the evidence path instead of the delivery path.
+# "pass" everywhere EXCEPT after "by". NUT publishes input.bypass.voltage, .frequency,
+# .current and .realpower as standard variables, and a bare "pass" matches "bypass" — so
+# the evidence line masked exactly the mains readings it exists to record. The lookbehind
+# is deliberately the only narrowing: everything a driver might spell "pass", "password",
+# "authPassword" or "passphrase" still matches, because erring towards masking is free
+# here and erring the other way publishes a credential.
+_SECRET_KEY_RE = re.compile(
+    r"((?<!by)pass|secret|token|community|authkey|privkey)", re.I
+)
+SECRET_MASK = "**********"
+
+
+def redact_raw(raw: dict) -> dict:
+    """Copy of ``raw`` with every secret-looking value replaced by the mask.
+
+    Masked rather than dropped: that a driver carries a password at all is itself
+    diagnostic information, and a missing key would read as a driver that has none. The
+    same placeholder the web API uses for a stored secret, so it is already familiar.
+    """
+    return {
+        key: (SECRET_MASK if _SECRET_KEY_RE.search(str(key)) else value)
+        for key, value in raw.items()
+    }
+
+
 @dataclass
 class UpsState:
     reachable: bool = False
+    # Whether the device answered at all, which is a different question from whether the
+    # answer was usable. Both "it answered but names no power source" and "it answered but
+    # implements none of this MIB's objects" are reachable=False — correctly, because the
+    # state machine has nothing to go on — but they are NOT a communication loss, and
+    # engine._ups_trigger_reason() reads exactly that distinction: the
+    # ``comm_loss_shutdown_after_min`` opt-in shuts the estate down on a *silent* device,
+    # and concluding "silent" from an answer would fire it during normal operation.
+    answered: bool = False
     last_poll: Optional[datetime] = None
     manufacturer: Optional[str] = None     # upsIdentManufacturer (as reported by the device)
     model: Optional[str] = None            # upsIdentModel (as reported by the device)
     power_source: str = "unknown"          # mains | battery | bypass | none | other | unknown
     battery_status: str = "unknown"        # normal | low | depleted | unknown
+    # What the device actually said, e.g. "upsBasicBatteryStatus=4" or "ups.status=OB LB".
+    # The normalised word above loses the distinction that matters when this fires a
+    # shutdown: APC maps batteryLow(3), batteryInFaultCondition(4) and noBatteryPresent(5)
+    # all to "low", and an event log reading "UPS reports 'low'" cannot tell an empty
+    # battery from a defective one. Diagnostics only — no trigger reads it.
+    battery_status_detail: str = ""
     seconds_on_battery: Optional[int] = None
     runtime_remaining_min: Optional[int] = None
     battery_charge_pct: Optional[int] = None
@@ -284,6 +350,46 @@ class UpsState:
     @property
     def battery_low(self) -> bool:
         return self.battery_status in ("low", "depleted")
+
+    def readable_raw(self, limit: int = 1000) -> str:
+        """The last poll's values as one line of evidence: ``name=value, ...``.
+
+        SNMP keys are OIDs, which nobody can read at a glance; NUT keys are variable names,
+        which everybody can. Both go through the same registry, so a key it does not know
+        simply keeps its own spelling. This is written into the event log when a trigger
+        fires: the readings that caused a shutdown are precisely what an incident report
+        needs afterwards, and the manual test button can only ever show a later, different
+        state.
+
+        Capped, because the two sources are not the same size. SNMP contributes the profile's
+        handful of OIDs; NUT hands back its whole ``LIST VAR`` answer, which on a real device
+        is fifty to ninety variables and several kilobytes. That body goes into SQLite, into
+        the event table of the UI and into the public status endpoint, so an unbounded line
+        would drown the feed at the exact moment it matters most. The battery values lead,
+        since they are the ones a post-mortem starts from; the complete answer is a click
+        away in the card's test button.
+        """
+        if not self.raw:
+            return ""
+
+        def rank(key: str) -> tuple[int, str]:
+            name = _object_name(key)
+            lead = ("ups.status", "battery", "ups.timer", "ups")
+            return (next((i for i, p in enumerate(lead) if name.startswith(p)), len(lead)),
+                    name)
+
+        # Redacted again here, not only at the source. nut.py already masks what it
+        # stores, but this is the method whose output reaches the public endpoint, and a
+        # future source that fills ``raw`` itself must not have to remember the rule.
+        safe = redact_raw(self.raw)
+        parts = [f"{_object_name(k)}={safe[k]}" for k in sorted(safe, key=rank)]
+        out = ""
+        for i, part in enumerate(parts):
+            candidate = part if not out else f"{out}, {part}"
+            if len(candidate) > limit:
+                return f"{out}, … (+{len(parts) - i} more)" if out else part[:limit]
+            out = candidate
+        return out
 
 
 @dataclass
@@ -530,6 +636,10 @@ def _map_state(state: UpsState, profile: MibProfile, values: dict, auto: bool = 
     """Fill a UpsState from one profile's varbinds. Objects the device left out keep
     their default, which is the same "unknown"/None a missing OID has always produced."""
     state.raw = {k: str(v) for k, v in values.items()}
+    # Unconditional: this function is only ever reached with a reply in hand, and two of
+    # the three verdicts below end in reachable=False. Only this flag keeps those apart
+    # from a device that is not there at all — see UpsState.answered.
+    state.answered = True
     state.mib = profile.id
     state.manufacturer = profile.manufacturer
     answered = 0
@@ -542,10 +652,34 @@ def _map_state(state: UpsState, profile: MibProfile, values: dict, auto: bool = 
         converted = _convert(obj, values[obj.oid])
         if converted is not None:
             setattr(state, obj.field, converted)
+            if obj.field == "battery_status":
+                state.battery_status_detail = f"{obj.name}={_coerce_int(values[obj.oid])}"
 
-    if answered:
+    if answered and state.power_source != "unknown":
         state.reachable = True
         return
+
+    if answered:
+        # Objects answered, but not the one that says where the power comes from — it was
+        # absent, unconvertible, or (APC's upsBasicOutputStatus) reported unknown(1).
+        # Everything else degrades into a threshold that cannot fire; this one decides the
+        # state machine, and ``on_battery`` is ``power_source == "battery"``, so leaving it
+        # at "unknown" reads as MAINS. Mid-outage that clears the running on-battery timer,
+        # drops a latched trigger and writes "mains power restored" — the one fail-dangerous
+        # reading in the whole engine. app/nut.py has always refused this (no ups.status ->
+        # unreachable); the two sources have to answer the same question the same way.
+        # Unreachable is an alarm, never a shutdown, and it keeps the blind countdown
+        # (``keep_shutdown_on_comm_loss``) running on a confirmed outage.
+        source = profile.source_object
+        state.reachable = False
+        state.error = (
+            f"The device answered, but {source.name if source else 'the power source'} did "
+            f"not yield a usable power source, so it is unknown whether this UPS runs on "
+            f"mains or on battery. Treated as unreachable — an alarm, never a shutdown. "
+            f"Use the test button to see which objects it does implement."
+        )
+        return
+
     # The agent replied, but not one object of this MIB exists on it — a UPS pinned to the
     # wrong MIB, or an SNMP device that is not a UPS at all. Reporting that as reachable
     # would show a healthy-looking card with no data and silence every trigger, so treat it
@@ -616,6 +750,10 @@ async def poll(cfg: SnmpConfig) -> UpsState:
             # not speaking a different MIB. Never spend a second timeout on that.
             state.error = str(error_indication)
             return state
+        # Past the transport level: whatever follows, this agent replied. Recorded here as
+        # well as in _map_state(), because the error_status branch below returns without
+        # reaching it — and a refused GET is still an answer, not silence.
+        state.answered = True
         if error_status:
             if not (auto and cfg.version == SnmpVersion.v1):
                 state.error = f"{error_status.prettyPrint()} at index {error_index}"

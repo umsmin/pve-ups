@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .config import NutConfig
-from .ups import ProbeEntry, ProbeResult, UpsState
+from .ups import ProbeEntry, ProbeResult, UpsState, redact_raw
 
 log = logging.getLogger("pve-usv.nut")
 
@@ -254,7 +254,16 @@ def _failure_text(cfg: NutConfig, exc: Exception) -> str:
 
 def _apply_variables(state: UpsState, variables: dict[str, str]) -> None:
     """Map NUT variables onto the source-neutral UpsState."""
-    state.raw = dict(variables)
+    # Redacted before it is stored, so every consumer inherits it. upsd publishes each
+    # driver's configuration as driver.parameter.<name>, which for several drivers means a
+    # plaintext password or SNMPv3 passphrase — and UpsState.raw ends up in the event log
+    # via readable_raw(), which /api/status serves unauthenticated. The unmasked values are
+    # never needed here: everything below reads a standardised ups./battery. variable.
+    state.raw = redact_raw(variables)
+    # upsd answered. Kept apart from ``reachable`` because the missing-ups.status branch
+    # below is unreachable-but-not-silent, and the engine's pure communication-loss opt-in
+    # must not fire on a server that is demonstrably talking to us (see UpsState.answered).
+    state.answered = True
     state.manufacturer = variables.get(VAR_MFR) or variables.get(VAR_MFR_LEGACY) or None
     state.model = variables.get(VAR_MODEL) or variables.get(VAR_MODEL_LEGACY) or None
 
@@ -281,9 +290,32 @@ def _apply_variables(state: UpsState, variables: dict[str, str]) -> None:
         state.error = f"upsd did not report {VAR_STATUS} — the driver is not delivering data"
         return
 
+    # Kept verbatim next to the normalised word, for the same reason the SNMP path keeps
+    # its enum: "low" alone cannot say whether the battery is empty or being replaced.
+    state.battery_status_detail = f"ups.status={status.strip()}"
     flags = status.upper().split()
     state.power_source = next((src for flag, src in _POWER_FLAGS if flag in flags), "unknown")
     state.battery_status = "low" if any(f in flags for f in _LOW_FLAGS) else "normal"
+
+    if state.power_source == "unknown":
+        # The variable is there, but nothing in it says where the power comes from: an
+        # empty value, or flags that describe something else entirely (CHRG, ALARM, RB, a
+        # driver's intermediate state during a transfer). ``on_battery`` is
+        # ``power_source == "battery"``, so leaving this reachable reads as MAINS —
+        # mid-outage that clears the running on-battery timer, drops a latched trigger and
+        # writes "mains power restored" about a device that reported nothing of the sort.
+        # The same fail-dangerous default ups.py:_map_state() refuses for SNMP, and the
+        # two sources have to answer this one question the same way. Unreachable is an
+        # alarm, never a shutdown, and it keeps the blind countdown
+        # (``keep_shutdown_on_comm_loss``) running on an outage that was already confirmed.
+        state.error = (
+            f"upsd reported {VAR_STATUS}='{status.strip()}', which names neither OL (on "
+            f"line) nor OB (on battery), so it is unknown whether this UPS runs on mains "
+            f"or on battery. Treated as unreachable — an alarm, never a shutdown. Use the "
+            f"test button to see what the driver does deliver."
+        )
+        return
+
     state.reachable = True
 
 
@@ -302,6 +334,16 @@ async def poll(cfg: NutConfig) -> UpsState:
         # happily keeps serving the last known values when its driver has died, and
         # treating those as a valid reading would break the fail-safe contract.
         log.warning("NUT poll failed: %s", exc)
+        # ...but an ERR is an ANSWER, and that is a different question from whether the
+        # answer was usable (see UpsState.answered). upsd replying DATA-STALE,
+        # DRIVER-NOT-CONNECTED, ACCESS-DENIED or UNKNOWN-UPS has demonstrably not stopped
+        # talking to us, while a timeout, a refused connection or a DNS failure has.
+        # engine._ups_trigger_reason() reads exactly that distinction: the
+        # ``comm_loss_shutdown_after_min`` opt-in shuts the whole estate down on a *silent*
+        # source, so filing a wedged driver or a mistyped ups_name under silence fired a
+        # real shutdown during normal operation — and the alarm sent the operator to a
+        # network that was working.
+        state.answered = isinstance(exc, _NutError)
         state.error = _failure_text(cfg, exc)
         return state
 

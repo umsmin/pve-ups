@@ -111,6 +111,9 @@
             <a class="doclink" href="/manual.html#logik" data-manual="logik" target="_blank" rel="noopener" title="Read in the manual: How it works &amp; logic" data-i18n-title="topo.doc"><svg class="icon"><use href="#i-help"></use></svg></a></div>
           <div class="stat"><span data-i18n="dash.state">State</span><b id="d_state">–</b></div>
           <div class="stat"><span data-i18n="dash.mode">Mode</span><b id="d_mode">–</b></div>
+          <!-- Only rendered while a notification target is actually failing (see app.js):
+               a permanent "Notifications: ok" row would be one more thing to read past. -->
+          <div class="stat" id="d_notifRow" hidden><span data-i18n="dash.notif">Notifications</span><b id="d_notif">–</b></div>
           <div class="stat"><span data-i18n="dash.trig">Shutdown triggered</span><b id="d_trig">–</b></div>
           <div class="stat"><span data-i18n="dash.reason">Reason</span><b id="d_reason">–</b></div>
           <div class="stat"><span data-i18n="dash.countdown">Countdown</span><b id="d_countdown">–</b></div>

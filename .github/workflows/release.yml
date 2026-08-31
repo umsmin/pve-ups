@@ -26,18 +26,32 @@ jobs:
       - name: Build dist tarball
         run: bash scripts/make-dist.sh --committed "$GITHUB_REF_NAME"
 
-      - name: Extract changelog section for the release body
+      - name: Extract changelog highlights for the release body
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          # The release notes carry the short "### Highlights" block only (3-4 bullets,
+          # the same ones the manuals show); the unabridged version stays in CHANGELOG.md.
           awk -v ver="$VERSION" '
             $0 ~ "^## \\[" ver "\\]" {on=1; next}
             on && /^## \[/ {exit}
-            on {print}
+            on && /^### Highlights/ {hl=1; next}
+            hl && /^### / {exit}
+            hl {print}
           ' CHANGELOG.md > release-body.md
-          # fall back to a minimal body if the section is missing/empty
+          # fall back to the whole section for tags predating the Highlights convention
+          if ! grep -q "[^[:space:]]" release-body.md; then
+            awk -v ver="$VERSION" '
+              $0 ~ "^## \\[" ver "\\]" {on=1; next}
+              on && /^## \[/ {exit}
+              on {print}
+            ' CHANGELOG.md > release-body.md
+          fi
+          # ... and to a minimal body if the section is missing/empty as well
           if ! grep -q "[^[:space:]]" release-body.md; then
             echo "Release $GITHUB_REF_NAME" > release-body.md
           fi
+          printf '\nFull changelog: %s/blob/%s/CHANGELOG.md\n' \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" >> release-body.md
 
       - name: Create GitHub release with assets
         uses: softprops/action-gh-release@v2

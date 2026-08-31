@@ -272,11 +272,16 @@ from Proxmox VE and explain the commands above:
 - **Webhook notifications** on notable events — as many targets as you like, each with its
   own format (full status JSON, **Microsoft Teams**, **Slack**, **Discord**, **ntfy**,
   plain text, or a **custom template** with placeholder substitution), severity filter,
-  optional authentication header and test-send button. Sends run in parallel, so one
-  unreachable target does not cost the others their notification.
+  optional authentication header and test-send button. Sends run in parallel and under a
+  common ceiling, so one unreachable target costs neither the others their notification
+  nor the shutdown its battery. A target that stops working is reported like a broken
+  shutdown credential: an event, a note on its card and a line on the dashboard — an
+  alarm nobody receives is one nobody acts on.
 - **REST status** (`/api/status`, `/api/health`) — read-only, no auth, no secrets;
   event log of the last 48 h included. `/api/health` also counts how many shutdown targets
-  passed their last self-test. Event/webhook texts are uniformly English.
+  passed their last self-test, how many notification targets are delivering, and whether
+  dry-run is still on — all three are monitoring information and never change the reported
+  status or the HTTP code. Event/webhook texts are uniformly English.
 - **Config export/import**, NTP/timezone setup, scheduled connectivity self-test per target
   (start time plus an interval from 15 min to 24 h; the result is kept per host and shown
   on the dashboard), in-place **updates via package upload** in the web UI.
@@ -288,11 +293,21 @@ from Proxmox VE and explain the commands above:
   answers with stale data because its driver died: that counts as unreachable, never as
   "on mains". Two explicit opt-ins refine this:
   continuing a confirmed on-battery countdown through a connection loss (default on),
-  and treating a prolonged pure communication loss as an outage (default off).
+  and treating a prolonged pure communication loss as an outage (default off) — that
+  second one fires on silence only, so a device that answers with something unusable is an
+  alarm but never a communication loss.
 - **Dry-run by default:** after installation the engine only logs what it would do.
-  A **test shutdown** simulates the shutdown order without any effect.
+  A **test shutdown** simulates the shutdown order without any effect. Because that is the
+  quietest failure there is — fully configured, self-test green, and nothing ever shuts
+  down — the dashboard, the event log and `/api/health` all say so while it is on.
+- **The outage is timed on this appliance's own clock**, never on the counter the UPS
+  reports: RFC 1628 leaves that value undefined while on mains, and cards that keep the
+  last transfer's figure used to fire the shutdown in the first second of an outage.
+- **A failed shutdown is retried** (three attempts) instead of costing the machine: a 503
+  from a busy `pveproxy` or an expired deadline is not proof that the node is going down.
 - A confirmed trigger and the on-battery countdown are **persisted to disk** and survive
-  a service restart.
+  a service restart. Nothing read back from that file may act on its own, though — it
+  waits for one poll of the new process to confirm the outage is still running.
 - **Ready for the next outage on its own:** a shutdown that was really sent stays latched,
   so a machine on its way down is never commanded twice. The latch is released once every
   UPS has been reachable and on mains for five minutes (configurable, or off for the

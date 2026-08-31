@@ -52,8 +52,13 @@ def _client(host: HostConfig, timeout: float) -> httpx.AsyncClient:
 
 async def test_connection(host: HostConfig, timeout: float = 10.0) -> TestResult:
     """Validate URL, token and that the token may power off this instance."""
+    # Half the caller's budget per request, for the same reason as in proxmox.py: two of
+    # them run in sequence while targets.test_connection() cuts the whole call off at
+    # timeout + DEADLINE_GRACE_S, so at the full timeout each a merely slow instance was
+    # reported as "gave up" — a CRITICAL self-test failure for a working target.
+    per_call = max(2.0, timeout / 2)
     try:
-        async with _client(host, timeout) as client:
+        async with _client(host, per_call) as client:
             # Version endpoint confirms reachability + token validity.
             resp = await client.get("/version")
             if resp.status_code == 401:

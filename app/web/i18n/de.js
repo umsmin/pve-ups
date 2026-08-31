@@ -43,6 +43,7 @@ I18N.de = {
   "dash.appliance": "Appliance",
   "dash.state": "Zustand",
   "dash.mode": "Modus",
+  "dash.notif": "Benachrichtigungen",
   "dash.trig": "Shutdown ausgelöst",
   "dash.reason": "Grund",
   "dash.countdown": "Countdown",
@@ -95,6 +96,8 @@ I18N.de = {
   "mode.armed": "SCHARF",
 
   // UPS status cards (dashboard)
+  "ups.incomplete": "unvollständig",
+  "ups.incompleteTitle": "Diese USV ist mit {what} gespeichert, wird also nie abgefragt und gilt als dauerhaft nicht erreichbar. Fail safe bedeutet damit zugleich: Jeder von ihr versorgte Host bekommt keinen Shutdown. Unter Einstellungen -> USV vervollständigen.",
   "ups.srcMains": "Netz",
   "ups.srcBattery": "Akku",
   "ups.tipUnreach": "nicht erreichbar",
@@ -124,6 +127,8 @@ I18N.de = {
   "banner.unreachCountdown": "USV nicht erreichbar – Akkubetrieb-Countdown läuft weiter, Shutdown bei Ablauf ({s}).",
   "banner.unreachCommLoss": "USV nicht erreichbar – Shutdown bei anhaltendem Verlust in {s}.",
   "banner.unreachAlarm": "USV nicht erreichbar – Alarm (kein Shutdown).",
+  "banner.restoredUnconfirmed": "{names}: Nach einem Neustart wurde ein Akkubetrieb-Timer wiederhergestellt, die USV hat sich aber noch nicht gemeldet. Er ist zurückgehalten, bis ein Poll den Ausfall bestätigt – bis dahin kein Shutdown.",
+  "banner.dryRun": "Testmodus aktiv – die Appliance protokolliert nur, was sie tun würde, und fährt nichts herunter. Nach dem Test unter Einstellungen abschalten.",
 
   // shown when the service restarted into a new version while this tab stayed open
   "reload.newVersion": "Version v{v} wurde installiert – bitte die Seite neu laden, damit die Oberfläche zum laufenden Dienst passt.",
@@ -134,6 +139,10 @@ I18N.de = {
   "chip.unreach": "USV nicht erreichbar",
 
   // dashboard hosts table
+  "hosts.incomplete": "unvollständig",
+  "hosts.incompleteTitle": "Dieser Host ist mit {what} gespeichert, ein Shutdown kann ihn also nicht erreichen – und das zeigt sich erst im Ausfall. Unter Einstellungen -> Hosts vervollständigen oder „aktiv“ abwählen.",
+  "hosts.staleFeed": "keine USV",
+  "hosts.staleFeedTitle": "Dieser Host ist USV-Geräten zugeordnet, die es nicht mehr gibt ({ids}). Sofern keine andere Zuleitung übrig ist, wird er nie heruntergefahren. Bitte unter Einstellungen -> Hosts korrigieren.",
   "hosts.allUps": "alle USV",
   "hosts.policyAnd": "UND",
   "hosts.policyOr": "ODER",
@@ -249,6 +258,9 @@ I18N.de = {
   "notif.doc": "Im Handbuch nachlesen: Webhook-Benachrichtigungen",
   "notif.webhook": "Webhook",
   "notif.webhookTitle": "Bei jedem wichtigen Ereignis ein HTTP-POST an eine URL senden (z.B. an ein Ticket-/Chat-/Monitoring-System).",
+  "notif.lastFailed": "Die letzte Benachrichtigung an dieses Ziel ist fehlgeschlagen: {err}",
+  "notif.deadChip": "{n} Webhook(s) gestört",
+  "notif.deadChipTitle": "Die letzte Benachrichtigung an {names} kam nicht an. Benachrichtigungen sind Best-Effort und beeinflussen einen Shutdown nie — aber ein Alarm, den niemand bekommt, ist einer, auf den niemand reagiert. Bitte unter Einstellungen -> Benachrichtigungen prüfen.",
   "notif.url": "URL",
   "notif.urlTitle": "Ziel-URL für den Webhook. Erhält bei jedem Ereignis einen POST im gewählten Format.",
   "notif.format": "Format",
@@ -353,6 +365,15 @@ I18N.de = {
   "pw.change": "Ändern",
 
   // save bar
+  "save.cardNo": "Karte {n}",
+  "save.needHostName": "Host {who} hat keinen Knotennamen — bitte ausfüllen oder die Karte entfernen. Beim Speichern ginge er samt API-Token verloren.",
+  "save.needHostUrl": "Host {who} hat keine API-URL — bitte ausfüllen, die Karte entfernen oder „aktiv“ abwählen. Ohne sie hat der Shutdown kein Ziel, und das zeigt sich erst im Stromausfall.",
+  "save.needHostToken": "Host {who} hat keine Token-ID — bitte ausfüllen, die Karte entfernen oder „aktiv“ abwählen. Ohne sie wird der Shutdown abgelehnt, und das zeigt sich erst im Stromausfall.",
+  "save.needHostSecret": "Der neue Host {who} hat kein Token-Secret — bitte ausfüllen, die Karte entfernen oder „aktiv“ abwählen. Es würde leer gespeichert und mit 401 abgewiesen, und das zeigt sich erst im Stromausfall.",
+  "save.needUps": "USV {who} hat weder Adresse noch Namen — bitte eines ausfüllen oder die Karte entfernen. Beim Speichern ginge sie samt gespeicherter Passwörter verloren.",
+  "save.needUpsHost": "USV {who} hat keine Adresse — bitte ausfüllen oder die Karte entfernen. Ohne sie wird das Gerät nie abgefragt, gilt dauerhaft als nicht erreichbar, und jedem von ihr versorgten Host wird der Shutdown sicherheitshalber verweigert.",
+  "save.needUpsName": "USV {who} hat keinen USV-Namen — bitte den Abschnittsnamen aus der ups.conf des NUT-Servers eintragen oder die Karte entfernen. Ohne ihn wird das Gerät nie abgefragt, gilt dauerhaft als nicht erreichbar, und jedem von ihr versorgten Host wird der Shutdown sicherheitshalber verweigert.",
+  "save.needWebhookUrl": "Webhook {who} hat keine URL — bitte ausfüllen oder die Karte entfernen.",
   "save.btn": "Konfiguration speichern",
   "save.title": "Speichert alle Einstellungen in die Konfigurationsdatei und übernimmt sie sofort in die laufende Engine (ohne Neustart). Leere Passwortfelder bedeuten „unverändert“.",
 
@@ -475,6 +496,7 @@ I18N.de = {
   "host.tokenSecretTitle": "Geheimer Token-Wert (UUID). Wird sicher gespeichert und nie zurückgegeben.",
   "host.tokenSecretPh": "Secret",
   "host.feeds": "Versorgt durch",
+  "host.feedsAllHint": "Nichts angehakt = versorgt durch alle konfigurierten USVs. Häkchen setzen nur zum Einschränken.",
   "host.feedsTitle": "Welche USV(s) diesen Host versorgen. Bei redundanten Netzteilen mehrere ankreuzen.",
   "host.policy": "Logik",
   "host.policyTitle": "UND = Shutdown erst, wenn ALLE angekreuzten USVs kritisch sind (redundante Netzteile). ODER = Shutdown sobald EINE kritisch ist (aufgeteilte, nicht redundante Last).",

@@ -293,11 +293,17 @@ unterscheiden sich von Proxmox VE und erklären die Befehle oben:
   mit eigenem Format (vollständiges Status-JSON, **Microsoft Teams**, **Slack**,
   **Discord**, **ntfy**, Klartext oder eine **eigene Vorlage** mit Platzhalter-Ersetzung),
   Stufenfilter, optionalem Authentifizierungs-Header und Testversand. Der Versand läuft
-  parallel; ein nicht erreichbares Ziel kostet den anderen also nicht ihre Meldung.
+  parallel und unter einer gemeinsamen Obergrenze; ein nicht erreichbares Ziel kostet den
+  anderen also weder ihre Meldung noch dem Shutdown Akkulaufzeit. Ein Ziel, das nicht mehr
+  funktioniert, wird wie ein kaputtes Shutdown-Credential gemeldet: als Ereignis, als
+  Hinweis auf seiner Karte und als Zeile im Dashboard — ein Alarm, den niemand bekommt,
+  ist einer, auf den niemand reagiert.
 - **REST-Status** (`/api/status`, `/api/health`) — lesend, ohne Auth, ohne Secrets;
-  Ereignisprotokoll der letzten 48 h inklusive. `/api/health` zählt zusätzlich, wie viele
-  Shutdown-Ziele ihren letzten Selbsttest bestanden haben. Ereignis-/Webhook-Texte sind
-  einheitlich englisch.
+  Ereignisprotokoll der letzten 48 h inklusive. `/api/health` meldet zusätzlich, wie viele
+  Shutdown-Ziele ihren letzten Selbsttest bestanden haben, wie viele
+  Benachrichtigungsziele zustellen und ob der Dry-Run noch an ist — alle drei sind reine
+  Monitoring-Angaben und verändern weder den gemeldeten Status noch den HTTP-Code.
+  Ereignis-/Webhook-Texte sind einheitlich englisch.
 - **Konfigurations-Export/-Import**, NTP/Zeitzone, regelmäßiger Selbsttest je Ziel
   (Startzeit plus Intervall von 15 min bis 24 h; das Ergebnis wird je Host gemerkt und im
   Dashboard angezeigt), In-Place-**Updates per Paket-Upload** im Webinterface.
@@ -310,11 +316,24 @@ unterscheiden sich von Proxmox VE und erklären die Befehle oben:
   zählt als nicht erreichbar, nie als „Netzbetrieb". Zwei explizite Opt-ins
   verfeinern das: einen bestätigten Akkubetrieb-Countdown über den Verbindungsverlust
   hinweg fortsetzen (Standard an) und einen anhaltenden reinen Kommunikationsverlust doch
-  als Ausfall behandeln (Standard aus).
+  als Ausfall behandeln (Standard aus) — Letzteres greift nur bei Stille, ein Gerät mit
+  unbrauchbarer Antwort ist also ein Alarm, aber nie ein Kommunikationsverlust.
 - **Dry-Run als Standard:** nach der Installation protokolliert die Engine nur, was sie
-  tun würde. Ein **Test-Shutdown** simuliert die Abschaltreihenfolge ohne Wirkung.
+  tun würde. Ein **Test-Shutdown** simuliert die Abschaltreihenfolge ohne Wirkung. Weil
+  das der leiseste Fehler überhaupt ist — vollständig konfiguriert, Selbsttest grün, und
+  es wird trotzdem nie etwas heruntergefahren — sagen Dashboard, Ereignisprotokoll und
+  `/api/health` es, solange er an ist.
+- **Die Ausfalldauer wird auf der eigenen Uhr dieser Appliance gemessen**, nie über den
+  Zähler, den die USV meldet: RFC 1628 lässt diesen Wert im Netzbetrieb undefiniert, und
+  Karten, die den Wert des letzten Umschaltens behalten, lösten den Shutdown in der ersten
+  Sekunde eines Ausfalls aus.
+- **Ein fehlgeschlagener Shutdown wird wiederholt** (drei Versuche), statt die Maschine zu
+  kosten: ein 503 von einem ausgelasteten `pveproxy` oder eine abgelaufene Frist ist kein
+  Beweis dafür, dass der Knoten heruntergefahren wird.
 - Ein ausgelöster Trigger und der Akkubetrieb-Countdown werden **auf Platte persistiert**
-  und überstehen einen Dienst-Neustart.
+  und überstehen einen Dienst-Neustart. Was aus dieser Datei zurückgelesen wird, darf
+  allerdings nichts von sich aus auslösen — es wartet darauf, dass ein Poll des neuen
+  Prozesses den laufenden Ausfall bestätigt.
 - **Von selbst bereit für den nächsten Ausfall:** Ein tatsächlich gesendeter Shutdown bleibt
   gesperrt, damit eine herunterfahrende Maschine den Befehl nie zweimal bekommt. Die Sperre
   löst sich, sobald jede USV fünf Minuten lang erreichbar und am Netz war (einstellbar,

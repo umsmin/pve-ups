@@ -50,8 +50,8 @@ function show(view) {
   ["login", "firstrun", "dashboard", "settings"].forEach((v) => {
     const el = $(v); if (el) el.hidden = (v !== view);
   });
-  document.querySelectorAll(".tab").forEach((t) =>
-    t.classList.toggle("active", t.dataset.view === view));
+  document.querySelectorAll(".tab").forEach((tab) =>
+    tab.classList.toggle("active", tab.dataset.view === view));
 }
 
 // --- bootstrap --------------------------------------------------------------
@@ -108,10 +108,21 @@ $("loginPw").addEventListener("keydown", (e) => { if (e.key === "Enter") $("logi
 $("logoutBtn").onclick = async () => { await api("/api/logout", "POST"); location.reload(); };
 
 // --- tabs -------------------------------------------------------------------
-document.querySelectorAll(".tab").forEach((t) => {
-  t.onclick = async () => {
-    const v = t.dataset.view;
-    if (v === "settings") { await loadConfig(); }
+// Parameter named tab, not t: t() is the i18n lookup, and shadowing it inside a handler
+// that now calls t() would be the same trap loadConfig() used to carry.
+document.querySelectorAll(".tab").forEach((tab) => {
+  tab.onclick = async () => {
+    const v = tab.dataset.view;
+    // Guarded: /api/config needs a session while /api/status does not, so an expired
+    // cookie used to make "Settings" do nothing at all — loadConfig() rejected, show()
+    // never ran, and the dashboard kept ticking as if everything were fine.
+    try {
+      if (v === "settings") { await loadConfig(); }
+    } catch (e) {
+      $("saveMsg").textContent = "✗ " + e.message;
+      await boot();          // most likely the session expired: back to the login
+      return;
+    }
     show(v);
   };
 });
@@ -198,8 +209,16 @@ function upsCardHtml(u) {
     ? `<div class="stat"><span>${esc(t("ups.countdown"))}</span><b>${u.countdown_remaining_s} s</b></div>` : "";
   const clr = u.comm_loss_remaining_s != null
     ? `<div class="stat"><span>${esc(t("ups.commLossIn"))}</span><b>${u.comm_loss_remaining_s} s</b></div>` : "";
+  // Stored without an address (or, for NUT, without the ups.conf section name), so it is
+  // never polled at all. That renders identically to a device that is simply not
+  // answering — while the consequence is the same either way: fail safe means every host
+  // this UPS feeds is refused a shutdown. Said in its own words, next to the name.
+  const incomplete = u.incomplete
+    ? ` <span class='chip crit' title="${esc(t("ups.incompleteTitle", { what: u.incomplete }))}">${
+        esc(t("ups.incomplete"))}</span>`
+    : "";
   return `<div class="card ups-card is-${upsStatusCls(u)}">
-    <div class="card-h"><h3><svg class="icon batt-ic"><use href="#i-battery"></use></svg>${esc(u.name)}</h3>${statIc}</div>
+    <div class="card-h"><h3><svg class="icon batt-ic"><use href="#i-battery"></use></svg>${esc(u.name)}${incomplete}</h3>${statIc}</div>
     <div class="hero-meta"><span>${esc(t("ups.source"))} ${src}</span><span class="faint">·</span><span>${esc(model) || "–"}</span><span class="faint">·</span><span class="muted">${esc(via)}</span></div>
     <div class="metric" style="margin-top:8px">
       <span class="k">${esc(t("ups.charge"))} ${pct === null ? "–" : pct + " %"}</span>
@@ -229,9 +248,17 @@ function checkAppVersion(version) {
   el.hidden = false;
 }
 
+// Last snapshot, kept so the settings view can show things only /api/status knows —
+// currently how each webhook's last delivery went.
+let lastStatus = null;
+
 async function refreshStatus() {
   let s;
   try { s = await api("/api/status"); } catch (_) { return; }
+  lastStatus = s;
+  // Cheap and idempotent: it is a no-op unless webhook cards are on screen, and it is
+  // what keeps their delivery note current while the settings view stays open.
+  updateWebhookDelivery();
   $("version").textContent = "v" + s.appliance.version;
   checkAppVersion(s.appliance.version);
 
@@ -244,6 +271,23 @@ async function refreshStatus() {
   $("d_state").innerHTML = a.engine_state === "ONLINE" ? pill(stateLbl, "ok")
     : a.engine_state === "ON_BATTERY" ? pill(stateLbl, "warn") : pill(stateLbl, "crit");
   $("d_mode").innerHTML = a.dry_run ? pill("DRY-RUN", "warn") : pill(t("mode.armed"), "ok");
+  // A notification target that has stopped working was only visible on its settings card,
+  // and the person watching an outage is looking at THIS page. Notifications stay
+  // best-effort — a failing one never delays or affects a shutdown — but an alarm nobody
+  // receives is an alarm nobody acts on, so it is worth a line where it will be seen.
+  // The row disappears again by itself once a send succeeds.
+  const deadHooks = (s.webhooks || [])
+    .filter((w) => w.enabled && w.last_delivery_ok === false);
+  const notifRow = $("d_notifRow");
+  if (notifRow) {
+    notifRow.hidden = deadHooks.length === 0;
+    if (deadHooks.length) {
+      const names = deadHooks.map((w) => w.name || w.id).join(", ");
+      $("d_notif").innerHTML = `<span class="chip warn" title="${
+        esc(t("notif.deadChipTitle", { names }))}">${
+        esc(t("notif.deadChip", { n: deadHooks.length }))}</span>`;
+    }
+  }
   $("d_trig").textContent = sd.triggered ? t("common.yes") : t("common.no");
   $("d_reason").textContent = sd.reason || "–";
   $("d_countdown").textContent = fmt(sd.countdown_remaining_s, " s");
@@ -271,7 +315,16 @@ async function refreshStatus() {
     setBanner("warn", "i-bolt", esc(txt));
     chip = { cls: "warn", text: t("chip.battery") };
   } else if (anyUnreachable) {
-    if (sd.countdown_remaining_s != null) {
+    // A timer read back from the state file that no poll of this process has confirmed:
+    // it is shown, but it cannot fire, and the countdown is deliberately null. Said in
+    // its own words rather than through "alarm (no shutdown)" — that one is true here and
+    // still answers a different question than the one being asked, which is why an outage
+    // is on screen while nothing is counting down.
+    const held = upses.filter((u) => u.elapsed_source === "own-unconfirmed");
+    if (held.length) {
+      setBanner("warn", "i-alert", esc(t("banner.restoredUnconfirmed",
+                                         { names: held.map((u) => u.name).join(", ") })));
+    } else if (sd.countdown_remaining_s != null) {
       setBanner("warn", "i-alert", esc(t("banner.unreachCountdown", { s: fmt(sd.countdown_remaining_s, " s") })));
     } else if (sd.comm_loss_remaining_s != null) {
       setBanner("warn", "i-alert", esc(t("banner.unreachCommLoss", { s: fmt(sd.comm_loss_remaining_s, " s") })));
@@ -279,6 +332,18 @@ async function refreshStatus() {
       setBanner("warn", "i-alert", esc(t("banner.unreachAlarm")));
     }
     chip = { cls: "warn", text: t("chip.unreach") };
+  } else if (a.dry_run && a.config_valid) {
+    // Last in the chain on purpose: a real outage or a fired trigger always wins the
+    // banner. But with nothing else to report, this is the one thing worth the space —
+    // an appliance left in dry-run is fully configured, self-tests green, answers
+    // /api/health with "ok" and shuts nothing down. A pill in the stat grid was the only
+    // thing saying so.
+    //
+    // config_valid, like the matching self-test line (see _run_selftest): before the
+    // wizard has been through once, dry-run is not a half-finished commissioning but the
+    // correct state, and greeting a fresh installation with a warning banner about its
+    // own default teaches the operator to read past this one.
+    setBanner("warn", "i-alert", esc(t("banner.dryRun")));
   } else { b.hidden = true; }
 
   const nav = $("navStatus");
@@ -310,8 +375,24 @@ async function refreshStatus() {
       ? ` <span class='chip warn' title="${esc(t("nodest.chipTitle"))}">${esc(t("nodest." + h.node_state))}</span>` : "";
     // A credential that broke long before any outage would otherwise stay invisible:
     // show the self-test complaint whenever there is no fresher shutdown error.
+    // The one failure that is otherwise completely silent: every UPS this host names is
+    // gone, so it has no feed left, is never eligible, and is simply never shut down.
+    // It looks exactly like a host waiting for an outage that has not come.
+    const stale = (h.stale_ups_ids || []).length
+      ? ` <span class='chip crit' title="${esc(t("hosts.staleFeedTitle",
+          { ids: (h.stale_ups_ids || []).join(", ") }))}">${esc(t("hosts.staleFeed"))}</span>`
+      : "";
+    // Stored without what the shutdown needs to reach it — an API URL, a token id, a
+    // token secret. The browser refuses to save such a card, but a backup import and a
+    // hand-edited config.yaml never pass that check, and nothing else says so in time:
+    // the node check answers "unverified" for an entry it cannot even address, which is
+    // read as no verdict rather than as a fault.
+    const incomplete = h.incomplete
+      ? ` <span class='chip crit' title="${esc(t("hosts.incompleteTitle",
+          { what: h.incomplete }))}">${esc(t("hosts.incomplete"))}</span>`
+      : "";
     const err = h.last_error || h.last_test_error || "";
-    return `<tr><td>${esc(h.name)}${kind}${clus}${nodeBad}${star}</td>
+    return `<tr><td>${esc(h.name)}${kind}${clus}${nodeBad}${stale}${incomplete}${star}</td>
       <td>${feeds} <span class="muted">(${esc(policy)})</span></td>
       <td>${pill(stLbl, cls)}</td><td class="muted">${esc(err)}</td></tr>`;
   }).join("");
@@ -476,11 +557,46 @@ const WEBHOOK_LEVELS = [["info", t("whlvl.info")], ["warning", t("whlvl.warning"
 const opts = (list, val) => list.map(([v, l]) => `<option value="${v}" ${v === val ? "selected" : ""}>${l}</option>`).join("");
 const triVal = (v) => v === true ? "on" : v === false ? "off" : "";
 
-function nextUpsId() {
-  const ids = Array.from(document.querySelectorAll("#upsList .u_id")).map((i) => i.value);
+// A fresh id for a card the user just added — never one the backend still holds a secret
+// for.
+//
+// Reading the lowest free "upsN"/"hostN" off the FORM alone was the wrong half of the
+// answer: delete host2, add a host, and the new card is handed host2 again. The backend
+// then matches that id against the STORED host2 and copies its API token into the new
+// entry (an empty secret field means "unchanged"), so a brand-new shutdown target arrives
+// pre-loaded with a different machine's credentials, pointed at a different IP.
+//
+// So the last loaded configuration is consulted as well — it still lists the entry that
+// was just removed from the form, which is exactly the one that must not be handed out
+// again. Once the deletion has been saved, loadConfig() refreshes it and the number is
+// genuinely free: there is no stored secret left for _reconcile_secret() to resolve the
+// placeholder to, so it resolves to "".
+//
+// Deliberately not a random suffix, which was the first fix here and solved it by making
+// the id unreadable: an entry without a name falls back to its id (UpsBase.label,
+// WebhookConfig.label), so the dashboard, the topology, the feed checkboxes, the event log
+// and every webhook message would have called it "ups-a3f9k2".
+//
+// What this does NOT cover, and a random suffix would have: a second browser tab whose
+// configuration predates an entry another tab added and saved. That tab sees the number as
+// free on both counts and can hand it out again. It is a narrow case and already a losing
+// one — a whole-config POST from a stale tab overwrites the other tab's work regardless —
+// and for the entry where it would matter most it is closed anyway: incompleteCards()
+// refuses to save a host card whose id the loaded configuration does not know without a
+// token secret typed into it, so nothing is left for the backend to fill in.
+//
+// assign_*_ids() on the backend leaves a non-empty id alone either way, so whatever is
+// picked here survives the round trip unchanged.
+function newCardId(prefix, selector, stored) {
+  const taken = new Set(Array.from(document.querySelectorAll(selector)).map((el) => el.value));
+  (stored || []).forEach((entry) => { if (entry && entry.id) taken.add(entry.id); });
   let n = 1;
-  while (ids.includes("ups" + n)) n += 1;
-  return "ups" + n;
+  while (taken.has(prefix + n)) n += 1;
+  return prefix + n;
+}
+
+function nextUpsId() {
+  return newCardId("ups", "#upsList .u_id", currentConfig && currentConfig.ups);
 }
 
 function upsMeta() {
@@ -837,22 +953,24 @@ async function loadConfig() {
   renderHosts(c.hosts || []);
   renderHostUpsCheckboxes();
 
-  const t = c.thresholds;
-  setVal("th_on_battery_seconds", t.on_battery_seconds);
-  setVal("th_runtime_below_minutes", t.runtime_below_minutes);
-  setVal("th_charge_below_percent", t.charge_below_percent);
-  setChk("th_on_battery_low", t.on_battery_low);
-  setVal("th_poll_interval_normal_s", t.poll_interval_normal_s);
-  setVal("th_poll_interval_battery_s", t.poll_interval_battery_s);
-  setVal("th_host_shutdown_timeout_s", t.host_shutdown_timeout_s);
-  setVal("th_unreachable_alarm_after_polls", t.unreachable_alarm_after_polls);
-  setVal("th_comm_loss_shutdown_after_min", t.comm_loss_shutdown_after_min);
-  setVal("th_rearm_after_mains_min", t.rearm_after_mains_min);
-  setChk("th_keep_shutdown_on_comm_loss", t.keep_shutdown_on_comm_loss);
-  setVal("th_cluster_prep_timeout_s", t.cluster_prep_timeout_s);
-  setChk("th_cluster_abort_on_prep_failure", t.cluster_abort_on_prep_failure);
-  setVal("th_cluster_guest_shutdown_timeout_s", t.cluster_guest_shutdown_timeout_s);
-  setVal("th_cluster_guest_force_after_s", t.cluster_guest_force_after_s);
+  // Named th, not t: t() is the i18n lookup, and a const named t here shadows it
+  // for the whole function body (temporal dead zone, so above this line too).
+  const th = c.thresholds;
+  setVal("th_on_battery_seconds", th.on_battery_seconds);
+  setVal("th_runtime_below_minutes", th.runtime_below_minutes);
+  setVal("th_charge_below_percent", th.charge_below_percent);
+  setChk("th_on_battery_low", th.on_battery_low);
+  setVal("th_poll_interval_normal_s", th.poll_interval_normal_s);
+  setVal("th_poll_interval_battery_s", th.poll_interval_battery_s);
+  setVal("th_host_shutdown_timeout_s", th.host_shutdown_timeout_s);
+  setVal("th_unreachable_alarm_after_polls", th.unreachable_alarm_after_polls);
+  setVal("th_comm_loss_shutdown_after_min", th.comm_loss_shutdown_after_min);
+  setVal("th_rearm_after_mains_min", th.rearm_after_mains_min);
+  setChk("th_keep_shutdown_on_comm_loss", th.keep_shutdown_on_comm_loss);
+  setVal("th_cluster_prep_timeout_s", th.cluster_prep_timeout_s);
+  setChk("th_cluster_abort_on_prep_failure", th.cluster_abort_on_prep_failure);
+  setVal("th_cluster_guest_shutdown_timeout_s", th.cluster_guest_shutdown_timeout_s);
+  setVal("th_cluster_guest_force_after_s", th.cluster_guest_force_after_s);
   const ap = c.appliance || {};
   applianceStored = { vmid: ap.self_vmid ?? null, node: ap.self_node || "",
                       external: !!ap.self_external };
@@ -914,6 +1032,7 @@ function addHostRow(h, isNew, open) {
     <div class="feedsblock" title="${esc(t("host.feedsTitle"))}">
       <span class="cfg-label">${esc(t("host.feeds"))}</span>
       <div class="h_feeds"></div>
+      <p class="help h_feedsall" hidden>${esc(t("host.feedsAllHint"))}</p>
     </div>
     <div class="row hostflags">
       <label title="${esc(t("host.policyTitle"))}">${esc(t("host.policy"))} <select class="h_policy"><option value="all">${esc(t("hosts.policyAnd"))}</option><option value="any">${esc(t("hosts.policyOr"))}</option></select></label>
@@ -1122,18 +1241,27 @@ function renderHostUpsCheckboxes() {
     cell.innerHTML = ups.map((u) =>
       `<label class="feedchk"><input type="checkbox" class="h_feed" value="${esc(u.id)}" ${selected.has(u.id) ? "checked" : ""}/> ${esc(u.name)}</label>`
     ).join("") || `<span class='muted'>${esc(t("host.noUps"))}</span>`;
-    cell.querySelectorAll(".h_feed").forEach((c) => { c.onchange = drawConfigTopology; });
+    // Nothing ticked means "every configured UPS" on the backend (see feed_ids_for), and
+    // the dashboard renders it exactly that way — while this panel showed an empty set of
+    // boxes, which reads as the opposite. Say it instead of leaving it to be discovered.
+    const hint = tr.querySelector(".h_feedsall");
+    if (hint) {
+      hint.hidden = !ups.length
+        || cell.querySelectorAll(".h_feed:checked").length > 0;
+    }
+    cell.querySelectorAll(".h_feed").forEach((c) => {
+      c.onchange = () => {
+        if (hint) {
+          hint.hidden = cell.querySelectorAll(".h_feed:checked").length > 0;
+        }
+        drawConfigTopology();
+      };
+    });
   });
 }
 
-let hostSeq = 0;
-
 function nextHostId() {
-  const taken = new Set(Array.from(document.querySelectorAll("#hostRows .h_id"))
-    .map((el) => el.value));
-  let n = ++hostSeq;
-  while (taken.has("host" + n)) n = ++hostSeq;
-  return "host" + n;
+  return newCardId("host", "#hostRows .h_id", currentConfig && currentConfig.hosts);
 }
 
 function hostFromRow(tr) {
@@ -1186,7 +1314,10 @@ function applyNodeCheck(el, msg, n) {
   const input = el.querySelector(".h_name");
   const take = () => {
     input.value = n.suggestion;
-    updSum();
+    // el._updSum(), never a bare updSum(): this is a top-level function while updSum is a
+    // const scoped to addHostRow. The bare call threw a ReferenceError that testHost's
+    // catch then displayed *in place of* the successful test result.
+    if (el._updSum) el._updSum();
     drawConfigTopology();
   };
   if (!input.value.trim()) {
@@ -1376,19 +1507,35 @@ function renderShutdownSequence() {
 // ===== notifications =======================================================
 // One card per webhook, mirroring the UPS cards: several targets can be configured and
 // each is tested on its own.
-let webhookSeq = 0;
-
 function nextWebhookId() {
-  const taken = new Set(Array.from(document.querySelectorAll("#webhookList .w_id"))
-    .map((el) => el.value));
-  let n = ++webhookSeq;
-  while (taken.has("webhook" + n)) n = ++webhookSeq;
-  return "webhook" + n;
+  return newCardId("webhook", "#webhookList .w_id",
+                   currentConfig && (currentConfig.notifications || {}).webhooks);
 }
 
 function renderWebhooks(list) {
   $("webhookList").innerHTML = "";
   (list || []).forEach((w) => addWebhookCard(w, false));  // loaded cards start collapsed
+  updateWebhookDelivery();
+}
+
+// Mark every webhook card whose last delivery failed, from the current snapshot.
+//
+// Called both after rendering and from refreshStatus(), so the note tracks reality while
+// the settings page stays open — the same treatment the host chips on the dashboard get.
+function updateWebhookDelivery() {
+  const seen = (lastStatus && lastStatus.webhooks) || [];
+  document.querySelectorAll("#webhookList .ups-cfg").forEach((card) => {
+    const note = card.querySelector(".w_deliv");
+    const idEl = card.querySelector(".w_id");
+    if (!note || !idEl) return;
+    const state = seen.find((x) => x.id === idEl.value);
+    const failed = state && state.last_delivery_ok === false;
+    note.hidden = !failed;
+    note.innerHTML = failed
+      ? `${svgIcon("i-alert")}<span>${esc(t("notif.lastFailed",
+          { err: state.last_delivery_error || "?" }))}</span>`
+      : "";
+  });
 }
 
 function addWebhookCard(w, open) {
@@ -1398,9 +1545,18 @@ function addWebhookCard(w, open) {
   div.className = "ups-cfg";
   if (open !== false) div.open = true;
   const authPh = w.auth_header_value === SECRET_PLACEHOLDER ? t("cfg.unchanged") : "";
+  // A webhook that stopped working used to do so in complete silence — the shutdown
+  // credentials next door have had a self-test, a chip and an event for releases, while
+  // a failed notification reached journald and nowhere else.
+  //
+  // Rendered empty here and filled by updateWebhookDelivery() below, which also runs on
+  // every status poll: built once from lastStatus, the note could only ever show what
+  // was true at the moment the settings page was opened — a target that broke while the
+  // page was open stayed unmarked, and one that recovered stayed accused.
   div.innerHTML = `
     <summary class="cfg-head">${svgIcon("i-bell")}<span class="cfg-title w_sum_name"></span><span class="cfg-sub w_sum_url"></span></summary>
     <input type="hidden" class="w_id" value="${esc(id)}" />
+    <p class="warnnote w_deliv" hidden></p>
     <label class="switch" title="${esc(t("notif.webhookTitle"))}"><input type="checkbox" class="w_enabled" ${w.enabled ? "checked" : ""} /><span>${esc(t("notif.webhookEnabled"))}</span></label>
     <div class="row">
       <label title="${esc(t("notif.nameTitle"))}">${esc(t("cfg.name"))} <input class="w_name" value="${esc(w.name || "")}" placeholder="${esc(id)}" /></label>
@@ -1540,7 +1696,101 @@ function buildConfig() {
   };
 }
 
+// Cards that would be saved in a state that cannot work, with the reason to show for each.
+//
+// Two kinds. The first is what buildConfig() would silently DROP: its three filters
+// discard anything missing its one identifying field, and they used to do it in silence —
+// fill in a host's URL, token id and token secret, forget the node name, press Save,
+// "Saved ✓", and the card is gone (secret included) as soon as loadConfig() re-renders.
+//
+// The second is what it would happily KEEP although the shutdown can never reach it: a
+// host without an API URL or without a token id is stored, looks complete on the
+// dashboard, and only fails — at the next self-test if one runs, otherwise during the
+// outage. That is the whole failure mode this appliance exists to prevent, so it is
+// refused at the one moment the operator is looking at the field.
+//
+// The SECOND kind applies to enabled cards only. A disabled entry shuts nothing down —
+// ordered_hosts() skips it — so none of its fields can fail during an outage, and
+// demanding them would leave an installation upgrading from 4.0.0 (which stored such
+// entries quite happily) unable to save anything at all until it had filled in a host it
+// deliberately switched off. The FIRST kind still applies to every card: a nameless one
+// is discarded on save whether it is enabled or not, and losing a stored API token is
+// not something a checkbox should license.
+function incompleteCards() {
+  const bad = [];
+  // Ids already on disk. An empty secret field means "unchanged" for those, so only a card
+  // the backend has never seen can be judged on it — see hostFromRow(), which sends the
+  // placeholder for an empty field, and main._reconcile_secret(), which resolves that to
+  // the stored value or, for an unknown id, to "".
+  const stored = new Set((currentConfig.hosts || []).map((h) => h.id).filter(Boolean));
+  document.querySelectorAll("#hostRows .host-cfg").forEach((el, i) => {
+    const isNew = !stored.has(el.querySelector(".h_id").value);
+    const name = el.querySelector(".h_name").value.trim();
+    // What to call the card in the message. With eight of them "a host entry" is not an
+    // answer to "which one?" — the highlight scrolls to it, but the sentence should stand
+    // on its own in the save bar too.
+    const who = name || t("save.cardNo", { n: i + 1 });
+    if (!name) {
+      bad.push([el, t("save.needHostName", { who })]);
+      return;
+    }
+    if (!el.querySelector(".h_enabled").checked) return;
+    if (!el.querySelector(".h_url").value.trim()) {
+      bad.push([el, t("save.needHostUrl", { who })]);
+    } else if (!el.querySelector(".h_token_id").value.trim()) {
+      bad.push([el, t("save.needHostToken", { who })]);
+    } else if (isNew && !el.querySelector(".h_token_secret").value) {
+      // The same class as the two above, and the last one still open: a new host saved
+      // without a secret is stored with an empty one, looks complete on the dashboard and
+      // answers 401 — during the outage, because the node check reads that as "could not
+      // verify" and the self-test may be a day away.
+      bad.push([el, t("save.needHostSecret", { who })]);
+    }
+  });
+  document.querySelectorAll("#upsList .ups-cfg").forEach((el, i) => {
+    const u = upsFromCard(el);
+    const who = u.name || u.host || t("save.cardNo", { n: i + 1 });
+    // First kind: currentUpsList() drops a card with neither, so it would vanish on save.
+    if (!u.host && !u.name) {
+      bad.push([el, t("save.needUps", { who })]);
+      return;
+    }
+    // Second kind, the same class as the host fields above: what the card is missing here
+    // is not cosmetic but what makes it pollable at all. UpsBase.configured stays false
+    // without it, poll() answers "not configured", and the device is then permanently
+    // unreachable — which is an alarm AND, being fail safe, a standing refusal to shut
+    // down every host this UPS feeds. Silent until an outage, exactly like the host ones.
+    if (!u.host) {
+      bad.push([el, t("save.needUpsHost", { who })]);
+    } else if (u.type === "nut" && !u.ups_name) {
+      bad.push([el, t("save.needUpsName", { who })]);
+    }
+  });
+  // Every card, enabled or not — unlike the host block above, and deliberately so:
+  // currentWebhookList() discards a URL-less hook whatever its "enabled" state, so this is
+  // the "would be silently dropped" kind, which no checkbox licenses.
+  document.querySelectorAll("#webhookList .ups-cfg").forEach((el, i) => {
+    if (!el.querySelector(".w_url").value.trim()) {
+      const name = el.querySelector(".w_name").value.trim();
+      bad.push([el, t("save.needWebhookUrl",
+                      { who: name || t("save.cardNo", { n: i + 1 }) })]);
+    }
+  });
+  return bad;
+}
+
 $("saveBtn").onclick = async () => {
+  document.querySelectorAll(".invalid").forEach((el) => el.classList.remove("invalid"));
+  const bad = incompleteCards();
+  if (bad.length) {
+    bad.forEach(([el]) => {
+      el.classList.add("invalid");
+      if (el.tagName === "DETAILS") el.open = true;
+    });
+    bad[0][0].scrollIntoView({ block: "center", behavior: "smooth" });
+    $("saveMsg").textContent = "✗ " + bad[0][1];
+    return;
+  }
   $("saveMsg").textContent = t("msg.saving");
   try {
     currentConfig = await api("/api/config", "POST", buildConfig());

@@ -4,6 +4,7 @@ Run with:  pytest
 These tests need no UPS hardware and no network.
 """
 
+import os
 from datetime import datetime, timedelta, timezone
 from itertools import groupby
 
@@ -11,6 +12,7 @@ import pytest
 
 from app.config import (
     AppConfig,
+    Notifications,
     NutConfig,
     PbsHostConfig,
     PveHostConfig,
@@ -19,9 +21,11 @@ from app.config import (
     SnmpVersion,
     Thresholds,
     UpsThresholdOverride,
+    WebhookConfig,
     load_config,
     save_config,
 )
+from app import db
 from app.engine import ON_BATTERY, ONLINE, SHUTDOWN_PENDING, SHUTTING_DOWN, Engine
 from app.ups import UpsState
 
@@ -361,6 +365,97 @@ def test_config_ignores_legacy_smtp_key(tmp_path):
     assert raw["notifications"]["webhooks"][0]["id"]
 
 
+# --- out-of-range numbers are corrected, never rejected ------------------------------
+def test_a_stored_config_with_impossible_numbers_still_loads(tmp_path):
+    """The load path has no guard: rejecting would mean the service never starts again.
+
+    load_config() is called straight from the FastAPI lifespan and does not catch
+    ValidationError, so a Field(ge=...) here would turn one bad stored number into an
+    appliance that no longer comes up — a far worse failure than the number itself.
+    """
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+thresholds:
+  poll_interval_battery_s: -1
+  poll_interval_normal_s: 0
+  charge_below_percent: 150
+  host_shutdown_timeout_s: -30
+ups:
+  - id: u
+    type: snmp
+    host: 10.0.0.9
+    port: 0
+    timeout_s: -3
+""",
+        encoding="utf-8",
+    )
+    cfg = load_config(path)            # must not raise
+
+    assert cfg.thresholds.poll_interval_battery_s == 8      # back to the default
+    assert cfg.thresholds.poll_interval_normal_s == 30
+    assert cfg.thresholds.charge_below_percent == 30
+    assert cfg.thresholds.host_shutdown_timeout_s == 60
+    assert cfg.ups[0].port == 161
+    assert cfg.ups[0].timeout_s == 3.0
+    # And it is loud about every one of them.
+    lines = " ".join(cfg.value_corrections())
+    for field in ("poll_interval_battery_s", "charge_below_percent", "port", "timeout_s"):
+        assert field in lines
+
+
+def test_a_per_ups_override_is_bounded_at_both_ends_like_the_global_thresholds():
+    """The overrides used to be bounded only from below, while Thresholds was bounded at
+    both ends — so the correction this release advertises applied to every threshold
+    except the ones actually set per device, which is exactly where a slipped digit hides:
+    one card among several, and nothing else in the interface shows the number again."""
+    from app.config import UpsThresholdOverride
+
+    ov = UpsThresholdOverride(on_battery_seconds=999999, runtime_below_minutes=99999,
+                              comm_loss_shutdown_after_min=99999)
+    # Back to the field default, which for an override means "inherit the global value" —
+    # the safe direction: the estate-wide setting takes over rather than a number nobody
+    # chose staying in force.
+    assert ov.on_battery_seconds is None
+    assert ov.runtime_below_minutes is None
+    assert ov.comm_loss_shutdown_after_min is None
+    assert len(ov._corrections) == 3
+
+    # And it reaches the report the engine reads, in the same words as a global one.
+    cfg = AppConfig(ups=[SnmpConfig(
+        id="u", name="Rack A", host="10.0.0.9",
+        overrides=UpsThresholdOverride(on_battery_seconds=999999))])
+    lines = " ".join(cfg.value_corrections())
+    assert "override" in lines and "on_battery_seconds" in lines
+
+    # A value a real estate might use still passes untouched.
+    sane = UpsThresholdOverride(on_battery_seconds=900, runtime_below_minutes=15)
+    assert sane.on_battery_seconds == 900 and sane.runtime_below_minutes == 15
+    assert sane._corrections == []
+
+
+def test_a_healthy_config_reports_no_corrections():
+    assert AppConfig().value_corrections() == []
+    assert AppConfig(thresholds=Thresholds(charge_below_percent=0)).value_corrections() == []
+
+
+def test_none_means_off_and_is_never_corrected():
+    """Optional thresholds are switched off with None — that is not an out-of-range value."""
+    th = Thresholds(on_battery_seconds=None, runtime_below_minutes=None,
+                    charge_below_percent=None, comm_loss_shutdown_after_min=None)
+    assert th.on_battery_seconds is None
+    assert th._corrections == []
+
+
+def test_corrections_never_reach_the_saved_file(tmp_path):
+    """The bookkeeping is a private attribute: it must not turn into a config key."""
+    path = tmp_path / "config.yaml"
+    save_config(AppConfig(thresholds=Thresholds(poll_interval_battery_s=-1)), path)
+    text = path.read_text(encoding="utf-8")
+    assert "_corrections" not in text
+    assert "poll_interval_battery_s: 8" in text
+
+
 def test_default_config_missing_file_returns_defaults(tmp_path):
     cfg = load_config(tmp_path / "does-not-exist.yaml")
     assert cfg.configured is False
@@ -515,6 +610,209 @@ def test_trigger_on_battery_seconds_uses_own_timer():
     eng.ups_rt["u"].state = UpsState(reachable=True, power_source="battery")  # no UPS counter
     eng.ups_rt["u"].on_battery_since = datetime.now(timezone.utc) - timedelta(seconds=130)
     assert _reason(eng) is not None
+
+
+# --- issue #25: the device's own "time on battery" counter is not evidence -----------
+# Two failure directions, one rule. The counter is a duration the device *claims*; RFC 1628
+# defines upsSecondsOnBattery only while on battery and says nothing about the value on
+# mains, so a card that keeps the last transfer's figure breaks no rule. Believing it fired
+# shutdowns in the first poll of an outage; believing a permanent 0 disabled the time
+# trigger entirely. Our own measurement wins wherever we have one.
+def test_an_inherited_device_counter_does_not_fire_the_shutdown_instantly():
+    """Issue #25: a fresh outage must not inherit the previous one's length."""
+    eng = _ups_engine(Thresholds(on_battery_seconds=600, runtime_below_minutes=None,
+                                 charge_below_percent=None, on_battery_low=False))
+    # The card reports three days on battery at the very moment it switches to battery.
+    eng.ups_rt["u"].state = UpsState(reachable=True, power_source="battery",
+                                     seconds_on_battery=259200)
+    eng.ups_rt["u"].on_battery_since = datetime.now(timezone.utc)  # we just saw it happen
+    assert _reason(eng) is None
+    # ... and once *our* clock passes the threshold, it does fire.
+    eng.ups_rt["u"].on_battery_since = datetime.now(timezone.utc) - timedelta(seconds=601)
+    assert _reason(eng) is not None
+
+
+def test_a_counter_stuck_at_zero_does_not_disable_the_time_trigger():
+    """The mirror image: RFC 1628 mandates 0 on mains, some cards report it always."""
+    eng = _ups_engine(Thresholds(on_battery_seconds=120, runtime_below_minutes=None,
+                                 charge_below_percent=None, on_battery_low=False))
+    eng.ups_rt["u"].state = UpsState(reachable=True, power_source="battery",
+                                     seconds_on_battery=0)
+    eng.ups_rt["u"].on_battery_since = datetime.now(timezone.utc) - timedelta(seconds=130)
+    assert _reason(eng) is not None
+
+
+@pytest.mark.asyncio
+async def test_a_cold_start_into_a_running_outage_counts_from_zero():
+    """No timer of our own means we start at zero — never at the number the device claims.
+
+    Driven through _evaluate(), not through the helper: _evaluate_ups() sets
+    on_battery_since on the very poll that first sees the battery, so a test calling
+    _ups_elapsed_on_battery() directly can assert a branch the engine never reaches.
+    """
+    eng = _ups_engine(Thresholds(on_battery_seconds=120, runtime_below_minutes=None,
+                                 charge_below_percent=None, on_battery_low=False))
+    # The card claims five minutes on battery; our state file was unusable, so we have
+    # no measurement at all. Its claim is past the 120 s threshold — and irrelevant.
+    eng.ups_rt["u"].state = UpsState(reachable=True, power_source="battery",
+                                     seconds_on_battery=300)
+    await eng._evaluate()
+    rt = eng.ups_rt["u"]
+    assert rt.on_battery_since is not None          # our clock started with this poll
+    assert eng._ups_elapsed_on_battery(rt) < 5      # from zero, not from the card's 300
+    assert eng._ups_elapsed_source(rt) == "own"
+    assert not rt.triggered
+    assert eng.shutdown_triggered is False
+
+
+# --- the evidence behind a trigger ---------------------------------------------------
+# A reason line says what the engine concluded, never what it read, and the test button can
+# only answer about a later and different state. Without this an unexpected shutdown cannot
+# be reconstructed at all.
+def test_the_evidence_line_leads_with_the_values_a_post_mortem_starts_from():
+    st = UpsState(raw={"device.serial": "abc", "battery.charge": "12",
+                       "ups.status": "OB LB", "driver.version": "2.8"})
+    line = st.readable_raw()
+    assert line.startswith("ups.status=OB LB, battery.charge=12")
+    assert "device.serial=abc" in line
+
+
+def test_the_evidence_line_is_bounded():
+    """SNMP contributes a handful of OIDs; NUT hands back its whole LIST VAR answer, which
+    is fifty to ninety variables. That body reaches SQLite, the event table and the public
+    status endpoint, so it cannot be unbounded."""
+    st = UpsState(raw={f"var.{i:02d}": "x" * 20 for i in range(90)})
+    line = st.readable_raw()
+    assert len(line) <= 1000
+    assert "more)" in line
+    # An empty reading stays empty rather than becoming a stray "… (+0 more)".
+    assert UpsState().readable_raw() == ""
+
+
+def test_the_evidence_line_never_carries_a_secret():
+    """The evidence line is written into the event log, and /api/status serves 48 h of it
+    without authentication. NUT hands back its whole LIST VAR answer, and upsd publishes
+    each driver's configuration as driver.parameter.<name> -- which for a number of drivers
+    means a plaintext password or an SNMPv3 passphrase. Same rule, same reason as
+    notify.safe_error() masking a webhook URL, on the evidence path instead."""
+    from app.ups import SECRET_MASK
+
+    st = UpsState(raw={
+        "ups.status": "OB LB",
+        "driver.parameter.password": "hunter2",
+        "driver.parameter.authPassword": "hunter3",
+        "driver.parameter.community": "private",
+        "driver.parameter.port": "/dev/ttyUSB0",
+    })
+    line = st.readable_raw()
+    for secret in ("hunter2", "hunter3", "private"):
+        assert secret not in line
+    # Masked, not dropped: that the driver carries one is itself diagnostic information,
+    # and everything harmless stays readable.
+    assert f"driver.parameter.password={SECRET_MASK}" in line
+    assert "driver.parameter.port=/dev/ttyUSB0" in line
+
+
+def test_the_mask_does_not_swallow_the_bypass_readings():
+    """"bypass" contains "pass", and NUT publishes input.bypass.* as standard variables.
+
+    A bare "pass" in the key pattern therefore masked input.bypass.voltage, .frequency,
+    .current and .realpower — mains readings, in the one line that exists to record what
+    the device said when it fired a shutdown. Every spelling of an actual credential still
+    goes: erring towards masking is free here, erring the other way publishes one.
+    """
+    from app.ups import SECRET_MASK, redact_raw
+
+    safe = redact_raw({
+        "input.bypass.voltage": "230",
+        "input.bypass.frequency": "50.0",
+        "output.bypass.realpower": "180",
+        "driver.parameter.password": "hunter2",
+        "driver.parameter.privPassword": "hunter3",
+        "driver.parameter.community": "private",
+    })
+    assert safe["input.bypass.voltage"] == "230"
+    assert safe["input.bypass.frequency"] == "50.0"
+    assert safe["output.bypass.realpower"] == "180"
+    for key in ("driver.parameter.password", "driver.parameter.privPassword",
+                "driver.parameter.community"):
+        assert safe[key] == SECRET_MASK
+
+
+def test_nut_never_stores_a_secret_in_the_first_place():
+    """Redacted at the source as well, so every consumer of UpsState.raw inherits it --
+    the evidence line is only the path that reaches a public endpoint today."""
+    from app import nut
+    from app.ups import SECRET_MASK
+
+    st = UpsState()
+    nut._apply_variables(st, {
+        "ups.status": "OL",
+        "battery.charge": "100",
+        "driver.parameter.password": "hunter2",
+    })
+    assert st.raw["driver.parameter.password"] == SECRET_MASK
+    assert "hunter2" not in repr(st.raw)
+    # The mapping itself is unaffected: it reads standardised ups./battery. variables.
+    assert st.battery_charge_pct == 100
+    assert st.power_source == "mains"
+
+
+@pytest.mark.asyncio
+async def test_a_trigger_records_the_readings_that_caused_it():
+    eng = _ups_engine(Thresholds(on_battery_seconds=None, runtime_below_minutes=None,
+                                 charge_below_percent=None, on_battery_low=True))
+    logged: list[tuple[str, str]] = []
+    eng._log_quiet = lambda s, b, sev: logged.append((s, b))  # type: ignore[assignment]
+    _notify_recorder(eng)
+    eng.ups_rt["u"].state = UpsState(reachable=True, power_source="battery",
+                                     battery_status="low",
+                                     battery_status_detail="upsBasicBatteryStatus=3",
+                                     battery_charge_pct=11,
+                                     raw={"1.3.6.1.2.1.33.1.2.4": "11"})
+
+    await eng._evaluate()
+
+    body = next(b for s, b in logged if "armed the shutdown trigger" in s)
+    assert "upsBasicBatteryStatus=3" in body        # what the device actually said
+    assert "from own clock" in body                 # never "device"
+    assert "Readings:" in body
+
+    # Once, not on every poll of the same outage.
+    logged.clear()
+    await eng._evaluate()
+    assert not [s for s, _ in logged if "armed the shutdown trigger" in s]
+
+
+def test_the_elapsed_source_is_own_or_nothing():
+    """The device counter is never a source, whatever it says."""
+    eng = _ups_engine(Thresholds(on_battery_seconds=120))
+    for claimed in (300, 0, -1):
+        eng.ups_rt["u"].state = UpsState(reachable=True, power_source="battery",
+                                         seconds_on_battery=claimed)
+        eng.ups_rt["u"].on_battery_since = None
+        assert eng._ups_elapsed_on_battery(eng.ups_rt["u"]) is None
+        assert eng._ups_elapsed_source(eng.ups_rt["u"]) is None
+
+
+def test_seconds_on_battery_is_not_reported_while_the_ups_is_on_mains():
+    """Issue #25's second symptom: "on battery for days" on a UPS sitting on mains."""
+    eng = _ups_engine(Thresholds())
+    eng.ups_rt["u"].state = UpsState(reachable=True, power_source="mains",
+                                     seconds_on_battery=259200)
+    snap = eng._ups_snapshot(eng.cfg.ups_by_id("u"), eng.ups_rt["u"])
+    assert snap["seconds_on_battery"] is None
+    assert snap["elapsed_source"] is None
+
+
+def test_the_snapshot_names_which_clock_the_elapsed_time_came_from():
+    eng = _ups_engine(Thresholds())
+    eng.ups_rt["u"].state = UpsState(reachable=True, power_source="battery",
+                                     seconds_on_battery=259200)
+    eng.ups_rt["u"].on_battery_since = datetime.now(timezone.utc) - timedelta(seconds=42)
+    snap = eng._ups_snapshot(eng.cfg.ups_by_id("u"), eng.ups_rt["u"])
+    assert snap["elapsed_source"] == "own"
+    assert 40 <= snap["seconds_on_battery"] <= 45  # ours, not the card's three days
 
 
 def test_no_trigger_when_healthy():
@@ -755,6 +1053,377 @@ async def test_eligible_hosts_shut_down_this_host_last(monkeypatch):
     assert order == ["other", "self"]  # appliance host last
 
 
+# --- a failed shutdown is retried, but not forever ----------------------------------
+def _one_host_on_battery(**host_kw):
+    """Engine with one UPS already past its runtime threshold and one PVE host on it."""
+    th = Thresholds(on_battery_seconds=None, runtime_below_minutes=5,
+                    charge_below_percent=None, on_battery_low=False)
+    cfg = AppConfig(dry_run=False, ups=[SnmpConfig(id="a", host="10.0.0.1")],
+                    hosts=[PveHostConfig(name="pve01", api_url="x", ups_ids=["a"],
+                                         **host_kw)],
+                    thresholds=th)
+    eng = Engine(cfg)
+    eng.ups_rt["a"].state = UpsState(reachable=True, power_source="battery",
+                                     runtime_remaining_min=3)
+    return eng
+
+
+@pytest.mark.asyncio
+async def test_a_transient_failure_is_retried_on_the_next_poll(monkeypatch):
+    """One 503 must not cost the machine: it used to latch the host for the episode."""
+    from app import proxmox
+    calls: list[str] = []
+
+    async def fake_shutdown(host, timeout=60, **kw):
+        calls.append(host.name)
+        return len(calls) > 1, "HTTP 503" if len(calls) == 1 else "accepted"
+
+    monkeypatch.setattr(proxmox, "shutdown_node", fake_shutdown)
+    eng = _one_host_on_battery()
+    key = eng.cfg.hosts[0].key
+
+    await eng._evaluate()
+    assert eng.host_states[key]["shutdown_state"] == "failed"
+    assert eng.host_fired.get(key) is False        # not latched — try again
+    # The dashboard must still say a shutdown is under way while we retry.
+    assert eng.state == SHUTTING_DOWN
+
+    await eng._evaluate()
+    assert calls == ["pve01", "pve01"]
+    assert eng.host_states[key]["shutdown_state"] == "sent"
+    assert eng.host_fired.get(key) is True
+
+
+@pytest.mark.asyncio
+async def test_a_dead_host_is_given_up_on_after_the_capped_attempts(monkeypatch):
+    from app import proxmox
+    calls: list[str] = []
+
+    async def fake_shutdown(host, timeout=60, **kw):
+        calls.append(host.name)
+        return False, "no route to host"
+
+    monkeypatch.setattr(proxmox, "shutdown_node", fake_shutdown)
+    eng = _one_host_on_battery()
+    key = eng.cfg.hosts[0].key
+
+    for _ in range(6):
+        await eng._evaluate()
+
+    from app.engine import MAX_SHUTDOWN_ATTEMPTS
+    assert len(calls) == MAX_SHUTDOWN_ATTEMPTS   # and then quiet, not every 8 s forever
+    assert eng.host_fired.get(key) is True
+    assert eng.host_states[key]["shutdown_attempts"] == MAX_SHUTDOWN_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_a_sent_shutdown_is_never_sent_twice(monkeypatch):
+    """The other direction: success still latches on the first attempt."""
+    from app import proxmox
+    calls: list[str] = []
+
+    async def fake_shutdown(host, timeout=60, **kw):
+        calls.append(host.name)
+        return True, "accepted"
+
+    monkeypatch.setattr(proxmox, "shutdown_node", fake_shutdown)
+    eng = _one_host_on_battery()
+    for _ in range(4):
+        await eng._evaluate()
+    assert calls == ["pve01"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_host_releases_its_latch_when_mains_return(monkeypatch):
+    """It never went down, so "aborted" is the honest word once the outage ends."""
+    from app import proxmox
+
+    async def fake_shutdown(host, timeout=60, **kw):
+        return False, "HTTP 503"
+
+    monkeypatch.setattr(proxmox, "shutdown_node", fake_shutdown)
+    eng = _one_host_on_battery()
+    key = eng.cfg.hosts[0].key
+    for _ in range(4):
+        await eng._evaluate()
+    assert eng.host_fired.get(key) is True        # gave up
+
+    eng.ups_rt["a"].state = UpsState(reachable=True, power_source="mains",
+                                     runtime_remaining_min=60)
+    await eng._evaluate()
+    assert eng.host_fired.get(key) is False
+    assert eng.state == ONLINE
+
+
+@pytest.mark.asyncio
+async def test_a_host_that_never_went_down_is_not_filed_as_merely_aborted(monkeypatch):
+    """"No longer needed" is true for a withdrawn shutdown and false for a failed one.
+
+    Reading the second as the first is how an unfinished episode gets closed: the machine
+    is still running, and the only trace was a routine-sounding line."""
+    from app import proxmox
+
+    async def fake_shutdown(host, timeout=60, **kw):
+        return False, "HTTP 503"
+
+    monkeypatch.setattr(proxmox, "shutdown_node", fake_shutdown)
+    eng = _one_host_on_battery()
+    for _ in range(4):
+        await eng._evaluate()
+
+    events: list[tuple[str, str, str]] = []
+
+    async def rec(subject, body, severity):
+        events.append((subject, body, severity))
+
+    eng._emit = rec  # type: ignore[assignment]
+    eng.ups_rt["a"].state = UpsState(reachable=True, power_source="mains",
+                                     runtime_remaining_min=60)
+    await eng._evaluate()
+
+    aborted = [e for e in events if "shutdown aborted" in e[0]]
+    assert aborted, "the latch release still has to say something"
+    assert "still running" in aborted[0][1]
+    assert aborted[0][2] == "critical"   # not the routine wording, not the routine level
+
+
+@pytest.mark.asyncio
+async def test_mains_returning_between_two_attempts_still_closes_the_episode(monkeypatch):
+    """The gap the retry opened: a failure with attempts LEFT keeps host_fired False.
+
+    The release branch used to key on that latch alone, so an outage ending between two
+    attempts left "failed" sitting in host_states for good. _recompute_state counts that
+    as committed, so the appliance reported SHUTTING_DOWN with mains long back, wrote no
+    abort event at all, and _maybe_rearm could not clean up because nothing was latched.
+    Only "Reset state" or a restart got out of it."""
+    from app import proxmox
+
+    async def fake_shutdown(host, timeout=60, **kw):
+        return False, "HTTP 503"
+
+    monkeypatch.setattr(proxmox, "shutdown_node", fake_shutdown)
+    eng = _one_host_on_battery()
+    key = eng.cfg.hosts[0].key
+
+    await eng._evaluate()                       # exactly ONE failed attempt
+    assert eng.host_fired.get(key) is False     # retries left, so not latched
+    assert eng.host_states[key]["shutdown_state"] == "failed"
+
+    events = _notify_recorder(eng)
+    eng.ups_rt["a"].state = UpsState(reachable=True, power_source="mains",
+                                     runtime_remaining_min=60)
+    await eng._evaluate()
+
+    assert eng.state == ONLINE
+    assert "shutdown_state" not in eng.host_states[key]
+    assert eng.shutdown_triggered is False
+    # _notify_recorder records (subject, severity, body).
+    aborted = [e for e in events if "shutdown aborted" in e[0]]
+    assert aborted, "the machine is still running - that has to be said"
+    assert "still running" in aborted[0][2]
+    assert aborted[0][1] == "critical"
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_host_does_not_keep_the_episode_open(monkeypatch):
+    """host_states and host_fired are read wholesale, so a removed host used to linger.
+
+    _recompute_state scans every value and _evaluate_hosts ends the episode on
+    ``any(host_fired.values())`` - a host that had fired and was then deleted therefore
+    pinned SHUTTING_DOWN and shutdown_triggered, which stands down the self-test, both
+    startup checks and "Restore cluster"."""
+    from app import proxmox
+
+    async def fake_shutdown(host, timeout=60, **kw):
+        return True, "accepted"
+
+    monkeypatch.setattr(proxmox, "shutdown_node", fake_shutdown)
+    eng = _one_host_on_battery()
+    key = eng.cfg.hosts[0].key
+    await eng._evaluate()
+    assert eng.host_fired.get(key) is True
+    assert eng.state == SHUTTING_DOWN
+
+    # The host is removed while the appliance is still latched on it.
+    new_cfg = eng.cfg.model_copy(update={"hosts": []})
+    eng.update_config(new_cfg)
+    eng.ups_rt["a"].state = UpsState(reachable=True, power_source="mains",
+                                     runtime_remaining_min=60)
+    await eng._evaluate()
+
+    assert key not in eng.host_states and key not in eng.host_fired
+    assert eng.shutdown_triggered is False
+    assert eng.state == ONLINE
+
+
+def test_a_deleted_webhook_does_not_hand_its_failure_to_a_new_one():
+    """The delivery record is keyed by the webhook id, and an id can come back."""
+    from app import notify as notify_mod
+    from app.config import Notifications, WebhookConfig
+
+    cfg = AppConfig(notifications=Notifications(webhooks=[
+        WebhookConfig(id="webhook1", enabled=True, url="https://old")]))
+    eng = Engine(cfg)
+    notify_mod.DELIVERY["webhook1"] = {"ok": False, "at": "now", "error": "HTTP 401"}
+
+    # The old target is deleted and a new one happens to be given the same id.
+    eng.update_config(AppConfig(notifications=Notifications(webhooks=[])))
+    assert "webhook1" not in notify_mod.DELIVERY
+
+    eng.update_config(AppConfig(notifications=Notifications(webhooks=[
+        WebhookConfig(id="webhook1", enabled=True, url="https://new")])))
+    assert eng._webhook_snapshot()[0]["last_delivery_ok"] is None
+
+
+@pytest.mark.asyncio
+async def test_the_reserve_warning_sees_a_threshold_set_on_one_ups():
+    """The trigger is overridable per UPS, and an override is where a short reserve lands.
+
+    Reading only the global value said nothing about the one device configured to fire at
+    two minutes while the estate takes longer than that to shut down."""
+    from app.config import UpsThresholdOverride
+
+    cfg = AppConfig(
+        ups=[SnmpConfig(id="a", name="Rack A", host="10.0.0.1"),
+             SnmpConfig(id="b", name="Rack B", host="10.0.0.2",
+                        overrides=UpsThresholdOverride(runtime_below_minutes=1))],
+        hosts=[PveHostConfig(name="a", api_url="x", order=0),
+               PveHostConfig(name="b", api_url="x2", order=1)],
+        thresholds=Thresholds(runtime_below_minutes=30, host_shutdown_timeout_s=60),
+    )
+    eng = Engine(cfg)
+    events = _notify_recorder(eng)
+
+    await eng._warn_about_battery_reserve()
+
+    body = next((b for s, _, b in events if "battery reserve" in s.lower()), "")
+    assert body, "the override is the whole point of the warning"
+    assert "1 min" in body
+    assert "Rack B" in body, "name the field the operator has to go and change"
+
+
+@pytest.mark.asyncio
+async def test_an_earlier_stage_is_retried_before_the_appliance_powers_itself_off(
+    monkeypatch,
+):
+    """The retry is normally carried by the next poll — but no poll follows ``this_host``.
+
+    Without a pass before that final stage, the one case MAX_SHUTDOWN_ATTEMPTS exists for
+    (a 503 from a busy pveproxy) is exactly the case it could never reach: the appliance
+    shut itself down eight seconds before the retry was due."""
+    from app import proxmox
+    calls: list[str] = []
+
+    async def fake_shutdown(host, timeout=60, **kw):
+        calls.append(host.name)
+        # "other" fails once, then works; the appliance's own host always works.
+        if host.name == "other":
+            return calls.count("other") > 1, "HTTP 503"
+        return True, "accepted"
+
+    monkeypatch.setattr(proxmox, "shutdown_node", fake_shutdown)
+    cfg = AppConfig(
+        dry_run=False,
+        ups=[SnmpConfig(id="a", host="10.0.0.1")],
+        hosts=[
+            PveHostConfig(name="other", api_url="x", order=1, ups_ids=["a"]),
+            PveHostConfig(name="self", api_url="x", this_host=True, ups_ids=["a"]),
+        ],
+        thresholds=Thresholds(on_battery_seconds=None, runtime_below_minutes=5,
+                              charge_below_percent=None, on_battery_low=False),
+    )
+    eng = Engine(cfg)
+    eng.ups_rt["a"].state = UpsState(reachable=True, power_source="battery",
+                                     runtime_remaining_min=3)
+
+    await eng._evaluate()
+
+    # The retry happens in the SAME sweep, and still before the appliance's own host.
+    assert calls == ["other", "other", "self"]
+    assert eng.host_fired[cfg.hosts[0].key] is True
+    assert eng.host_states[cfg.hosts[0].key]["shutdown_state"] == "sent"
+
+
+# --- one sick source must not freeze the engine -------------------------------------
+def test_the_poll_budget_leaves_room_for_a_legitimate_slow_read():
+    """The bound is a backstop, not a tightening of the source's own timeouts.
+
+    SNMP in "auto" mode may issue two sequential GETs, each costing
+    timeout_s x (retries + 1) — about 12 s with the defaults, against an 8 s battery
+    interval, and perfectly healthy. Cutting the poll off at the interval would report a
+    working UPS as unreachable, which is an alarm and a refusal to shut down.
+    """
+    from app.sources import poll_budget_s
+    assert poll_budget_s(SnmpConfig(id="u", host="h")) >= 12
+    assert poll_budget_s(NutConfig(id="n", host="h", ups_name="ups")) >= 8
+
+
+@pytest.mark.asyncio
+async def test_a_hanging_source_is_cut_off_rather_than_stalling_the_loop(monkeypatch):
+    """Everything else — countdowns, eligibility, the staged shutdown — waits behind this."""
+    import asyncio as _asyncio
+    from app import sources
+
+    monkeypatch.setattr(sources, "POLL_GRACE_S", 0.05)
+    monkeypatch.setattr(sources, "poll_budget_s", lambda cfg: 0.05)
+
+    async def hang(cfg):
+        await _asyncio.sleep(30)
+
+    monkeypatch.setattr(sources.ups, "poll", hang)
+    state = await sources.poll(SnmpConfig(id="u", host="10.0.0.9"))
+
+    assert state.reachable is False          # unreachable = alarm, never a shutdown
+    assert "No answer within" in (state.error or "")
+
+
+@pytest.mark.asyncio
+async def test_a_source_that_raises_becomes_unreachable_not_an_exception(monkeypatch):
+    from app import sources
+
+    async def boom(cfg):
+        raise RuntimeError("driver exploded")
+
+    monkeypatch.setattr(sources.ups, "poll", boom)
+    state = await sources.poll(SnmpConfig(id="u", host="10.0.0.9"))
+    assert state.reachable is False
+    assert "driver exploded" in (state.error or "")
+
+
+@pytest.mark.asyncio
+async def test_a_raising_stage_does_not_cost_the_stages_behind_it(monkeypatch):
+    """Including the last one, which is the appliance's own host.
+
+    Without return_exceptions the throw propagates out of _evaluate(), so every later
+    stage is skipped and _recompute_state()/_persist_state() never run for that poll.
+    """
+    fired: list[str] = []
+    eng = Engine(AppConfig(
+        dry_run=False,
+        ups=[SnmpConfig(id="a", host="10.0.0.1")],
+        hosts=[
+            PveHostConfig(name="other", api_url="x", order=1, ups_ids=["a"]),
+            PveHostConfig(name="self", api_url="x", this_host=True, ups_ids=["a"]),
+        ],
+        thresholds=Thresholds(on_battery_seconds=None, runtime_below_minutes=5,
+                              charge_below_percent=None, on_battery_low=False),
+    ))
+    eng.ups_rt["a"].state = UpsState(reachable=True, power_source="battery",
+                                     runtime_remaining_min=3)
+
+    async def fire(host, reason):
+        if host.name == "other":
+            raise RuntimeError("something in the first stage broke")
+        fired.append(host.name)
+
+    eng._fire_host = fire  # type: ignore[assignment]
+    await eng._evaluate()
+
+    assert fired == ["self"], "the appliance's own host must still be told to go"
+    # The host that threw was never recorded as handled, so the next poll picks it up.
+    assert eng.host_fired.get(eng.cfg.hosts[0].key) is False
+
+
 @pytest.mark.asyncio
 async def test_per_ups_override_changes_only_that_ups():
     th = Thresholds(on_battery_seconds=None, runtime_below_minutes=5,
@@ -833,7 +1502,11 @@ async def test_dry_run_latches_and_does_not_shutdown():
                     hosts=[PveHostConfig(name="pve01", api_url="x", ups_ids=["u"])],
                     thresholds=th)
     eng = Engine(cfg)
-    eng.ups_rt["u"].state = UpsState(reachable=True, power_source="battery", seconds_on_battery=10)
+    eng.ups_rt["u"].state = UpsState(reachable=True, power_source="battery")
+    # Our own clock, not a device counter: the engine measures the outage itself now
+    # (see _ups_elapsed_on_battery), so the outage starts in the past rather than the UPS
+    # being handed a "10 s on battery" it could just as well have inherited.
+    eng.ups_rt["u"].on_battery_since = datetime.now(timezone.utc) - timedelta(seconds=10)
     await eng._evaluate()  # enters ON_BATTERY + fires dry-run
     assert eng.shutdown_triggered is True
     assert eng.host_fired.get("pve:pve01") is True
@@ -1149,8 +1822,23 @@ async def test_latched_trigger_persists_across_restart():
     reason = eng1.ups_rt["u"].trigger_reason
     assert reason
 
-    # "Restart": the latch is re-armed together with the battery timer.
+    # "Restart": the timer comes back, but the latch is HELD until a poll of this process
+    # answers. Restoring rt.triggered straight from the file made the latch bypass every
+    # freshness check there is — the unreachable branch never re-derives a trigger that is
+    # already set, so a latch read off disk fired on the first poll after a boot whatever
+    # the device said, or whether it said anything at all.
     eng2 = Engine(cfg)
+    assert eng2.ups_rt["u"].restored_unconfirmed is True
+    assert eng2.ups_rt["u"].triggered is False
+    eng2.ups_rt["u"].state = UpsState(reachable=False, error="timeout")
+    await eng2._evaluate()
+    assert eng2.ups_rt["u"].triggered is False
+    assert eng2.shutdown_triggered is False
+
+    # The confirming poll re-arms it from fresh data, with the same reason.
+    eng2.ups_rt["u"].state = UpsState(reachable=True, power_source="battery",
+                                      battery_charge_pct=20)
+    await eng2._evaluate()
     assert eng2.ups_rt["u"].triggered is True
     assert eng2.ups_rt["u"].trigger_reason == reason
 
@@ -1457,13 +2145,22 @@ async def test_battery_timer_persists_and_restores_across_restart():
     assert since is not None
     assert engine_mod.STATE_PATH.exists()  # timer was persisted
 
-    # "Restart": a fresh engine restores the timer, and the blind countdown (UPS now
-    # unreachable) keeps running and fires once it elapses.
+    # "Restart": a fresh engine restores the timer, but HOLDS it until one poll of this
+    # process has answered — nothing read off disk fires on its own (see
+    # _UpsRuntime.restored_unconfirmed).
     eng2 = Engine(cfg)
     assert eng2.ups_rt["u"].on_battery_since == since
+    assert eng2.ups_rt["u"].restored_unconfirmed is True
     eng2.ups_rt["u"].on_battery_since = since - timedelta(seconds=700)
     eng2.ups_rt["u"].state = UpsState(reachable=False, error="timeout")
     await eng2._evaluate()
+    assert eng2.shutdown_triggered is False
+
+    # One answer confirming the outage is still running releases it, and the blind
+    # countdown then fires on the FULL restored elapsed time — the restart costs nothing.
+    eng2.ups_rt["u"].state = UpsState(reachable=True, power_source="battery")
+    await eng2._evaluate()
+    assert eng2.ups_rt["u"].restored_unconfirmed is False
     assert eng2.shutdown_triggered is True
 
 
@@ -1481,6 +2178,187 @@ async def test_battery_timer_state_file_cleared_on_mains():
     eng.ups_rt["u"].state = UpsState(reachable=True, power_source="mains")
     await eng._evaluate()
     assert _json.loads(engine_mod.STATE_PATH.read_text())["on_battery_since"] == {}
+
+
+@pytest.mark.asyncio
+async def test_a_restored_timer_does_not_shut_down_a_silent_ups():
+    """The reported failure: healthy hosts shut down again right after an outage.
+
+    The appliance shuts its OWN host down last, so every outage ends with this process
+    being restarted — and finding a state file that says "on battery since T0". If the UPS
+    then misses the very first poll after that boot (a switch still converging, an SNMP
+    card still coming up), the blind countdown read hours of restored elapsed time against
+    the default 600 s threshold and shut the machines that had just come back up down
+    again, during normal operation, before the device had said a single word.
+
+    Defaults throughout, because that is the point: keep_shutdown_on_comm_loss is on and
+    on_battery_seconds is 600 out of the box.
+    """
+    from app import engine as engine_mod
+    import json as _json
+
+    cfg = AppConfig(
+        dry_run=False,
+        ups=[SnmpConfig(id="u", host="10.0.0.9")],
+        hosts=[PveHostConfig(id="h", name="pve01", api_url="https://10.0.0.10:8006",
+                             token_id="ups@pve!s", token_secret="sec", ups_ids=["u"])],
+    )
+    assert cfg.thresholds.keep_shutdown_on_comm_loss is True
+    assert cfg.thresholds.on_battery_seconds == 600
+
+    since = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    engine_mod.STATE_PATH.write_text(
+        _json.dumps({"on_battery_since": {"u": since},
+                     "trigger_reason": {"u": "charge 20% <= 30%"}}),
+        encoding="utf-8",
+    )
+
+    eng = Engine(cfg)
+    assert eng.ups_rt["u"].on_battery_since is not None  # the timer itself is kept
+    assert eng.ups_rt["u"].restored_unconfirmed is True
+    assert eng.ups_rt["u"].triggered is False            # ...but nothing is armed by it
+
+    eng.ups_rt["u"].state = UpsState(reachable=False, error="timeout")
+    assert eng._ups_trigger_reason(cfg.ups[0], eng.ups_rt["u"]) is None
+    assert eng._host_trigger_reason(cfg.hosts[0]) is None
+    # And no countdown is ticked toward a shutdown that cannot happen.
+    assert eng._ups_countdown_remaining_s(cfg.ups[0], eng.ups_rt["u"]) is None
+
+    fired: list = []
+    eng._fire_host = lambda h, r: fired.append(h.name)  # type: ignore[assignment]
+    await eng._evaluate()
+    assert fired == []
+    assert eng.shutdown_triggered is False
+
+
+@pytest.mark.asyncio
+async def test_a_held_timer_does_not_stand_the_housekeeping_down_for_ever():
+    """The other half of the hold, and the one that locks the operator out.
+
+    Five places stand down "while an outage is running": both startup checks, the
+    scheduled self-test, the manual one and "Restore cluster". A restored timer sets
+    on_battery_since and keeps it until the UPS answers — so a UPS that never answers
+    again meant "an outage is running" for ever.
+
+    That is exactly the state after a real cluster shutdown: the appliance powers its own
+    host off last, comes back, and the UPS management card is still down. The cluster
+    startup check then never ran, so cluster_states stayed empty and the "Restore cluster"
+    button stayed hidden — and the button was the only thing the operator needed.
+
+    Nothing is risked by letting them run: a held timer cannot fire a shutdown either, so
+    there is no countdown for a self-test to delay.
+    """
+    from app import engine as engine_mod
+    import json as _json
+
+    since = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    engine_mod.STATE_PATH.write_text(
+        _json.dumps({"on_battery_since": {"u": since}}), encoding="utf-8")
+    eng = Engine(AppConfig(
+        ups=[SnmpConfig(id="u", name="Rack A", host="10.0.0.9")],
+        hosts=[PveHostConfig(id="h", name="pve01", api_url="https://10.0.0.10:8006",
+                             token_id="ups@pve!s", token_secret="sec", ups_ids=["u"])]))
+    rt = eng.ups_rt["u"]
+    rt.state = UpsState(reachable=False, error="timeout")
+    assert rt.restored_unconfirmed is True and rt.on_battery_since is not None
+
+    # Unconfirmed: the housekeeping runs, and so does the button behind restore_clusters().
+    assert eng._outage_in_progress() is False
+
+    # A confirmed outage still stands everything down — that half is the whole point.
+    rt.restored_unconfirmed = False
+    assert eng._outage_in_progress() is True
+    rt.state = UpsState(reachable=True, power_source="battery")
+    assert eng._outage_in_progress() is True
+
+    # As does a shutdown episode, whatever the UPS is saying.
+    eng.ups_rt["u"] = engine_mod._UpsRuntime()
+    eng.shutdown_triggered = True
+    assert eng._outage_in_progress() is True
+
+
+@pytest.mark.asyncio
+async def test_the_unreachable_alarm_does_not_promise_a_held_countdown():
+    """The alarm text has three neighbouring cases and the held one is none of them.
+
+    "The countdown keeps running, shutdown when it expires" is a promise that will not be
+    kept while the timer is held; "NO shutdown will be triggered" would hide a timer that
+    is still there and re-arms in full the moment the device speaks.
+    """
+    from app import engine as engine_mod
+    import json as _json
+
+    since = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    engine_mod.STATE_PATH.write_text(
+        _json.dumps({"on_battery_since": {"u": since}}), encoding="utf-8")
+    eng = Engine(AppConfig(
+        ups=[SnmpConfig(id="u", name="Rack A", host="10.0.0.9")],
+        thresholds=Thresholds(unreachable_alarm_after_polls=1)))
+    events = _notify_recorder(eng)
+
+    eng.ups_rt["u"].state = UpsState(reachable=False, error="timeout")
+    await eng._evaluate()
+
+    alarms = [(s, b) for s, _sev, b in events if "unreachable" in s]
+    assert len(alarms) == 1
+    subject, body = alarms[0]
+    assert "on hold" in subject
+    assert "shutdown when it expires" not in body
+    assert "NO shutdown will be triggered" not in body
+    assert "re-arms in full" in body
+
+
+@pytest.mark.asyncio
+async def test_a_restored_timer_is_released_by_mains_and_by_battery():
+    """The two answers that end the hold, and what each of them means.
+
+    Mains: the outage is over, everything restored is dropped. Battery: it is still
+    running, and the trigger is derived from the FULL restored elapsed time on that very
+    poll — so a service restart mid-outage, where the UPS is reachable by definition,
+    costs nothing at all.
+    """
+    from app import engine as engine_mod
+    import json as _json
+
+    def _engine():
+        since = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+        engine_mod.STATE_PATH.write_text(
+            _json.dumps({"on_battery_since": {"u": since}}), encoding="utf-8")
+        return Engine(AppConfig(dry_run=True, ups=[SnmpConfig(id="u", host="10.0.0.9")]))
+
+    on_mains = _engine()
+    on_mains.ups_rt["u"].state = UpsState(reachable=True, power_source="mains")
+    await on_mains._evaluate()
+    assert on_mains.ups_rt["u"].restored_unconfirmed is False
+    assert on_mains.ups_rt["u"].on_battery_since is None
+    assert on_mains.ups_rt["u"].triggered is False
+
+    still_out = _engine()
+    still_out.ups_rt["u"].state = UpsState(reachable=True, power_source="battery")
+    await still_out._evaluate()
+    assert still_out.ups_rt["u"].restored_unconfirmed is False
+    # The restored three hours are honoured in full, not restarted from zero.
+    assert still_out._ups_elapsed_on_battery(still_out.ups_rt["u"]) > 3 * 3600 - 60
+    assert still_out.ups_rt["u"].triggered is True
+
+
+def test_the_elapsed_source_says_when_it_is_unconfirmed():
+    """/api/status has to distinguish "we measured this" from "we measured this and have
+    not been able to check it since" — the number is real either way, the conclusion is
+    not."""
+    from app import engine as engine_mod
+    import json as _json
+
+    since = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    engine_mod.STATE_PATH.write_text(
+        _json.dumps({"on_battery_since": {"u": since}}), encoding="utf-8")
+    eng = Engine(AppConfig(ups=[SnmpConfig(id="u", host="10.0.0.9")]))
+    eng.ups_rt["u"].state = UpsState(reachable=False, error="timeout")
+
+    snap = eng.snapshot()["ups"][0]
+    assert snap["elapsed_source"] == "own-unconfirmed"
+    assert snap["seconds_on_battery"] is not None
+    assert snap["countdown_remaining_s"] is None
 
 
 def test_stale_battery_timer_is_not_restored():
@@ -1845,6 +2723,289 @@ def test_a_device_answering_no_object_of_the_mib_counts_as_unreachable():
     assert state.reachable is False
     assert state.on_battery is False        # unreachable is an alarm, never a shutdown
     assert "implements none of the APC PowerNet objects" in state.error
+
+
+def test_a_reading_without_a_usable_power_source_counts_as_unreachable():
+    """Other objects answer, the one that decides the state machine does not.
+
+    ``on_battery`` is ``power_source == "battery"``, so an unresolved source reads as
+    MAINS — the one fail-dangerous default in the engine. app/nut.py has always refused
+    this (no ups.status -> unreachable); the SNMP path did not.
+    """
+    from pysnmp.proto import rfc1905
+    from pysnmp.proto.rfc1902 import Integer
+
+    from app import ups
+
+    # RFC 1628: upsOutputSource simply absent, the charge answers perfectly well.
+    absent = ups.UpsState()
+    ups._map_state(absent, ups.RFC1628, {
+        ups.OID_OUTPUT_SOURCE: rfc1905.noSuchObject,
+        ups.OID_CHARGE_REMAINING: Integer(55),
+    })
+    assert absent.reachable is False and absent.on_battery is False
+    assert "upsOutputSource" in absent.error
+
+    # APC: the object answers, with unknown(1) — mapped to "unknown", not to a source.
+    unknown = ups.UpsState()
+    ups._map_state(unknown, ups.APC, {
+        ups.OID_APC_OUTPUT_STATUS: Integer(1),
+        ups.OID_APC_CAPACITY: Integer(42),
+    })
+    assert unknown.reachable is False and unknown.on_battery is False
+    assert "upsBasicOutputStatus" in unknown.error
+
+    # And the normal case is untouched: a source that resolves stays reachable.
+    ok = ups.UpsState()
+    ups._map_state(ok, ups.APC, {ups.OID_APC_OUTPUT_STATUS: Integer(3)})
+    assert ok.reachable is True and ok.on_battery is True
+
+
+@pytest.mark.asyncio
+async def test_an_unresolved_power_source_does_not_end_a_running_outage():
+    """The engine consequence of the reading above, which is where it hurt.
+
+    Mid-outage such a poll used to take the mains branch: the on-battery timer was
+    cleared, a latched trigger dropped and the event log said "mains power restored" —
+    on a UPS that had reported nothing of the sort.
+    """
+    from pysnmp.proto.rfc1902 import Integer
+
+    from app import ups
+
+    cfg = AppConfig(
+        dry_run=True,
+        ups=[SnmpConfig(id="a", name="UPS-A", host="10.0.0.9")],
+        hosts=[PveHostConfig(name="pve01", api_url="https://x:8006", ups_ids=["a"])],
+        thresholds=Thresholds(on_battery_seconds=600, runtime_below_minutes=None,
+                              charge_below_percent=None, on_battery_low=True,
+                              unreachable_alarm_after_polls=1),
+    )
+    eng = Engine(cfg)
+    rt = eng.ups_rt["a"]
+
+    rt.state = UpsState(reachable=True, power_source="battery", battery_status="normal")
+    await eng._evaluate()
+    assert eng.state == ON_BATTERY and rt.on_battery_since is not None
+    started = rt.on_battery_since
+
+    blind = ups.UpsState()
+    ups._map_state(blind, ups.APC, {ups.OID_APC_OUTPUT_STATUS: Integer(1)})
+    rt.state = blind
+    await eng._evaluate()
+
+    # The outage is still on, the timer never restarted, and it is an alarm.
+    assert eng.state == ON_BATTERY
+    assert rt.on_battery_since == started
+    assert rt.alarm_active is True
+
+
+def test_an_unusable_reading_is_still_an_answer():
+    """``reachable`` and ``answered`` are two questions, and only one of them is "silent".
+
+    Both branches that end in reachable=False here were reached by an agent that replied:
+    one named no usable power source, the other implemented none of the profile's objects.
+    Neither is a communication loss — which matters because a communication loss is a
+    shutdown trigger (see the opt-in below).
+    """
+    from pysnmp.proto import rfc1905
+    from pysnmp.proto.rfc1902 import Integer
+
+    from app import ups
+
+    no_source = ups.UpsState()
+    ups._map_state(no_source, ups.APC, {ups.OID_APC_OUTPUT_STATUS: Integer(1)})
+    assert no_source.reachable is False and no_source.answered is True
+
+    nothing = ups.UpsState()
+    ups._map_state(nothing, ups.APC,
+                   {oid: rfc1905.noSuchInstance for oid in ups.APC.oids})
+    assert nothing.reachable is False and nothing.answered is True
+
+    # A device that never spoke: the poller returns a bare state, and that one IS silence.
+    assert ups.UpsState(error="timeout").answered is False
+
+
+def test_rfc1628_other_is_read_as_no_verdict_not_as_mains():
+    """upsOutputSource other(1) is the MIB's own "none of the below" — i.e. unknown.
+
+    Mapped to a source it was simply "not battery", so a card falling back to it mid-outage
+    cleared the timer and logged "mains power restored". The APC enum keeps its own
+    "other" for rebooting(8), which is a definite state.
+    """
+    from pysnmp.proto.rfc1902 import Integer
+
+    from app import ups
+
+    state = ups.UpsState()
+    ups._map_state(state, ups.RFC1628, {
+        ups.OID_OUTPUT_SOURCE: Integer(1),
+        ups.OID_CHARGE_REMAINING: Integer(88),
+    })
+    assert state.power_source == "unknown"
+    assert state.reachable is False and state.on_battery is False
+    assert ups._APC_OUTPUT_STATUS[8] == "other"  # unchanged, deliberately
+
+
+@pytest.mark.asyncio
+async def test_a_device_that_answers_never_triggers_the_pure_comms_loss_shutdown():
+    """The opt-in shuts the estate down on SILENCE, and an answer is not silence.
+
+    A card that replies but names no usable power source is reachable=False — correctly,
+    the state machine has nothing to go on. Reading that as a communication loss fired a
+    real shutdown during normal operation, minutes after the threshold, on a device that
+    had never stopped talking.
+    """
+    from pysnmp.proto.rfc1902 import Integer
+
+    from app import ups
+
+    cfg = AppConfig(
+        dry_run=True,
+        ups=[SnmpConfig(id="a", name="UPS-A", host="10.0.0.9")],
+        hosts=[PveHostConfig(name="pve01", api_url="https://x:8006", ups_ids=["a"])],
+        thresholds=Thresholds(on_battery_seconds=None, runtime_below_minutes=None,
+                              charge_below_percent=None, on_battery_low=True,
+                              unreachable_alarm_after_polls=1,
+                              comm_loss_shutdown_after_min=1),
+    )
+    eng = Engine(cfg)
+    rt = eng.ups_rt["a"]
+
+    answering = ups.UpsState()
+    ups._map_state(answering, ups.APC, {ups.OID_APC_OUTPUT_STATUS: Integer(1)})
+    rt.state = answering
+    await eng._evaluate()
+    # Long past the threshold on the wall clock the opt-in measures.
+    rt.unreachable_since = datetime.now(timezone.utc) - timedelta(minutes=5)
+    await eng._evaluate()
+
+    assert rt.triggered is False and rt.trigger_reason is None
+    assert eng.shutdown_triggered is False
+    # And no countdown is advertised for a shutdown that deliberately never comes.
+    assert eng._ups_comm_loss_remaining_s(cfg.ups[0], rt) is None
+    assert rt.alarm_active is True  # still an alarm, that half is unchanged
+
+    # A device that really is silent still arms it — the opt-in itself is untouched.
+    rt.state = UpsState(error="timeout")
+    rt.unreachable_since = datetime.now(timezone.utc) - timedelta(minutes=5)
+    await eng._evaluate()
+    assert rt.triggered is True and "communication lost" in rt.trigger_reason
+
+
+@pytest.mark.asyncio
+async def test_a_nut_status_naming_no_power_source_does_not_end_a_running_outage():
+    """The NUT half of the reading above — the two sources have to agree.
+
+    A missing ``ups.status`` was always refused, but a status that is *present* and names
+    neither OL nor OB (an empty value, CHRG, ALARM, a driver's intermediate state during a
+    transfer) left power_source "unknown" while staying reachable. ``on_battery`` is
+    ``power_source == "battery"``, so that fell into the MAINS branch: mid-outage it
+    cleared the timer, dropped a latched trigger and logged "mains power restored".
+    """
+    from app import nut
+
+    cfg = AppConfig(
+        dry_run=True,
+        ups=[NutConfig(id="a", name="UPS-A", host="10.0.0.9", ups_name="ups")],
+        hosts=[PveHostConfig(name="pve01", api_url="https://x:8006", ups_ids=["a"])],
+        thresholds=Thresholds(on_battery_seconds=600, runtime_below_minutes=None,
+                              charge_below_percent=None, on_battery_low=True,
+                              unreachable_alarm_after_polls=1),
+    )
+    eng = Engine(cfg)
+    rt = eng.ups_rt["a"]
+
+    rt.state = UpsState(reachable=True, power_source="battery", battery_status="normal")
+    await eng._evaluate()
+    assert eng.state == ON_BATTERY and rt.on_battery_since is not None
+    started = rt.on_battery_since
+
+    blind = UpsState()
+    nut._apply_variables(blind, {"ups.status": "ALARM", "battery.charge": "44"})
+    assert blind.reachable is False and blind.answered is True
+    rt.state = blind
+    await eng._evaluate()
+
+    assert eng.state == ON_BATTERY
+    assert rt.on_battery_since == started
+    assert rt.alarm_active is True
+
+
+@pytest.mark.asyncio
+async def test_a_nut_server_that_answers_err_never_triggers_the_comms_loss_shutdown():
+    """upsd replying ERR DATA-STALE is talking to us; the opt-in fires on silence only.
+
+    The NUT sibling of the SNMP case above. A wedged driver, a wrong password or a
+    mistyped ups_name reaches the poller as a protocol error — an answer — and reading it
+    as a communication loss shut the whole estate down during normal operation.
+    """
+    from app import nut
+
+    cfg = AppConfig(
+        dry_run=True,
+        ups=[NutConfig(id="a", name="UPS-A", host="10.0.0.9", ups_name="ups")],
+        hosts=[PveHostConfig(name="pve01", api_url="https://x:8006", ups_ids=["a"])],
+        thresholds=Thresholds(on_battery_seconds=None, runtime_below_minutes=None,
+                              charge_below_percent=None, on_battery_low=True,
+                              unreachable_alarm_after_polls=1,
+                              comm_loss_shutdown_after_min=1),
+    )
+    eng = Engine(cfg)
+    rt = eng.ups_rt["a"]
+
+    stale = UpsState(error=str(nut._NutError("DATA-STALE")), answered=True)
+    rt.state = stale
+    await eng._evaluate()
+    rt.unreachable_since = datetime.now(timezone.utc) - timedelta(minutes=5)
+    await eng._evaluate()
+
+    assert rt.triggered is False and rt.trigger_reason is None
+    assert eng.shutdown_triggered is False
+    assert eng._ups_comm_loss_remaining_s(cfg.ups[0], rt) is None
+    assert rt.alarm_active is True  # still an alarm
+
+
+@pytest.mark.asyncio
+async def test_an_unpollable_ups_never_triggers_the_comms_loss_shutdown():
+    """An entry with no address is silent by construction — and has produced no evidence.
+
+    poll() returns "not configured" without touching the network, so such a UPS is
+    unreachable and silent for ever. The appliance calls exactly that state fail safe ("a
+    standing refusal to shut down every host it feeds"), and with the opt-in on it did the
+    opposite: a configuration mistake, a backup import or a hand-edited config.yaml shut
+    down every host the entry feeds, minutes later, during normal operation, without a
+    single packet having been sent.
+    """
+    cfg = AppConfig(
+        dry_run=True,
+        ups=[SnmpConfig(id="a", name="UPS-A", host="")],  # never pollable
+        hosts=[PveHostConfig(name="pve01", api_url="https://x:8006", ups_ids=["a"])],
+        thresholds=Thresholds(on_battery_seconds=None, runtime_below_minutes=None,
+                              charge_below_percent=None, on_battery_low=True,
+                              unreachable_alarm_after_polls=1,
+                              comm_loss_shutdown_after_min=1),
+    )
+    assert cfg.incomplete_ups(cfg.ups[0])  # the premise of this test
+    eng = Engine(cfg)
+    rt = eng.ups_rt["a"]
+
+    rt.state = UpsState(error="SNMP not configured")
+    await eng._evaluate()
+    rt.unreachable_since = datetime.now(timezone.utc) - timedelta(minutes=5)
+    await eng._evaluate()
+
+    assert rt.triggered is False and rt.trigger_reason is None
+    assert eng.shutdown_triggered is False
+    assert eng._ups_comm_loss_remaining_s(cfg.ups[0], rt) is None
+    assert rt.alarm_active is True
+
+    # Completing the entry restores the opt-in: this guard is about the missing address,
+    # not about switching the feature off.
+    cfg.ups[0].host = "10.0.0.9"
+    rt.unreachable_since = datetime.now(timezone.utc) - timedelta(minutes=5)
+    await eng._evaluate()
+    assert rt.triggered is True and "communication lost" in rt.trigger_reason
 
 
 def test_probe_entry_interprets_apc_values():
@@ -2365,12 +3526,58 @@ async def test_run_selftest_queries_hosts_concurrently_and_damps_success_events(
 
 
 @pytest.mark.asyncio
+async def test_one_raising_host_does_not_take_the_self_test_round_with_it(monkeypatch):
+    """targets.test_connection() is total in practice; the round makes that structural.
+
+    Without return_exceptions one host that manages to raise aborts the whole gather: every
+    other host keeps a stale verdict, no failure event is written for any of them, and the
+    exception travels up into _loop()'s catch-all, which costs the iteration its
+    housekeeping as well. _fire_stage() already guards the shutdown stages this way."""
+    from app import db, engine as engine_mod
+    from app.proxmox import TestResult
+
+    monkeypatch.setattr(engine_mod, "_local_now", lambda: datetime(2026, 7, 25, 10, 0))
+    eng = Engine(AppConfig(hosts=[
+        PveHostConfig(name="pve01", api_url="https://10.0.0.10:8006"),
+        PveHostConfig(name="pve02", api_url="https://10.0.0.11:8006"),
+    ]))
+
+    async def fake_test(host, *a, **k):
+        if host.name == "pve01":
+            raise RuntimeError("boom")
+        return TestResult(True, "ok", has_power_mgmt=True)
+
+    emitted: list = []
+
+    async def fake_emit(subject, body, severity):
+        emitted.append((subject, severity, body))
+
+    monkeypatch.setattr(engine_mod.targets, "test_connection", fake_test)
+    monkeypatch.setattr(eng, "_emit", fake_emit)
+    monkeypatch.setattr(eng, "_log_quiet", lambda *a: None)
+
+    await eng._run_selftest()
+
+    # The healthy host keeps its verdict...
+    key2 = eng.cfg.hosts[1].key
+    assert eng.host_states[key2]["credentials_ok"] is True
+    # ...and the raising one becomes a reported failure, not a silent gap.
+    key1 = eng.cfg.hosts[0].key
+    assert eng.host_states[key1]["credentials_ok"] is False
+    assert "boom" in eng.host_states[key1]["last_test_error"]
+    assert ("Self-test pve01: FAILED", db.CRITICAL) in [(s, sev) for s, sev, _ in emitted]
+    assert eng.last_selftest_ok is False
+
+
+@pytest.mark.asyncio
 async def test_run_selftest_always_reports_failures(monkeypatch):
     from app import engine as engine_mod
     from app.proxmox import TestResult
 
     monkeypatch.setattr(engine_mod, "_local_now", lambda: datetime(2026, 7, 25, 10, 0))
-    eng = Engine(AppConfig(hosts=[PveHostConfig(name="pve01", api_url="https://10.0.0.10:8006")]))
+    eng = Engine(AppConfig(hosts=[PveHostConfig(
+        name="pve01", api_url="https://10.0.0.10:8006",
+        token_id="ups@pve!s", token_secret="sec")]))
 
     async def fake_test(host, *a, **k):
         return TestResult(False, "Authentication failed (token invalid?)")
@@ -3111,6 +4318,299 @@ async def test_test_endpoint_sends_regardless_of_the_severity_filter(_import_tar
 
 
 @pytest.mark.asyncio
+async def test_the_test_endpoint_uses_the_stored_secret_not_the_mask(
+        _import_target, monkeypatch):
+    """Pressing "Test" on a saved webhook used to send the literal placeholder.
+
+    The UI sends "**********" whenever the auth field is left blank — the same convention
+    as every other secret — but this was the one test endpoint that never reconciled it,
+    so a working configuration answered 401.
+    """
+    from app.config import WebhookConfig, Notifications
+
+    main, _ = _import_target
+    main.engine.cfg.notifications = Notifications(webhooks=[WebhookConfig(
+        id="webhook1", url="https://hook/x", auth_header_name="X-Token",
+        auth_header_value="the-real-token")])
+    seen: list = []
+
+    async def record(hook, subject, body, severity, payload):
+        seen.append(hook.auth_header_value.get_secret_value())
+        return "HTTP 202"
+
+    monkeypatch.setattr(main.notify, "send_webhook", record)
+
+    await main.api_test_webhook({
+        "id": "webhook1", "url": "https://hook/x",
+        "auth_header_name": "X-Token", "auth_header_value": main.SECRET_PLACEHOLDER,
+    })
+
+    assert seen == ["the-real-token"]
+
+
+@pytest.mark.asyncio
+async def test_a_failing_webhook_is_written_to_the_event_log_once(monkeypatch):
+    """It used to reach journald and nowhere else — no event, no health field, no UI."""
+    from app import db, notify
+    from app.config import Notifications, WebhookConfig
+
+    logged: list[tuple] = []
+    # Recorded rather than written: db.log_event() binds its path default at import, and
+    # the point of the test is *that* it is called, once, and never through the engine's
+    # _emit (which would notify about the failing webhook, for ever).
+    monkeypatch.setattr(notify.db, "log_event",
+                        lambda ev, detail="", sev=db.INFO: logged.append((ev, detail)))
+    monkeypatch.setattr(notify, "DELIVERY", {})
+
+    async def boom(hook, subject, body, severity, payload):
+        raise RuntimeError("401 Unauthorized")
+
+    monkeypatch.setattr(notify, "send_webhook", boom)
+    hooks = Notifications(webhooks=[WebhookConfig(id="w1", name="Teams", enabled=True,
+                                                  url="https://hook/x")])
+
+    for _ in range(3):        # an outage emits steadily; the log must not be flooded
+        await notify.notify(hooks, "s", "b", {}, db.WARNING)
+
+    assert len(logged) == 1
+    assert "Teams" in logged[0][0] and "401 Unauthorized" in logged[0][1]
+    assert notify.delivery_state()["w1"]["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_recovered_webhook_can_be_reported_again(monkeypatch):
+    from app import db, notify
+    from app.config import Notifications, WebhookConfig
+
+    logged: list[tuple] = []
+    monkeypatch.setattr(notify.db, "log_event",
+                        lambda ev, detail="", sev=db.INFO: logged.append((ev, detail)))
+    monkeypatch.setattr(notify, "DELIVERY", {})
+    hooks = Notifications(webhooks=[WebhookConfig(id="w1", enabled=True,
+                                                  url="https://hook/x")])
+    outcome = {"fail": True}
+
+    async def flaky(hook, subject, body, severity, payload):
+        if outcome["fail"]:
+            raise RuntimeError("boom")
+        return "HTTP 200"
+
+    monkeypatch.setattr(notify, "send_webhook", flaky)
+
+    await notify.notify(hooks, "s", "b", {}, db.WARNING)
+    outcome["fail"] = False
+    await notify.notify(hooks, "s", "b", {}, db.WARNING)
+    assert notify.delivery_state()["w1"]["ok"] is True
+    outcome["fail"] = True
+    await notify.notify(hooks, "s", "b", {}, db.WARNING)
+
+    assert len(logged) == 2, "a fresh run of failures is worth saying again"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_delivery_never_publishes_the_webhook_url(monkeypatch):
+    """The URL IS the credential for Slack, Discord, Teams and ntfy — and /api/status,
+    which carries both the delivery state and the event log, is deliberately public.
+
+    httpx spells a status error as "... for url '<the whole thing>'", so storing the raw
+    exception text published the secret to anyone who could reach the appliance. Worse,
+    the snapshot travels on as the ``status`` field of every notification, so target A's
+    URL would have been POSTed to target B."""
+    from app import db, notify
+    from app.config import Notifications, WebhookConfig
+    import httpx
+
+    secret_url = "https://hooks.slack.com/services/T00/B00/sUpErSeCrEt"
+    logged: list[tuple] = []
+    monkeypatch.setattr(notify.db, "log_event",
+                        lambda ev, detail="", sev=db.INFO: logged.append((ev, detail)))
+    monkeypatch.setattr(notify, "DELIVERY", {})
+
+    async def unauthorized(hook, subject, body, severity, payload):
+        request = httpx.Request("POST", secret_url)
+        raise httpx.HTTPStatusError(
+            "boom", request=request, response=httpx.Response(401, request=request)
+        )
+
+    monkeypatch.setattr(notify, "send_webhook", unauthorized)
+    hooks = Notifications(webhooks=[WebhookConfig(id="w1", enabled=True, url=secret_url)])
+
+    await notify.notify(hooks, "s", "b", {}, db.WARNING)
+
+    state = notify.delivery_state()["w1"]
+    assert state["ok"] is False
+    # Still diagnostic — the status code is the whole answer here — but nothing secret.
+    assert "401" in state["error"]
+    assert "sUpErSeCrEt" not in state["error"] and "://" not in state["error"]
+    # The event log is served through /api/status too, so it gets the same treatment.
+    assert "sUpErSeCrEt" not in logged[0][1]
+
+
+def test_the_error_sanitiser_keeps_a_url_out_of_every_shape_of_failure():
+    """Pure, so the rule can be checked without a network: nothing that reaches the
+    public snapshot may carry a URL, whatever the exception turned out to be."""
+    import httpx
+    from app.notify import safe_error
+
+    url = "https://discord.com/api/webhooks/123/tOkEn"
+    request = httpx.Request("POST", url)
+    assert safe_error(httpx.HTTPStatusError(
+        "x", request=request, response=httpx.Response(404, request=request))) == "HTTP 404 Not Found"
+    # Transport failures degrade to the class name — httpx puts the host in the message.
+    assert safe_error(httpx.ConnectError("failed to connect to " + url)) == "ConnectError"
+    # Anything unforeseen keeps its text, minus any URL in it.
+    masked = safe_error(RuntimeError(f"template blew up on {url} again"))
+    assert "tOkEn" not in masked and "<url>" in masked and "template blew up" in masked
+
+
+@pytest.mark.asyncio
+async def test_one_silent_webhook_cannot_hold_up_the_shutdown(monkeypatch):
+    """notify() is awaited from Engine._emit(), which is awaited from the poll loop —
+    including between two shutdown stages. Per-target httpx timeouts do not bound the
+    round, so "best effort" had to be made to mean "bounded" as well."""
+    import asyncio as _asyncio
+    from app import db, notify
+    from app.config import Notifications, WebhookConfig
+
+    monkeypatch.setattr(notify.db, "log_event", lambda *a, **kw: None)
+    monkeypatch.setattr(notify, "DELIVERY", {})
+    monkeypatch.setattr(notify, "NOTIFY_BUDGET_S", 0.05)
+
+    async def never_answers(hook, subject, body, severity, payload):
+        await _asyncio.sleep(30)
+        return "HTTP 200"
+
+    async def answers(hook, subject, body, severity, payload):
+        return "HTTP 200"
+
+    async def dispatch(hook, *a, **kw):
+        return await (never_answers if hook.id == "dead" else answers)(hook, *a, **kw)
+
+    monkeypatch.setattr(notify, "send_webhook", dispatch)
+    hooks = Notifications(webhooks=[
+        WebhookConfig(id="dead", enabled=True, url="https://nowhere/x"),
+        WebhookConfig(id="live", enabled=True, url="https://somewhere/x"),
+    ])
+
+    await _asyncio.wait_for(notify.notify(hooks, "s", "b", {}, db.WARNING), timeout=5)
+
+    state = notify.delivery_state()
+    assert state["dead"]["ok"] is False
+    # The healthy target keeps its own outcome: the ceiling is per send, so it is not
+    # filed under the timeout of the one next to it.
+    assert state["live"]["ok"] is True
+
+
+def test_two_entries_sharing_an_id_are_split_on_load(tmp_path):
+    """Duplicate ids used to pass straight through, so two hosts shared one latch."""
+    path = tmp_path / "config.yaml"
+    save_config(AppConfig(hosts=[
+        PveHostConfig(id="host1", name="a", api_url="https://a:8006"),
+        PveHostConfig(id="host1", name="b", api_url="https://b:8006"),
+    ], ups=[
+        SnmpConfig(id="u", name="A", host="10.0.0.1"),
+        SnmpConfig(id="u", name="B", host="10.0.0.2"),
+    ]), path)
+    cfg = load_config(path)
+
+    assert [h.id for h in cfg.hosts] == ["host1", "host1-2"]   # the first keeps its id
+    assert len({h.key for h in cfg.hosts}) == 2                # ... so latches differ
+    assert [u.id for u in cfg.ups] == ["u", "u-2"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Windows does not honour POSIX modes")
+def test_config_is_never_world_readable_even_mid_write(tmp_path):
+    """chmod after the write left every plaintext secret at 0644 for its duration."""
+    import stat as _stat
+
+    import os as _os
+
+    path = tmp_path / "config.yaml"
+    save_config(AppConfig(ups=[SnmpConfig(id="u", host="h", community="s3cret")]), path)
+    mode = _stat.S_IMODE(_os.stat(path).st_mode)
+    assert mode & 0o077 == 0, oct(mode)
+
+
+def test_saving_works_with_a_leftover_temp_file(tmp_path):
+    """O_EXCL here would have made one crashed save block every future one."""
+    path = tmp_path / "config.yaml"
+    (tmp_path / "config.yaml.tmp").write_text("junk from an earlier crash", encoding="utf-8")
+    save_config(AppConfig(), path)
+    assert load_config(path).thresholds.poll_interval_normal_s == 30
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Windows does not honour POSIX modes")
+def test_a_leftover_temp_file_cannot_smuggle_its_old_permissions_back(tmp_path):
+    """The other half of the leftover case, and the one that was missing.
+
+    open()'s mode argument only applies when it CREATES the file, so reusing a .tmp left
+    behind by a crash — which is deliberately allowed — wrote every plaintext secret into
+    whatever permissions that file already carried."""
+    import stat as _stat
+
+    import os as _os
+
+    path = tmp_path / "config.yaml"
+    leftover = tmp_path / "config.yaml.tmp"
+    leftover.write_text("junk", encoding="utf-8")
+    _os.chmod(leftover, 0o644)
+
+    save_config(AppConfig(ups=[SnmpConfig(id="u", host="h", community="s3cret")]), path)
+
+    assert _stat.S_IMODE(_os.stat(path).st_mode) & 0o077 == 0
+
+
+def test_a_slipped_digit_upwards_is_corrected_like_one_downwards(tmp_path):
+    """Every timeout here is awaited inside the poll loop, so "6000" where "60" was meant
+    parks the decision engine for 100 minutes per stage while the battery drains. That is
+    the same class of fault as the negative values, and it was unbounded."""
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+thresholds:
+  host_shutdown_timeout_s: 6000
+  poll_interval_battery_s: 9999
+  cluster_prep_timeout_s: 100000
+""",
+        encoding="utf-8",
+    )
+    cfg = load_config(path)                                   # must not raise
+
+    assert cfg.thresholds.host_shutdown_timeout_s == 60       # back to the default
+    assert cfg.thresholds.poll_interval_battery_s == 8
+    assert cfg.thresholds.cluster_prep_timeout_s == 60
+    lines = " ".join(cfg.value_corrections())
+    assert "host_shutdown_timeout_s" in lines and "poll_interval_battery_s" in lines
+
+    # A large but sane estate is untouched: the ceilings only ever catch a typo.
+    sane = Thresholds(host_shutdown_timeout_s=600, cluster_guest_shutdown_timeout_s=1800)
+    assert sane.host_shutdown_timeout_s == 600
+    assert sane._corrections == []
+
+
+def test_webhooks_without_an_id_are_given_one_on_load(tmp_path):
+    """Third of three, and the one that was skipped: the id keys the per-target delivery
+    state and the masked-secret reconcile, so two entries without one shared a record —
+    each overwriting the other's "last delivery"."""
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+notifications:
+  webhooks:
+    - url: https://a/hook
+      enabled: true
+    - url: https://b/hook
+      enabled: true
+""",
+        encoding="utf-8",
+    )
+    hooks = load_config(path).notifications.webhooks
+
+    assert all(h.id for h in hooks)
+    assert len({h.id for h in hooks}) == 2
+
+
+@pytest.mark.asyncio
 async def test_test_endpoint_reports_a_failure_instead_of_raising(_import_target, monkeypatch):
     from fastapi import HTTPException
 
@@ -3441,6 +4941,41 @@ async def test_a_shutdown_does_not_erase_the_selftest_result(monkeypatch):
     state = eng.host_states["pbs:pbs01"]
     assert state["shutdown_state"] == "sent"
     assert state["power_mgmt_ok"] is True  # survived the shutdown write
+
+
+@pytest.mark.asyncio
+async def test_health_reports_the_notification_targets(_import_target, monkeypatch):
+    """The shutdown credentials have had a health field for releases; the notification
+    ones became a first-class signal in 4.1.0 — an event, a dashboard row, a note on the
+    card — but the endpoint an external monitor actually polls knew nothing about it."""
+    import json
+
+    from app import notify
+    from app.config import Notifications, WebhookConfig
+
+    main, _ = _import_target
+    main.engine = Engine(AppConfig(notifications=Notifications(webhooks=[
+        WebhookConfig(id="w1", name="chat", enabled=True, url="https://example.invalid/a"),
+        WebhookConfig(id="w2", name="off", enabled=False, url="https://example.invalid/b"),
+    ])))
+
+    before = json.loads((await main.api_health()).body)
+    # Enabled targets only, and one that has never been tried is not broken.
+    assert before["webhooks_total"] == 1
+    assert before["webhooks_ok"] == 1
+
+    notify.DELIVERY.clear()
+    try:
+        notify._record_delivery(main.engine.cfg.notifications.webhooks[0],
+                                RuntimeError("nope"))
+        after = json.loads((await main.api_health()).body)
+    finally:
+        notify.DELIVERY.clear()
+
+    assert after["webhooks_ok"] == 0
+    # Monitoring information, like hosts_ok: an unreachable chat server is not a reason to
+    # declare a running appliance down.
+    assert after["status"] == before["status"]
 
 
 @pytest.mark.asyncio
@@ -4104,6 +5639,88 @@ async def test_host_test_reports_coverage_and_reuses_the_cluster_node_list(monke
     assert not [c for c in calls if c[0] == "GET" and c[1] == "/nodes"]
 
 
+# --- the clients stay inside the deadline app/targets.py gives them ----------
+# Both entry points there are documented as never exceeding their timeout by more than
+# DEADLINE_GRACE_S, and the guarantee is what keeps one slow target from costing another
+# its shutdown. The clients underneath issue SEVERAL sequential requests, so handing each
+# of them the full timeout breaks it from the inside: the wait_for fires first and a
+# merely slow host is reported as "gave up" — for the self-test a CRITICAL failure on a
+# target whose credentials are fine, for a shutdown the loss of the retry.
+
+
+def _worst_case_s(calls) -> float:
+    """Longest the recorded exchange can take: per client, its read timeout per request."""
+    total, per_request = 0.0, 0.0
+    for call in calls:
+        if call[0] == "client":
+            per_request = float(call[1]["timeout"].read)
+        else:
+            total += per_request
+    return total
+
+
+@pytest.mark.asyncio
+async def test_credential_test_fits_in_the_deadline_targets_allows_it(monkeypatch):
+    from app import proxmox, targets
+
+    calls: list = []
+    routes = {
+        "/version": _FakeJson(200, {"data": {"version": "8.2"}}),
+        "/access/permissions": _FakeJson(200, {"data": {"/": {"Sys.PowerMgmt": 1}}}),
+        "/cluster/status": _FakeJson(200, {"data": [{"type": "node", "name": "pve01",
+                                                     "local": 1}]}),
+    }
+    monkeypatch.setattr(proxmox.httpx, "AsyncClient", _FakeApiClient(routes, calls))
+    host = PveHostConfig(name="pve01", api_url="https://pve:8006",
+                         token_id="ups@pve!x", token_secret="s")
+
+    result = await proxmox.test_connection(host, timeout=10.0)
+
+    assert result.ok and result.has_power_mgmt and result.node_state == "ok"
+    # /version + /access/permissions + the node listing, all sequential.
+    assert len([c for c in calls if c[0] == "GET"]) >= 3
+    assert _worst_case_s(calls) <= 10.0 + targets.DEADLINE_GRACE_S
+
+
+@pytest.mark.asyncio
+async def test_pbs_credential_test_fits_in_the_same_deadline(monkeypatch):
+    from app import pbs, targets
+
+    calls = _fake_pbs(monkeypatch, {"/system/status": {"Sys.PowerManagement": 1}})
+
+    host = PbsHostConfig(name="backup", api_url="https://pbs:8007",
+                         token_id="ups@pbs!x", token_secret="s")
+    result = await pbs.test_connection(host, timeout=10.0)
+
+    assert result.ok and result.has_power_mgmt
+    assert _worst_case_s(calls) <= 10.0 + targets.DEADLINE_GRACE_S
+
+
+@pytest.mark.asyncio
+async def test_both_shutdown_forms_share_one_budget(monkeypatch):
+    """The fallback has to be reachable, not just written down.
+
+    A first form that hangs rather than answering used to leave the second one the five
+    seconds of grace, so the retry this routine exists for never happened and the result
+    was a bare "gave up".
+    """
+    from app import proxmox, targets
+
+    calls: list = []
+    routes = {
+        "/nodes/localhost/status": _FakeJson(403, {}),   # node-scoped privilege
+        "/nodes/pve01/status": _FakeJson(200, {"data": None}),
+    }
+    monkeypatch.setattr(proxmox.httpx, "AsyncClient", _FakeApiClient(routes, calls))
+    host = PveHostConfig(name="pve01", api_url="https://pve:8006",
+                         token_id="ups@pve!x", token_secret="s")
+
+    ok, message = await proxmox.shutdown_node(host, timeout=60.0, use_localhost=True)
+
+    assert ok and "/nodes/pve01" in message and "Fix this host entry" in message
+    assert _worst_case_s(calls) <= 60.0 + targets.DEADLINE_GRACE_S
+
+
 # --- node name verification (the shutdown path) -----------------------------
 def _nodes_client(monkeypatch, nodes=("pve01", "pve02"), status=200):
     from app import proxmox
@@ -4385,12 +6002,128 @@ async def test_an_unverified_node_name_is_never_held_against_a_host(monkeypatch)
     assert not [s for s, _, _ in events if "FAILED" in s]
 
 
+# --- entries stored in a state in which they cannot do their job --------------------
+def test_incomplete_entries_names_what_each_card_is_missing():
+    """The server-side half of app.js's incompleteCards().
+
+    It has to exist separately because the two paths where this actually happens never
+    pass a form: POST /api/config/import and a hand-edited config.yaml.
+    """
+    cfg = AppConfig(
+        ups=[
+            SnmpConfig(id="ok", host="10.0.0.1"),
+            SnmpConfig(id="noaddr"),
+            NutConfig(id="nonut", host="10.0.0.2"),  # address but no ups.conf section
+        ],
+        hosts=[
+            PveHostConfig(id="good", name="pve01", api_url="https://10.0.0.10:8006",
+                          token_id="ups@pve!s", token_secret="sec"),
+            PveHostConfig(id="nourl", name="pve02", api_url="",
+                          token_id="ups@pve!s", token_secret="sec"),
+            PveHostConfig(id="notok", name="pve03", api_url="https://10.0.0.12:8006"),
+            # Switched off: it shuts nothing down, so none of its fields can fail during
+            # an outage — and demanding them would leave an installation upgrading from a
+            # release that stored such entries happily unable to save at all.
+            PveHostConfig(id="off", name="pve04", api_url="", enabled=False),
+        ],
+        notifications=Notifications(webhooks=[
+            WebhookConfig(id="w1", enabled=True, url=""),
+            WebhookConfig(id="w2", enabled=False, url=""),  # off: nothing is sent anyway
+        ]),
+    )
+    found = {label: missing for _kind, label, missing in cfg.incomplete_entries()}
+
+    assert "noaddr" in found and "nonut" in found
+    assert "ok" not in found
+    assert found["pve02"] == "no API URL"
+    assert found["pve03"] == "no API token ID, no API token secret"
+    assert "pve01" not in found and "pve04" not in found
+    assert "w1" in found and "w2" not in found
+
+
+@pytest.mark.asyncio
+async def test_an_incomplete_host_is_reported_once_and_reaches_the_snapshot(monkeypatch):
+    """A backup import stores it, the dashboard renders it complete, and nothing else says
+    otherwise in time: verify_node() answers "unverified" for an entry it cannot even
+    address, which _node_name_ok() correctly reads as *no verdict* rather than a fault."""
+    from app import engine as engine_mod
+
+    eng = Engine(AppConfig(hosts=[
+        PveHostConfig(id="h", name="pve01", api_url="https://10.0.0.10:8006")]))
+
+    async def fake_verify(host, *a, **k):
+        from app.proxmox import NodeVerdict
+        return NodeVerdict(state="unverified")
+
+    monkeypatch.setattr(engine_mod.targets, "verify_node", fake_verify)
+    events = _notify_recorder(eng)
+
+    await eng._maybe_node_startup_check()
+    said = [(s, sev) for s, sev, _ in events if "incomplete configuration" in s]
+    assert said == [("Host pve01: incomplete configuration", db.CRITICAL)]
+
+    # Once per finding and configuration — repeating it every self-test trains the
+    # operator to skip the feed.
+    events.clear()
+    await eng._run_selftest()
+    assert [s for s, _, _ in events if "incomplete configuration" in s] == []
+
+    # ...but it stays true on the dashboard until it is actually fixed.
+    host = eng.snapshot()["hosts"][0]
+    assert host["incomplete"] == "no API token ID, no API token secret"
+
+
+def test_an_unpollable_ups_says_so_instead_of_looking_unreachable():
+    """Stored without an address it is never polled at all, which renders identically to a
+    device that is simply not answering — while fail safe means every host it feeds is
+    refused a shutdown either way."""
+    eng = Engine(AppConfig(ups=[SnmpConfig(id="u", name="Rack A")]))
+    assert eng.snapshot()["ups"][0]["incomplete"] == "no address to poll"
+
+    ok = Engine(AppConfig(ups=[SnmpConfig(id="u", host="10.0.0.9")]))
+    assert ok.snapshot()["ups"][0]["incomplete"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_green_selftest_still_says_dry_run_is_on(monkeypatch):
+    """The one thing a green self-test does not say by itself: every token can be valid
+    while the master switch means none of it is ever used."""
+    from app import engine as engine_mod
+    from app.proxmox import TestResult
+
+    monkeypatch.setattr(engine_mod, "_local_now", lambda: datetime(2026, 7, 25, 10, 0))
+
+    async def fake_test(host, *a, **k):
+        return TestResult(True, "ok", has_power_mgmt=True, node_state="ok")
+
+    monkeypatch.setattr(engine_mod.targets, "test_connection", fake_test)
+
+    def _engine(dry_run):
+        return Engine(AppConfig(
+            dry_run=dry_run, configured=True,
+            hosts=[PveHostConfig(id="h", name="pve01", api_url="https://10.0.0.10:8006",
+                                 token_id="ups@pve!s", token_secret="sec")]))
+
+    eng = _engine(True)
+    quiet: list[str] = []
+    eng._log_quiet = lambda subject, body, sev: quiet.append(subject)  # type: ignore
+    await eng._run_selftest()
+    assert [q for q in quiet if "Dry-run is on" in q]
+
+    armed = _engine(False)
+    quiet2: list[str] = []
+    armed._log_quiet = lambda subject, body, sev: quiet2.append(subject)  # type: ignore
+    await armed._run_selftest()
+    assert [q for q in quiet2 if "Dry-run is on" in q] == []
+
+
 def _startup_engine(monkeypatch, state, detail="nope", **cfg_kw):
     from app import engine as engine_mod
     from app.proxmox import NodeVerdict
 
     eng = Engine(AppConfig(
-        hosts=[PveHostConfig(name="pve01", api_url="https://10.0.0.10:8006")], **cfg_kw))
+        hosts=[PveHostConfig(name="pve01", api_url="https://10.0.0.10:8006",
+                             token_id="ups@pve!s", token_secret="sec")], **cfg_kw))
 
     async def fake_verify(host, *a, **k):
         return NodeVerdict(state=state, detail=detail)
@@ -4415,6 +6148,111 @@ async def test_node_names_are_checked_at_startup_not_at_the_next_slot(monkeypatc
     events.clear()
     await eng._maybe_node_startup_check()
     assert events == []
+
+
+# --- a host pointing at a UPS that no longer exists ---------------------------------
+def _stale_feed_engine(monkeypatch, ups_ids, policy="all"):
+    from app import engine as engine_mod
+    from app.proxmox import NodeVerdict
+
+    eng = Engine(AppConfig(
+        ups=[SnmpConfig(id="a", host="10.0.0.1")],
+        hosts=[PveHostConfig(name="pve01", api_url="https://10.0.0.10:8006",
+                             token_id="ups@pve!s", token_secret="sec",
+                             ups_ids=ups_ids, ups_policy=policy)],
+    ))
+
+    async def fake_verify(host, *a, **k):
+        return NodeVerdict(state="unverified")
+
+    monkeypatch.setattr(engine_mod.targets, "verify_node", fake_verify)
+    return eng
+
+
+def test_stale_feed_ids_names_only_what_is_really_gone():
+    cfg = AppConfig(ups=[SnmpConfig(id="a", host="10.0.0.1")],
+                    hosts=[PveHostConfig(name="h", api_url="x", ups_ids=["a", "ghost"])])
+    assert cfg.stale_feed_ids(cfg.hosts[0]) == ["ghost"]
+    # An empty assignment means "all configured UPS" — that is not staleness.
+    cfg.hosts[0].ups_ids = []
+    assert cfg.stale_feed_ids(cfg.hosts[0]) == []
+
+
+@pytest.mark.asyncio
+async def test_a_host_whose_only_feed_vanished_is_reported_as_never_shut_down(monkeypatch):
+    """The one silent failure: no feeds means never eligible, with nothing saying so."""
+    eng = _stale_feed_engine(monkeypatch, ["ghost"])
+    events = _notify_recorder(eng)
+
+    await eng._maybe_node_startup_check()
+
+    hits = [b for s, sev, b in events
+            if "unknown UPS assignment" in s and sev == "critical"]
+    assert hits and "NEVER" in hits[0]
+    # And the dashboard can see it without waiting for an event to scroll past.
+    assert eng.snapshot()["hosts"][0]["stale_ups_ids"] == ["ghost"]
+
+
+@pytest.mark.asyncio
+async def test_a_partly_stale_assignment_says_the_redundancy_is_gone(monkeypatch):
+    """Quieter and just as wrong: policy "all" is satisfied by whatever is left."""
+    eng = _stale_feed_engine(monkeypatch, ["a", "ghost"])
+    events = _notify_recorder(eng)
+
+    await eng._maybe_node_startup_check()
+
+    hits = [b for s, _, b in events if "unknown UPS assignment" in s]
+    assert hits and "redundancy" in hits[0]
+
+
+@pytest.mark.asyncio
+async def test_the_stale_feed_warning_is_said_once_per_configuration(monkeypatch):
+    eng = _stale_feed_engine(monkeypatch, ["ghost"])
+    events = _notify_recorder(eng)
+    await eng._maybe_node_startup_check()
+    assert len(events) == 1
+    events.clear()
+
+    await eng._maybe_node_startup_check()
+    assert events == []                      # unchanged config: not repeated
+
+    eng.update_config(eng.cfg)               # saving is a new question
+    await eng._maybe_node_startup_check()
+    assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_healthy_assignment_says_nothing(monkeypatch):
+    eng = _stale_feed_engine(monkeypatch, ["a"])
+    events = _notify_recorder(eng)
+    await eng._maybe_node_startup_check()
+    assert [s for s, _, _ in events if "unknown UPS assignment" in s] == []
+
+
+@pytest.mark.asyncio
+async def test_the_silent_failure_is_reported_on_a_backup_server_too(monkeypatch):
+    """These three warnings are pure config questions and have nothing to do with node
+    names — but they sat at the bottom of the node check, behind "if not hosts: return".
+
+    An estate of Proxmox Backup Servers has no PVE target at all, so the one failure the
+    appliance calls completely silent stayed completely silent there: no event until the
+    next scheduled self-test, up to a day after the save that caused it."""
+    from app.engine import Engine
+
+    cfg = AppConfig(
+        ups=[SnmpConfig(id="a", host="10.0.0.1")],
+        hosts=[PbsHostConfig(name="backup", api_url="https://pbs:8007",
+                             token_id="ups@pbs!x", token_secret="s",
+                             ups_ids=["ghost"])],
+    )
+    eng = Engine(cfg)
+    events = _notify_recorder(eng)
+
+    await eng._maybe_node_startup_check()
+
+    hits = [b for s, sev, b in events
+            if "unknown UPS assignment" in s and sev == "critical"]
+    assert hits and "NEVER" in hits[0]
 
 
 @pytest.mark.asyncio
@@ -5013,6 +6851,142 @@ async def test_abort_on_prep_failure_holds_the_cluster_back(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_the_guest_budget_starts_when_the_guests_do_not_when_prepare_does(monkeypatch):
+    """The HA disarm used to spend the guests' time before they got any.
+
+    Both deadlines were taken at prepare() entry, so a disarm that legitimately ran for
+    tens of seconds came straight off the guest budget — and a disarm longer than the
+    guest budget left a grace of zero, which force-stops every guest at once instead of
+    ever asking one to shut down.
+    """
+    import asyncio as _asyncio
+    from app import cluster as cluster_mod
+
+    seen: dict[str, float] = {}
+    real_stop = cluster_mod._shutdown_guests
+
+    async def spy(client, targets, steps, *, deadline, force_after_s):
+        seen["left"] = deadline - _asyncio.get_running_loop().time()
+        return await real_stop(client, targets, steps, deadline=deadline,
+                               force_after_s=force_after_s)
+
+    # A disarm that is armed on the first read and only reaches "disarmed" after a while,
+    # which is what a real CRM/LRM round trip looks like.
+    reads = {"n": 0}
+
+    async def slow_armed_state(client):
+        reads["n"] += 1
+        if reads["n"] == 1:
+            return cluster_mod.ARMED
+        await _asyncio.sleep(1.2)
+        return cluster_mod.DISARMED
+
+    monkeypatch.setattr(cluster_mod, "_shutdown_guests", spy)
+    monkeypatch.setattr(cluster_mod, "_read_armed_state", slow_armed_state)
+    eng = _outage_cluster_engine(monkeypatch, _CephServer(), nodes=1)
+    _noop_fire(eng)
+    await eng._evaluate()
+
+    guest_budget = eng.cfg.thresholds.cluster_guest_shutdown_timeout_s
+    assert "left" in seen, "the guest step must have run"
+    # Nearly the whole configured budget — not the budget minus the disarm.
+    assert seen["left"] > guest_budget * 0.85
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_cluster_is_reported_and_not_silently_let_through(monkeypatch):
+    """The abort opt-in used to be defeated by silence.
+
+    A failed inspection walked away with `continue`: no event, no cluster_prep_failed
+    entry, and no cluster_name for the abort filter to key on — so the node was powered
+    off with HA armed and no flags, and the log said nothing about it.
+    """
+    from app import cluster as cluster_mod
+
+    async def unreachable(host, *a, **k):
+        return cluster_mod.ClusterInfo(reachable=False, error="connection refused")
+
+    monkeypatch.setattr(cluster_mod, "inspect", unreachable)
+    srv = _CephServer()
+    eng = _outage_cluster_engine(monkeypatch, srv, abort=True, nodes=1)
+    eng.host_states.clear()                    # nothing discovered yet: cold start
+    events = _notify_recorder(eng)
+    fired: list[str] = []
+
+    async def fake_fire(host, reason):
+        fired.append(host.name)
+
+    eng._fire_host = fake_fire  # type: ignore[assignment]
+    await eng._evaluate()
+
+    assert [s for s, sev, _ in events
+            if "not reachable for preparation" in s and sev == "critical"]
+    assert fired == [], "abort-on-failure must hold a cluster nobody could inspect"
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_cluster_is_reported_once_not_every_poll(monkeypatch):
+    """The sibling of the held-back-cluster latch, and this branch had been left out of it.
+
+    With abort-on-failure the host is filtered out, so it never fires and stays eligible —
+    and it came back through _prepare_clusters() on every poll: eight seconds apart on
+    battery, each round paying for a full inspection and sending another CRITICAL, while
+    the battery drained."""
+    from app import cluster as cluster_mod
+    inspections: list[str] = []
+
+    async def unreachable(host, *a, **k):
+        inspections.append(host.name)
+        return cluster_mod.ClusterInfo(reachable=False, error="connection refused")
+
+    monkeypatch.setattr(cluster_mod, "inspect", unreachable)
+    eng = _outage_cluster_engine(monkeypatch, _CephServer(), abort=True, nodes=1)
+    eng.host_states.clear()
+    events = _notify_recorder(eng)
+    _noop_fire(eng)
+
+    for _ in range(5):
+        await eng._evaluate()
+
+    assert len(inspections) == 1, "one inspection per episode, not one per poll"
+    assert len([s for s, _, _ in events if "not reachable for preparation" in s]) == 1
+
+    # Mains back: the episode ends, the latch is released, and a NEW outage inspects again.
+    eng.ups_rt["u"].state = UpsState(reachable=True, power_source="mains",
+                                     runtime_remaining_min=60)
+    await eng._evaluate()
+    eng.ups_rt["u"].state = UpsState(reachable=True, power_source="battery",
+                                     battery_status="low")
+    await eng._evaluate()
+    assert len(inspections) == 2
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_cluster_still_shuts_down_when_abort_is_off(monkeypatch):
+    """Default stays: unprepared is worse than uncontrolled, so the node still goes."""
+    from app import cluster as cluster_mod
+
+    async def unreachable(host, *a, **k):
+        return cluster_mod.ClusterInfo(reachable=False, error="connection refused")
+
+    monkeypatch.setattr(cluster_mod, "inspect", unreachable)
+    srv = _CephServer()
+    eng = _outage_cluster_engine(monkeypatch, srv, abort=False, nodes=1)
+    eng.host_states.clear()
+    events = _notify_recorder(eng)
+    fired: list[str] = []
+
+    async def fake_fire(host, reason):
+        fired.append(host.name)
+
+    eng._fire_host = fake_fire  # type: ignore[assignment]
+    await eng._evaluate()
+
+    assert fired == ["pve01"]
+    assert any("not reachable for preparation" in s for s, _, _ in events)
+
+
+@pytest.mark.asyncio
 async def test_a_held_back_cluster_is_not_prepared_again_every_poll(monkeypatch):
     """The abort must cost one preparation and one pair of events, not one per poll.
 
@@ -5171,6 +7145,87 @@ async def test_cold_start_uses_the_inspection_it_just_made(monkeypatch):
     assert not any("/status/shutdown" in url for _m, url in srv.calls)
     # The reading is kept, so the next cluster of this episode does not re-probe.
     assert "prod" in eng.cluster_states
+
+
+@pytest.mark.asyncio
+async def test_a_cold_start_inspects_a_cluster_once_not_once_per_node(monkeypatch):
+    """The other half of the cold start, and it is battery time.
+
+    Only _inspect_clusters() writes host_states[...]["cluster_name"], and that one stands
+    down for the whole duration of an outage. So every due node used to fall through to its
+    own cluster.inspect() — three nodes, three sequential reads of up to the full inspect
+    budget each, all of it before the first node was even asked to shut down.
+    """
+    from app import cluster
+
+    srv = _CephServer(nodes=("pve01", "pve02", "pve03"), mons=("pve01",))
+    eng = _outage_cluster_engine(monkeypatch, srv, nodes=3)
+    eng.host_states = {}          # no self-test has run: nothing knows the cluster name
+    eng.cluster_states = {}
+    _notify_recorder(eng)
+
+    real_inspect = cluster.inspect
+    seen: list[str] = []
+
+    async def counting_inspect(host, *a, **kw):
+        seen.append(host.name)
+        return await real_inspect(host, *a, **kw)
+
+    monkeypatch.setattr(cluster, "inspect", counting_inspect)
+    _noop_fire(eng)
+    await eng._evaluate()
+
+    assert seen == ["pve01"], f"one inspection per cluster, not per node: {seen}"
+    # And the membership it established is on every node, which is what the abort filter
+    # and the next poll both key on.
+    assert [eng.host_states[h.key].get("cluster_name") for h in eng.cfg.hosts]         == ["prod", "prod", "prod"]
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_cluster_is_read_once_over_not_once_after_another(monkeypatch):
+    """The other end of the cold start: a cluster that names nobody.
+
+    One reading answers for the whole cluster because it brings back the node list and
+    every member is stamped from it. An unreachable API brings back nothing, so each
+    remaining node still needs its own read — correctly, its API may be the one that works
+    — but they used to happen one after another, each up to inspect()'s full budget plus
+    the grace. Three nodes were close to a minute, spent before the first machine was
+    asked to shut down, cluster member or not.
+
+    Asserted by construction rather than by clock: every read after the first blocks until
+    all of them have started. Sequentially that never resolves.
+    """
+    import asyncio as _asyncio
+
+    from app import cluster
+
+    srv = _CephServer(nodes=("pve01", "pve02", "pve03"))
+    eng = _outage_cluster_engine(monkeypatch, srv, nodes=3)
+    eng.host_states = {}          # cold start: nothing knows the cluster name
+    eng.cluster_states = {}
+    _notify_recorder(eng)
+
+    started = _asyncio.Event()
+    seen: list[str] = []
+
+    async def unreachable_inspect(host, *a, **kw):
+        seen.append(host.name)
+        if len(seen) >= 3:
+            started.set()
+        if len(seen) > 1:
+            # Only the concurrent ones wait for each other; the first is read alone by
+            # design, and waiting on it would deadlock whatever the fix.
+            await _asyncio.wait_for(started.wait(), timeout=2)
+        return cluster.ClusterInfo(reachable=False, error="connection refused")
+
+    monkeypatch.setattr(cluster, "inspect", unreachable_inspect)
+    _noop_fire(eng)
+    await eng._evaluate()
+
+    assert sorted(seen) == ["pve01", "pve02", "pve03"]
+    # Every one of them is latched, so the next poll costs nothing at all and the CRITICAL
+    # is written once per node per episode rather than every eight seconds.
+    assert eng.cluster_inspect_failed == {h.key for h in eng.cfg.hosts}
 
 
 @pytest.mark.asyncio
@@ -5659,7 +7714,12 @@ async def test_node_count_warning_counts_every_target_not_only_the_ticked_ones(m
 
     await eng._check_clusters()
 
-    assert not [s for s, _, _ in events if "not every node" in s]
+    # The full subject, not a prefix: "some nodes are left out of the cluster
+    # handling" is a different and perfectly correct warning about this same
+    # configuration (see _check_cluster_optout), and matching loosely would make
+    # this test pass or fail on the wording of its neighbour.
+    assert not [s for s, _, _ in events
+                if "not every node is a configured target" in s]
 
     # A genuinely incomplete setup is still reported.
     eng2 = _cluster_engine(monkeypatch)          # only pve01 of three configured
@@ -5667,6 +7727,94 @@ async def test_node_count_warning_counts_every_target_not_only_the_ticked_ones(m
     await eng2._check_clusters()
     assert [s for s, _, _ in events2 if "not every node" in s]
     assert isinstance(eng2, Engine)
+
+
+@pytest.mark.asyncio
+async def test_a_node_that_opted_out_of_the_cluster_handling_is_still_named(monkeypatch):
+    """The membership rule is right and it made this node invisible.
+
+    Filtering _cluster_members() on ``h.cluster`` stopped an unticked node from being
+    powered off by another node's outage — but the preparation is cluster-WIDE either way:
+    HA is disarmed for the whole cluster and, with Ceph, every guest in it is stopped,
+    including the ones running there. Every neighbouring check looks past it: the "only
+    part of the cluster" event and _unit_additions() count over the ticked members, the
+    switch-agreement check compares within them, and node_coverage() sees a perfectly good
+    enabled target and calls it covered.
+    """
+    eng = _cluster_engine(monkeypatch, all_nodes=True)
+    for h in eng.cfg.hosts[1:]:
+        h.cluster = False
+    events = _notify_recorder(eng)
+
+    await eng._check_clusters()
+
+    hit = [b for s, _, b in events if "left out of the cluster handling" in s]
+    assert hit, "a node the preparation reaches but the shutdown skips must be named"
+    assert "pve02" in hit[0] and "pve03" in hit[0]
+    assert "HA" in hit[0], "it has to say what actually happens to that machine"
+
+    # Ticked everywhere: nothing to say.
+    quiet = _cluster_engine(monkeypatch, all_nodes=True)
+    quiet_events = _notify_recorder(quiet)
+    await quiet._check_clusters()
+    assert not [s for s, _, _ in quiet_events if "left out of the cluster handling" in s]
+
+
+@pytest.mark.asyncio
+async def test_the_ceph_clause_is_only_said_where_the_guests_really_stop(monkeypatch):
+    """With Ceph the opted-out node also loses its guests, which is the worse half."""
+    eng = _cluster_engine(monkeypatch, all_nodes=True)
+    eng.cfg.hosts[0].cluster_ceph = True
+    for h in eng.cfg.hosts[1:]:
+        h.cluster = False
+    events = _notify_recorder(eng)
+
+    await eng._check_clusters()
+
+    body = [b for s, _, b in events if "left out of the cluster handling" in s][0]
+    assert "guest" in body and "Ceph maintenance flags" in body
+
+
+@pytest.mark.asyncio
+async def test_a_standalone_node_marked_as_a_cluster_member_is_inspected_once(monkeypatch):
+    """Reachable and settled: it is not a cluster, and that answer cannot change inside
+    one episode. Without a latch every poll on which the host is still due — a retried
+    shutdown — paid for another full inspection off the battery for a question already
+    answered, and nothing ever told the operator the tick does nothing here."""
+    from app import cluster as cluster_mod
+
+    eng = _cluster_engine(monkeypatch, is_cluster=False)
+    host = eng.cfg.hosts[0]
+    calls: list[str] = []
+    real = cluster_mod.inspect
+
+    async def counting(h, *a, **kw):
+        calls.append(h.name)
+        return await real(h, *a, **kw)
+
+    monkeypatch.setattr(cluster_mod, "inspect", counting)
+    events = _notify_recorder(eng)
+
+    for _ in range(3):
+        assert await eng._prepare_clusters([(host, "battery low")]) == [
+            (host, "battery low")
+        ]
+
+    assert calls == ["pve01"], "one inspection per episode, not one per poll"
+    assert eng.cluster_standalone == {host.key}
+    # "Not a cluster" is not a failed preparation: it must never hold the node back.
+    assert not [s for s, _, _ in events if "not reachable for preparation" in s]
+    eng.cfg.thresholds.cluster_abort_on_prep_failure = True
+    assert await eng._prepare_clusters([(host, "battery low")]) == [
+        (host, "battery low")
+    ]
+    assert calls == ["pve01"]
+
+    # A new episode asks afresh, exactly like the other per-episode latches.
+    eng._release_shutdown_latches()
+    assert eng.cluster_standalone == set()
+    await eng._prepare_clusters([(host, "battery low")])
+    assert calls == ["pve01", "pve01"]
 
 
 @pytest.mark.asyncio
@@ -5924,6 +8072,116 @@ async def test_a_guest_that_ignores_the_shutdown_is_force_stopped(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_an_unreadable_guest_list_is_never_read_as_all_guests_stopped(monkeypatch):
+    """"Stopped" is only ever concluded from a re-read - so a read that did not happen
+    cannot conclude it.
+
+    _read_running_vmids() used to answer an unreadable listing with an empty set, which is
+    exactly what a finished cluster looks like. The verification then reported success on
+    no evidence at all, in the one module whose whole doctrine is that a write is
+    confirmed by a read or not at all."""
+    from app import cluster
+
+    class _BlindAfterShutdown(_CephServer):
+        """The guest listing stops answering the moment the guests were asked to stop."""
+
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.blind = False
+
+        async def get(self, url, **kw):
+            if url == "/cluster/resources?type=vm" and self.blind:
+                self.calls.append(("GET", url))
+                return _FakeJson(500, {})
+            return await super().get(url, **kw)
+
+        async def _guest_power(self, url):
+            resp = await super()._guest_power(url)
+            if "/status/shutdown" in url:
+                self.blind = True
+            return resp
+
+    srv = _BlindAfterShutdown()
+    monkeypatch.setattr(cluster.httpx, "AsyncClient", srv)
+    monkeypatch.setattr(cluster, "_VERIFY_INTERVAL_S", 0.01)
+    monkeypatch.setattr(cluster, "_GUEST_POLL_INTERVAL_S", 0.01)
+    info = await cluster.inspect(_pve(), self_vmid=950, self_node="pve01")
+
+    result = await cluster.prepare(
+        _pve(), want_ceph=True, want_disarm=True, want_guests=True,
+        guests=info.guests, self_guest=info.self_guest, guest_needs_disarm=False,
+        hostname="pve-usv", timeout=3, guest_timeout=1, force_after_s=None,
+    )
+
+    assert result.ok is False, "an unreadable list is not a stopped cluster"
+    assert "could not be re-read" in result.message
+    # And the flags still go on: they cost nothing and still stop the rebalancing.
+    assert all(srv.flags.values())
+
+
+@pytest.mark.asyncio
+async def test_a_slow_force_stop_cannot_swallow_the_ceph_step(monkeypatch):
+    """The force-stop round is bounded and concurrent, so the step behind it still runs.
+
+    It used to be a sequential loop bounded only by the client's timeout, so a control
+    plane that had stopped answering spent CONNECT_TIMEOUT_S per straggler. Enough of them
+    outlasted prepare()'s outer wait_for, and the whole preparation came back as a bare
+    "gave up" - taking the Ceph flags, whose reserve exists for exactly this, with it."""
+    import asyncio as _asyncio
+
+    from app import cluster
+
+    hung = [
+        {"vmid": 200 + i, "node": "pve01", "type": "qemu", "name": f"vm{i}",
+         "status": "running"}
+        for i in range(12)
+    ]
+    guests = [
+        {"vmid": 950, "node": "pve01", "type": "lxc", "name": "pve-usv",
+         "status": "running"},
+    ] + hung
+
+    class _SlowStop(_CephServer):
+        """Counts the FORCE-STOP round separately: the graceful round was already
+        concurrent, so the shared max_inflight says nothing about the one under test."""
+
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.stop_inflight = 0
+            self.max_stop_inflight = 0
+
+        async def _guest_power(self, url):
+            if not url.endswith("/status/stop"):
+                return await super()._guest_power(url)
+            self.stop_inflight += 1
+            self.max_stop_inflight = max(self.max_stop_inflight, self.stop_inflight)
+            try:
+                await _asyncio.sleep(0.4)     # a control plane answering very slowly
+                return await super()._guest_power(url)
+            finally:
+                self.stop_inflight -= 1
+
+    srv = _SlowStop(guests=guests,
+                    guest_ignores_shutdown=tuple(g["vmid"] for g in hung))
+    monkeypatch.setattr(cluster.httpx, "AsyncClient", srv)
+    monkeypatch.setattr(cluster, "_VERIFY_INTERVAL_S", 0.01)
+    monkeypatch.setattr(cluster, "_GUEST_POLL_INTERVAL_S", 0.01)
+    info = await cluster.inspect(_pve(), self_vmid=950, self_node="pve01")
+
+    result = await cluster.prepare(
+        _pve(), want_ceph=True, want_disarm=True, want_guests=True,
+        guests=info.guests, self_guest=info.self_guest, guest_needs_disarm=False,
+        hostname="pve-usv", timeout=3, guest_timeout=2, force_after_s=1,
+    )
+
+    # Twelve stragglers at 0.4 s each is 4.8 s in sequence - past the whole budget. Run
+    # under the module's own semaphore they fit, and the Ceph step behind them still runs.
+    assert srv.max_stop_inflight > 1, "the force-stop round has to be concurrent"
+    assert "gave up" not in result.message
+    assert all(srv.flags.values()), "the step after the guests must still have happened"
+
+
+@pytest.mark.asyncio
 async def test_without_force_a_hung_guest_fails_the_preparation_by_name(monkeypatch):
     """"Never force" has to mean it — and then say which guest is still up, because that
     is the machine someone has to go and look at."""
@@ -6060,6 +8318,51 @@ async def test_guest_shutdowns_stay_within_the_concurrency_limit(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_the_graceful_guest_round_cannot_outlast_its_own_deadline(monkeypatch):
+    """The round that ASKS the guests to stop is bounded, not only the one that kills them.
+
+    Each request is limited by the client's timeout alone, so a control plane that accepts
+    connections and then goes quiet cost a full timeout per batch of _GUEST_CONCURRENCY.
+    That time comes off the front of the guest budget -- ``grace`` is measured from what is
+    left afterwards -- so on a large cluster it collapsed to zero and every guest was
+    force-stopped at once instead of ever being asked. The kill round below it had already
+    been fixed; this one had been left out."""
+    import asyncio as aio
+    from app import cluster as cluster_mod
+
+    guests = [
+        cluster_mod.GuestInfo(vmid=200 + i, node="pve01", kind="qemu", name=f"vm{i}",
+                              status="running")
+        for i in range(3 * cluster_mod._GUEST_CONCURRENCY)
+    ]
+
+    async def hanging_post(client, path, **kw):
+        await aio.sleep(30)          # accepts, then goes quiet
+        return None
+
+    async def unreadable(client, timeout=0.0):
+        return None                  # the re-read cannot confirm anything either
+
+    monkeypatch.setattr(cluster_mod, "_post", hanging_post)
+    monkeypatch.setattr(cluster_mod, "_read_running_vmids", unreadable)
+    monkeypatch.setattr(cluster_mod, "_GUEST_POLL_INTERVAL_S", 0.01)
+
+    steps: list[str] = []
+    loop = aio.get_running_loop()
+    started = loop.time()
+    ok, left = await cluster_mod._shutdown_guests(
+        object(), guests, steps, deadline=loop.time() + 2.0, force_after_s=1,
+    )
+
+    elapsed = loop.time() - started
+    assert elapsed < 6.0, f"the round has to end with the deadline, not with the requests ({elapsed:.1f}s)"
+    assert ok is False
+    assert any("cut short by the guest deadline" in line for line in steps)
+    # An unreadable re-read still means "assume they are all up", never "all stopped".
+    assert len(left) == len(guests)
+
+
+@pytest.mark.asyncio
 async def test_the_preview_describes_the_four_steps_without_touching_anything(monkeypatch):
     """A POST the operator clicks: it must be instant and free of side effects, so it is
     built from the last inspection rather than from fresh calls."""
@@ -6175,16 +8478,177 @@ async def test_the_selftest_warns_when_the_battery_reserve_is_shorter_than_the_s
         monkeypatch):
     """Warned about, never acted on: lowering someone's trigger for them is not this
     appliance's decision."""
+    from app import cluster as cluster_mod
     srv = _CephServer()
     eng = _outage_cluster_engine(monkeypatch, srv)
     eng.cfg.thresholds.runtime_below_minutes = 1
     eng.cfg.thresholds.cluster_guest_shutdown_timeout_s = 300
     events = _notify_recorder(eng)
 
-    await eng._check_clusters()
+    await eng._warn_about_battery_reserve()
 
-    body = next((b for s, _, b in events if "battery reserve" in s), "")
-    assert "60s" in body and "365s" in body
+    body = next((b for s, _, b in events if "battery reserve" in s.lower()), "")
+    # 5 s HA disarm + 300 s guests + the cluster inspection + TWO node stages. A stage
+    # costs the host timeout PLUS targets.DEADLINE_GRACE_S, because that is what
+    # targets.shutdown() is really bounded at, and it pays that per stage. Both
+    # corrections point the same way: the figure an operator sizes a battery against must
+    # never be short.
+    from app import targets as targets_mod
+    stage = 60 + int(targets_mod.DEADLINE_GRACE_S)
+    total = (5 + 300 + int(cluster_mod.INSPECT_BUDGET_S
+                           + cluster_mod.DEADLINE_GRACE_S) + 2 * stage)
+    assert f"{total}s" in body
+    assert f"2 node stage(s) {2 * stage}s" in body
+    # And the arithmetic it prints adds up to the total it prints — they used to be
+    # computed from two different stage counts.
+    assert "cluster preparation 305s" in body and "cluster inspection 17s" in body
+
+
+@pytest.mark.asyncio
+async def test_the_battery_reserve_warning_does_not_need_a_cluster():
+    """It used to live inside the Ceph-only self-guest check, so the majority of
+    installations — standalone nodes, Backup Servers, clusters without Ceph — never saw the
+    one warning that says the trigger fires later than the shutdown lasts."""
+    cfg = AppConfig(
+        hosts=[PveHostConfig(name="a", api_url="x", order=0),
+               PveHostConfig(name="b", api_url="x2", order=1)],
+        thresholds=Thresholds(runtime_below_minutes=1, host_shutdown_timeout_s=60),
+    )
+    eng = Engine(cfg)
+    events = _notify_recorder(eng)
+
+    await eng._warn_about_battery_reserve()
+
+    body = next((b for s, _, b in events if "battery reserve" in s.lower()), "")
+    from app import targets as targets_mod
+    assert f"{2 * (60 + int(targets_mod.DEADLINE_GRACE_S))}s" in body
+    assert "2 node stage(s)" in body
+    assert "cluster" not in body       # no cluster here, so no cluster terms
+
+    # Said once per configuration, not on every self-test run.
+    events.clear()
+    await eng._warn_about_battery_reserve()
+    assert not events
+
+
+@pytest.mark.asyncio
+async def test_no_reserve_warning_when_the_reserve_is_long_enough():
+    cfg = AppConfig(
+        hosts=[PveHostConfig(name="a", api_url="x")],
+        thresholds=Thresholds(runtime_below_minutes=30, host_shutdown_timeout_s=60),
+    )
+    eng = Engine(cfg)
+    events = _notify_recorder(eng)
+    await eng._warn_about_battery_reserve()
+    assert not events
+
+
+def test_the_shutdown_budget_counts_the_stages_that_really_run():
+    """One term per thing that happens in sequence — not one per kind of thing."""
+    from app.engine import shutdown_budget_s
+    from app import targets as targets_mod
+
+    th = Thresholds(host_shutdown_timeout_s=60, cluster_prep_timeout_s=60,
+                    cluster_guest_shutdown_timeout_s=300)
+    # What ONE stage really costs: targets.shutdown() bounds a call at the configured
+    # timeout PLUS its grace — the backstop for everything httpx does not bound — and it
+    # pays that per stage, not once for the whole sequence.
+    stage = 60 + int(targets_mod.DEADLINE_GRACE_S)
+
+    # No cluster, one stage.
+    one = AppConfig(hosts=[PveHostConfig(name="a", api_url="x")], thresholds=th)
+    assert shutdown_budget_s(one) == stage
+
+    # Three distinct stages: two order values plus the appliance's own host, which always
+    # forms the last stage on its own — PLUS the one retry pass _evaluate_hosts runs
+    # immediately before that final stage, because no poll follows it to carry a retry.
+    three = AppConfig(thresholds=th, hosts=[
+        PveHostConfig(name="a", api_url="x", order=0),
+        PveHostConfig(name="b", api_url="x", order=0),   # same stage as "a"
+        PveHostConfig(name="c", api_url="x", order=1),
+        PveHostConfig(name="me", api_url="x", this_host=True, order=0),
+    ])
+    assert shutdown_budget_s(three) == 4 * stage
+
+    # A disabled host does not cost a stage.
+    assert shutdown_budget_s(AppConfig(thresholds=th, hosts=[
+        PveHostConfig(name="a", api_url="x", order=0),
+        PveHostConfig(name="off", api_url="x", order=5, enabled=False),
+    ])) == stage
+
+    # The retry pass is counted only where it can actually run: it fires between the
+    # earlier stages and ``this_host``, so it needs both to exist.
+    no_own_host = AppConfig(thresholds=th, hosts=[
+        PveHostConfig(name="a", api_url="x", order=0),
+        PveHostConfig(name="c", api_url="x", order=1),
+    ])
+    assert shutdown_budget_s(no_own_host) == 2 * stage  # two stages, nothing after
+    own_host_alone = AppConfig(thresholds=th, hosts=[
+        PveHostConfig(name="me", api_url="x", this_host=True),
+    ])
+    assert shutdown_budget_s(own_host_alone) == stage  # one stage, nothing before it
+
+    # With the cluster preparation on, its budget comes first — plus the inspection,
+    # which on a cold start runs from inside the shutdown path (once per cluster).
+    from app import cluster as cluster_mod
+    from app.engine import shutdown_budget
+    inspect_s = int(cluster_mod.INSPECT_BUDGET_S + cluster_mod.DEADLINE_GRACE_S)
+    clustered = AppConfig(thresholds=th, hosts=[
+        PveHostConfig(name="a", api_url="x", cluster=True)])
+    # Without Ceph the guest stop cannot run (see _prepare_clusters: want_guests requires
+    # want_ceph), so its five minutes are NOT charged. Counting them off the cluster tick
+    # alone was enough on its own to push a plain three-node cluster past the default
+    # 10-minute trigger and warn a correctly sized installation about its battery reserve.
+    assert shutdown_budget_s(clustered) == 60 + inspect_s + stage
+    # With it, the guest stop is real and counted — read as "any member asked for it",
+    # the same way _cluster_switches() resolves the switch.
+    with_ceph = AppConfig(thresholds=th, hosts=[
+        PveHostConfig(name="a", api_url="x", cluster=True),
+        PveHostConfig(name="b", api_url="x", cluster=True, cluster_ceph=True)])
+    assert shutdown_budget(with_ceph).cluster_s == 60 + 300
+    # A disabled Ceph member does not buy the term either.
+    off = AppConfig(thresholds=th, hosts=[
+        PveHostConfig(name="a", api_url="x", cluster=True),
+        PveHostConfig(name="b", api_url="x", cluster=True, cluster_ceph=True,
+                      enabled=False)])
+    assert shutdown_budget(off).cluster_s == 60
+
+    # A webhook that accepts the connection and then goes quiet costs real battery: _emit()
+    # awaits the notification round, and several of them run in sequence before the last
+    # stage. Counted only where a target is actually configured — and one round PER STAGE
+    # on top of the fixed ones, because every stage emits its own "shutdown sent".
+    from app.engine import NOTIFY_EVENTS_ON_PATH, shutdown_budget
+    from app import notify as notify_mod
+    from app.config import Notifications, WebhookConfig
+    noisy = AppConfig(thresholds=th,
+                      hosts=[PveHostConfig(name="a", api_url="x")],
+                      notifications=Notifications(webhooks=[
+                          WebhookConfig(id="w", enabled=True, url="https://hook")]))
+    assert shutdown_budget_s(noisy) == (
+        stage + int(notify_mod.NOTIFY_BUDGET_S) * (NOTIFY_EVENTS_ON_PATH + 1)
+    )
+    # And it grows with the stages rather than staying a constant: the shutdown is staged,
+    # so the rounds are too.
+    noisy_staged = AppConfig(thresholds=th,
+                             hosts=[PveHostConfig(name="a", api_url="x", order=0),
+                                    PveHostConfig(name="c", api_url="x", order=1)],
+                             notifications=Notifications(webhooks=[
+                                 WebhookConfig(id="w", enabled=True, url="https://hook")]))
+    assert shutdown_budget(noisy_staged).notify_s == (
+        int(notify_mod.NOTIFY_BUDGET_S) * (NOTIFY_EVENTS_ON_PATH + 2)
+    )
+    # A disabled or URL-less target costs nothing.
+    quiet = AppConfig(thresholds=th,
+                      hosts=[PveHostConfig(name="a", api_url="x")],
+                      notifications=Notifications(webhooks=[
+                          WebhookConfig(id="w", enabled=False, url="https://hook")]))
+    assert shutdown_budget_s(quiet) == stage
+
+    # The breakdown adds up to the total it is printed next to — the arithmetic in the
+    # reserve warning used to quote a different stage count than the number above it.
+    b = shutdown_budget(three)
+    assert b.total == shutdown_budget_s(three)
+    assert f"{b.stages} node stage(s)" in b.explain()
 
 
 @pytest.mark.asyncio
@@ -6369,6 +8833,219 @@ async def test_one_ups_takes_the_whole_cluster_down(monkeypatch):
     assert "UPS-A" in dict(fired)["pve01"]
     assert "shut down as a unit" in dict(fired)["pve03"]
     assert "shut down as a unit" in dict(fired)["pve04"]
+
+
+@pytest.mark.asyncio
+async def test_a_node_without_the_cluster_switch_is_not_taken_along(monkeypatch):
+    """"As a unit" may only cover the nodes that asked for cluster handling.
+
+    _cluster_members() matched on the API's node list alone, so a node whose cluster
+    switch was deliberately left off — its own UPS perfectly happy — was powered off by
+    another node's outage. The warning meant to catch exactly that (_check_cluster_feeds)
+    did filter on the switch and returned early below two members, so the one
+    configuration in which the action over-reached was the one in which nothing said so.
+    """
+    eng = _split_feed_engine(monkeypatch, _srv4())
+    # pve03 and pve04 stay in the cluster and in the API's node list, but opt out.
+    for host in eng.cfg.hosts:
+        if host.name in ("pve03", "pve04"):
+            host.cluster = False
+    fired = _fire_recorder(eng)
+
+    await eng._evaluate()
+
+    # Only the two that both opted in AND are fed by the failing UPS.
+    assert [n for n, _ in fired] == ["pve01", "pve02"]
+    assert eng.cluster_unit_hosts == {}
+
+
+def test_cluster_switches_are_read_per_cluster_not_per_triggering_node(monkeypatch):
+    """One answer per cluster, or the preview promises what the preparation skips.
+
+    The preparation used to read the three switches off whichever candidate triggered
+    first, while the shutdown preview and the scheduled health check read any(member) —
+    so with the switches set unevenly the two disagreed, and which one was right depended
+    on which node's UPS failed.
+    """
+    eng = _split_feed_engine(monkeypatch, _srv4(), ceph=False)
+    members = list(eng.cfg.hosts)
+    assert eng._cluster_switches(members) == (False, True, True)
+
+    # A single node asking for Ceph is enough: skipping a step that was asked for costs
+    # the storage, running one nobody asked for costs a maintenance flag.
+    members[3].cluster_ceph = True
+    assert eng._cluster_switches(members)[0] is True
+
+
+@pytest.mark.asyncio
+async def test_uneven_cluster_switches_are_reported(monkeypatch):
+    """Half-on is not two settings but one contradiction, and it has to be said."""
+    from app import cluster
+
+    eng = _split_feed_engine(monkeypatch, _srv4())
+    for host in eng.cfg.hosts[2:]:
+        host.cluster_ha_disarm = False
+    info = cluster.ClusterInfo(reachable=True, is_cluster=True, name="prod",
+                               nodes=["pve01", "pve02", "pve03", "pve04"])
+    events: list[tuple[str, str, str]] = []
+
+    async def rec(subject, body, severity):
+        events.append((subject, body, severity))
+
+    eng._emit = rec  # type: ignore[assignment]
+
+    n = await eng._check_cluster_switch_agreement("prod", eng._cluster_members(info, "prod"))
+
+    assert n == 1
+    subject, body, _sev = events[0]
+    assert "'Disarm HA' is not set the same on every node" in subject
+    # Both sides named, and what the appliance actually does with the contradiction.
+    assert "On: pve01, pve02. Off: pve03, pve04." in body
+    assert "at least one node asked for it" in body
+
+
+@pytest.mark.asyncio
+async def test_a_node_taken_along_by_its_cluster_is_retried_like_any_other(monkeypatch):
+    """The retry has to reach the nodes that have no trigger of their own.
+
+    They are the ones a cluster pulled in, and their eligibility comes from
+    cluster_unit_hosts rather than from a UPS — so the branch that recognises them was
+    skipping them before any retry was considered. _prepare_clusters() cannot offer them
+    again either (its per-episode latch returns first), which left them with exactly one
+    attempt while the event promised three."""
+    eng = _split_feed_engine(monkeypatch, _srv4())
+    attempts: list[str] = []
+
+    async def flaky_fire(host, reason):
+        attempts.append(host.name)
+        # pve03 is a taken-along node: it fails once, then works.
+        ok = host.name != "pve03" or attempts.count("pve03") > 1
+        eng.host_fired[host.key] = ok
+        eng.host_states.setdefault(host.key, {}).update({
+            "shutdown_state": "sent" if ok else "failed",
+            "shutdown_attempts": attempts.count(host.name),
+        })
+
+    eng._fire_host = flaky_fire  # type: ignore[assignment]
+
+    await eng._evaluate()
+    assert attempts.count("pve03") == 1
+    assert eng.host_fired[eng.cfg.hosts[2].key] is False
+
+    await eng._evaluate()
+    assert attempts.count("pve03") == 2, "the next poll has to try it again"
+    assert eng.host_fired[eng.cfg.hosts[2].key] is True
+    # And nothing else is disturbed: the nodes that succeeded are not re-sent.
+    assert attempts.count("pve01") == 1 and attempts.count("pve04") == 1
+
+
+@pytest.mark.asyncio
+async def test_a_taken_along_node_is_not_shut_down_once_mains_are_back(monkeypatch):
+    """The retry must not outlive the outage that justified it.
+
+    A node its cluster took along has no trigger of its own, so "no reason now" says
+    nothing about it -- which is why the branch skips the release. But it also stopped
+    asking whether the episode was still running at all: a taken-along node whose first
+    attempt had failed was re-sent on every following poll, mains back or not. With every
+    attempt of the round failing, that is a healthy production node powered off during
+    normal operation."""
+    from app import db
+
+    eng = _split_feed_engine(monkeypatch, _srv4())
+    events = _notify_recorder(eng)
+    attempts: list[str] = []
+
+    async def failing_fire(host, reason):
+        attempts.append(host.name)
+        eng.host_fired[host.key] = False
+        eng.host_states.setdefault(host.key, {}).update({
+            "shutdown_state": "failed",
+            "shutdown_attempts": attempts.count(host.name),
+        })
+
+    eng._fire_host = failing_fire  # type: ignore[assignment]
+
+    await eng._evaluate()
+    assert sorted(set(attempts)) == ["pve01", "pve02", "pve03", "pve04"]
+
+    # Mains come back between the first and the second attempt: nothing was ever sent, so
+    # there is no half-down cluster for the taken-along nodes to follow.
+    eng.ups_rt["a"].state = UpsState(reachable=True, power_source="mains")
+    events.clear()
+    await eng._evaluate()
+
+    assert attempts.count("pve03") == 1, "a healthy node must not be shut down with mains back"
+    assert attempts.count("pve04") == 1
+    key = eng.cfg.hosts[2].key
+    assert eng.host_fired.get(key) is False
+    assert "shutdown_state" not in eng.host_states[key], "the attempt record has to go too"
+    assert key not in eng.cluster_unit_hosts, "nothing is left to take it along with"
+    # And it is said out loud, at the level a machine that is still running deserves.
+    aborted = [e for e in events if e[0] == "Host pve03: shutdown aborted"]
+    assert aborted and aborted[0][1] == db.CRITICAL
+    assert "never succeeded" in aborted[0][2]
+
+
+@pytest.mark.asyncio
+async def test_a_taken_along_node_still_follows_a_cluster_that_did_go_down(monkeypatch):
+    """The other half of the rule above, and the reason it keys on "sent".
+
+    When the nodes that triggered really were shut down, the cluster is half down and
+    prepared -- HA disarmed, with Ceph every guest stopped -- so a taken-along node whose
+    own attempt failed has to keep trying even after its UPS reports mains again. Refusing
+    there would leave a node standing in a cluster with no guests and no storage."""
+    eng = _split_feed_engine(monkeypatch, _srv4())
+    attempts: list[str] = []
+
+    async def flaky_fire(host, reason):
+        attempts.append(host.name)
+        ok = host.name != "pve03"
+        eng.host_fired[host.key] = ok
+        eng.host_states.setdefault(host.key, {}).update({
+            "shutdown_state": "sent" if ok else "failed",
+            "shutdown_attempts": attempts.count(host.name),
+        })
+
+    eng._fire_host = flaky_fire  # type: ignore[assignment]
+
+    await eng._evaluate()
+    assert attempts.count("pve03") == 1
+
+    eng.ups_rt["a"].state = UpsState(reachable=True, power_source="mains")
+    await eng._evaluate()
+    assert attempts.count("pve03") == 2, "its cluster is down; it has to follow"
+
+
+@pytest.mark.asyncio
+async def test_a_raising_shutdown_does_not_orphan_a_taken_along_node(monkeypatch):
+    """The defensive path has to leave a retryable state, not an unshuttable one.
+
+    _fire_host is total in practice, but _fire_stage guards it anyway. That guard used to
+    drop cluster_unit_hosts along with the latch — and for a node the cluster takes down as
+    a unit, that entry is the ONLY record of why it is due: _host_trigger_reason returns
+    None for it and _prepare_clusters cannot offer it again behind the per-episode latch.
+    So the one host the guard was protecting was the one it left permanently unshut."""
+    eng = _split_feed_engine(monkeypatch, _srv4())
+    attempts: list[str] = []
+
+    async def raising_fire(host, reason):
+        attempts.append(host.name)
+        if host.name == "pve03" and attempts.count("pve03") == 1:
+            raise RuntimeError("boom")
+        eng.host_fired[host.key] = True
+        eng.host_states.setdefault(host.key, {}).update({"shutdown_state": "sent"})
+
+    eng._fire_host = raising_fire  # type: ignore[assignment]
+
+    await eng._evaluate()
+    key = eng.cfg.hosts[2].key
+    assert attempts.count("pve03") == 1
+    assert eng.host_fired[key] is False
+    assert key in eng.cluster_unit_hosts, "the reason is what makes the retry possible"
+
+    await eng._evaluate()
+    assert attempts.count("pve03") == 2, "the next poll has to try it again"
+    assert eng.host_fired[key] is True
 
 
 @pytest.mark.asyncio

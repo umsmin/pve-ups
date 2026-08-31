@@ -19,7 +19,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, URLSafeTimedSerializer
@@ -313,10 +322,18 @@ async def api_health():
         1 for h in host_list if h.get("node_state") in (None, "ok", "unverified")
     )
     tested = [h for h in host_list if h["last_test_at"]]
+    # Enabled targets only: a disabled webhook sends nothing, so it can never be "not ok".
+    webhooks = [w for w in snap.get("webhooks", []) if w["enabled"]]
     payload = {
         "status": "ok" if ok else "degraded",
         "version": __version__,
         "engine_state": snap["appliance"]["engine_state"],
+        # Monitoring information, under the same rule as hosts_ok/webhooks_ok below: it
+        # never moves ``status`` or the HTTP code. Reported at all because an appliance
+        # left in dry-run is the quietest failure there is — fully configured, self-test
+        # green, "ok" here, and it shuts nothing down. The endpoint an external monitor
+        # actually polls should be able to say so.
+        "dry_run": snap["appliance"]["dry_run"],
         # True only when every configured UPS is reachable (all() of empty list is True).
         "ups_reachable": all(u["reachable"] for u in ups_list),
         "ups_reachable_count": sum(1 for u in ups_list if u["reachable"]),
@@ -329,6 +346,13 @@ async def api_health():
         "hosts_selftest_ok": (hosts_ok == len(host_list)) if tested else None,
         "hosts_node_ok": hosts_node_ok,
         "hosts_selftest_at": max((h["last_test_at"] for h in tested), default=None),
+        # Notification targets, same caveat again. 4.1.0 made a webhook that stopped
+        # working a first-class signal — an event, a dashboard row, a note on its card —
+        # but the endpoint an external monitor actually polls knew nothing about it. A
+        # target counts as ok until a send has provably failed, so one that has never been
+        # tried does not read as broken.
+        "webhooks_total": len(webhooks),
+        "webhooks_ok": sum(1 for w in webhooks if w["last_delivery_ok"] is not False),
         # Cluster state, for the same reason and with the same caveat as hosts_ok above:
         # monitoring information only, never part of ``status`` or the HTTP code. Empty
         # unless at least one host has cluster preparation enabled.
@@ -485,6 +509,19 @@ def _reconcile_host_secrets(host_entry: dict, old: Optional[HostConfig]) -> None
         host_entry[fld] = _reconcile_secret(host_entry.get(fld), old_secret)
 
 
+def _reconcile_webhook_secrets(hook: dict, old: Optional[WebhookConfig]) -> None:
+    """Carry a webhook's unchanged (masked) auth header over, matched by webhook id.
+
+    The sibling of _reconcile_ups_secrets/_reconcile_host_secrets, and it exists because
+    /api/test/webhook did not have one: the UI sends the placeholder whenever the field is
+    left blank, so pressing "Test" on a saved webhook with an auth header sent the literal
+    "**********" as the header value and reported a 401 for a configuration that works.
+    """
+    for fld, default in WebhookConfig.secret_fields().items():
+        old_secret = getattr(old, fld).get_secret_value() if old is not None else default
+        hook[fld] = _reconcile_secret(hook.get(fld), old_secret)
+
+
 def _merge_config(incoming: dict, existing: AppConfig) -> AppConfig:
     """Build a new config, carrying over unchanged (masked) secrets."""
     data = dict(incoming)
@@ -505,10 +542,7 @@ def _merge_config(incoming: dict, existing: AppConfig) -> AppConfig:
     for hook in (data.get("notifications") or {}).get("webhooks", []) or []:
         if not isinstance(hook, dict):
             continue
-        old = existing_hooks.get(hook.get("id"))
-        for fld, default in WebhookConfig.secret_fields().items():
-            old_secret = getattr(old, fld).get_secret_value() if old is not None else default
-            hook[fld] = _reconcile_secret(hook.get(fld), old_secret)
+        _reconcile_webhook_secrets(hook, existing_hooks.get(hook.get("id")))
 
     # Never overwrite auth/session material from the config form.
     data["ui_password_hash"] = existing.ui_password_hash
@@ -543,10 +577,21 @@ async def api_set_config(incoming: dict):
     # Apply changed system settings (NTP / timezone) via the privileged agent (needs root).
     # No agent exists in Docker deployments; the values persist but nothing is enqueued.
     if not IS_DOCKER:
-        if new_cfg.ntp_server and new_cfg.ntp_server != old_ntp:
-            _enqueue_agent("set-ntp", server=new_cfg.ntp_server)
-        if new_cfg.timezone and new_cfg.timezone != old_tz:
-            _enqueue_agent("set-timezone", tz=new_cfg.timezone)
+        # Guarded: the configuration is already saved and applied at this point, so an
+        # unwritable queue must not answer with a 500 that reads as "nothing was saved".
+        try:
+            if new_cfg.ntp_server and new_cfg.ntp_server != old_ntp:
+                _enqueue_agent("set-ntp", server=new_cfg.ntp_server)
+            if new_cfg.timezone and new_cfg.timezone != old_tz:
+                _enqueue_agent("set-timezone", tz=new_cfg.timezone)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not queue a system job for the agent: %s", exc)
+            db.log_event(
+                "System settings not applied",
+                f"The configuration was saved, but NTP/timezone could not be handed to "
+                f"the privileged agent: {exc}",
+                db.WARNING,
+            )
     return _sanitized_config(new_cfg)
 
 
@@ -587,16 +632,24 @@ async def api_config_import(incoming: dict):
         raise HTTPException(status_code=400, detail=f"Invalid import file: {exc}")
     assign_ups_ids(new_cfg.ups)  # backups from <2.0 migrate to a single UPS; ensure ids
     assign_host_ids(new_cfg.hosts)  # backups from before 4.0.0 carry no host ids
+    # And webhooks, which this path used to leave alone: the id keys the delivery state
+    # and the masked-secret reconcile, so an import carrying two of them without ids left
+    # both sharing one record.
+    assign_webhook_ids(new_cfg.notifications.webhooks)
     new_cfg.configured = True
     save_config(new_cfg)
     engine.update_config(new_cfg)
     db.log_event("Configuration imported", "Settings taken over from file.", db.WARNING)
     # No agent exists in Docker deployments; the values persist but nothing is enqueued.
+    # Guarded like the save path: the import has already been applied by now.
     if not IS_DOCKER:
-        if new_cfg.ntp_server:
-            _enqueue_agent("set-ntp", server=new_cfg.ntp_server)
-        if new_cfg.timezone:
-            _enqueue_agent("set-timezone", tz=new_cfg.timezone)
+        try:
+            if new_cfg.ntp_server:
+                _enqueue_agent("set-ntp", server=new_cfg.ntp_server)
+            if new_cfg.timezone:
+                _enqueue_agent("set-timezone", tz=new_cfg.timezone)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not queue a system job for the agent: %s", exc)
     return _sanitized_config(new_cfg)
 
 
@@ -969,6 +1022,10 @@ async def api_test_webhook(incoming: dict):
     explicitly, and the point is to verify URL and format *before* saving.
     """
     assert engine is not None
+    # Reconcile first, exactly like /api/test/ups and /api/test/host do.
+    incoming = dict(incoming)
+    existing = {h.id: h for h in engine.cfg.notifications.webhooks}
+    _reconcile_webhook_secrets(incoming, existing.get(incoming.get("id")))
     try:
         hook = WebhookConfig.model_validate(incoming)
     except Exception as exc:  # noqa: BLE001 - validation error -> 400
@@ -1111,7 +1168,9 @@ async def api_reset():
 
 
 @app.get("/api/events", dependencies=[Depends(require_auth)])
-async def api_events(limit: int = 100):
+async def api_events(limit: int = Query(100, ge=1, le=1000)):
+    # Bounded: SQLite reads a negative LIMIT as "no limit", so ?limit=-1 serialised the
+    # whole table out of a synchronous read on the event loop.
     return db.recent_events(limit)
 
 
