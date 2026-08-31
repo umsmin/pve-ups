@@ -41,28 +41,47 @@ rather than replacing it:
 
 ## Screenshots
 
-*Dashboard during a power outage — one UPS on battery, shutdown countdown running:*
+*Dashboard during a power outage — one UPS on battery, shutdown countdown running, with
+the live power-feed diagram underneath:*
 
 ![Dashboard during a power outage](Screenshots/dashboard.png)
 
 <details>
-<summary>More screenshots (UPS status, feed diagram, UPS &amp; host settings)</summary>
+<summary>More screenshots (UPS status &amp; settings, hosts, cluster preparation, webhooks)</summary>
 
-*UPS status cards:*
+*UPS status cards — power source, the MIB actually in use, charge, remaining runtime:*
 
 ![UPS status](Screenshots/ups-status.png)
 
-*Live power-feed diagram (UPS → host):*
-
-![Power feed diagram](Screenshots/power-feed.png)
-
-*UPS settings with per-UPS threshold overrides:*
+*A UPS entry: read via SNMP (network card) or a NUT server, MIB selection, query timeout
+and retries, optional per-UPS thresholds:*
 
 ![UPS settings](Screenshots/ups-settings.png)
 
-*Host settings (API token, feeds, AND/OR logic):*
+*Host settings — Proxmox VE or Backup Server per entry, API token, which UPS devices feed
+it, AND/OR logic, and the resulting feed diagram:*
 
 ![Host settings](Screenshots/host-settings.png)
+
+*Live preview of the shutdown sequence: hosts sharing an order go at the same time, and
+the appliance's own host is always last:*
+
+![Shutdown sequence preview](Screenshots/shutdown-sequence-preview.png)
+
+*Cluster options per host (Beta): shut the cluster down as a unit, disarm the HA manager,
+and prepare a hyper-converged (Ceph) cluster:*
+
+![Cluster options on a host](Screenshots/host-settings-cluster.png)
+
+*Cluster preparation — the timeouts each step gets, the worst-case battery time they add
+up to, and the guest this appliance itself runs in:*
+
+![Cluster preparation settings](Screenshots/cluster-preparation.png)
+
+*Webhooks: one per target, each with its own format (Slack, Discord, Teams, ntfy, status
+JSON or a custom template), severity filter and test button:*
+
+![Webhook settings](Screenshots/webhook-settings.png)
 
 </details>
 

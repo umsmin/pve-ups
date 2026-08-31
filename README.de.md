@@ -46,28 +46,47 @@ NUT als *Treiber*, statt es zu ersetzen:
 
 ## Screenshots
 
-*Dashboard während eines Stromausfalls — eine USV im Akkubetrieb, Shutdown-Countdown läuft:*
+*Dashboard während eines Stromausfalls — eine USV im Akkubetrieb, Shutdown-Countdown
+läuft, darunter das Live-Schaubild der Versorgung:*
 
 ![Dashboard während eines Stromausfalls](Screenshots/dashboard.png)
 
 <details>
-<summary>Weitere Screenshots (USV-Status, Schaubild, USV- &amp; Host-Einstellungen)</summary>
+<summary>Weitere Screenshots (USV-Status &amp; -Einstellungen, Hosts, Cluster-Vorbereitung, Webhooks)</summary>
 
-*USV-Statuskarten:*
+*USV-Statuskarten — Quelle, tatsächlich verwendete MIB, Ladung, Restlaufzeit:*
 
 ![USV-Status](Screenshots/ups-status.png)
 
-*Live-Schaubild der Versorgung (USV → Host):*
-
-![Schaubild der Versorgung](Screenshots/power-feed.png)
-
-*USV-Einstellungen mit Schwellen-Overrides je USV:*
+*Ein USV-Eintrag: ausgelesen per SNMP (Netzwerkkarte) oder über einen NUT-Server, MIB-Wahl,
+Zeitlimit und Wiederholungen, optionale Schwellen je USV:*
 
 ![USV-Einstellungen](Screenshots/ups-settings.png)
 
-*Host-Einstellungen (API-Token, Versorgung, UND/ODER-Logik):*
+*Host-Einstellungen — Typ Proxmox VE oder Backup Server je Eintrag, API-Token, welche USVs
+ihn versorgen, UND/ODER-Logik und das daraus entstehende Schaubild:*
 
 ![Host-Einstellungen](Screenshots/host-settings.png)
+
+*Live-Vorschau der Shutdown-Reihenfolge: Hosts mit gleicher Nummer gehen gleichzeitig, der
+eigene Host der Appliance immer zuletzt:*
+
+![Vorschau der Shutdown-Reihenfolge](Screenshots/shutdown-sequence-preview.png)
+
+*Cluster-Optionen je Host (Beta): den Cluster als Einheit herunterfahren, den HA-Manager
+disarmen und einen hyperkonvergenten (Ceph-)Cluster vorbereiten:*
+
+![Cluster-Optionen an einem Host](Screenshots/host-settings-cluster.png)
+
+*Cluster-Vorbereitung — die Zeitlimits der einzelnen Schritte, die Worst-Case-Akkuzeit, die
+daraus entsteht, und der Gast, in dem die Appliance selbst läuft:*
+
+![Einstellungen der Cluster-Vorbereitung](Screenshots/cluster-preparation.png)
+
+*Webhooks: einer je Ziel, jeder mit eigenem Format (Slack, Discord, Teams, ntfy, Status-JSON
+oder eigene Vorlage), Schweregrad-Filter und Testversand:*
+
+![Webhook-Einstellungen](Screenshots/webhook-settings.png)
 
 </details>
 
